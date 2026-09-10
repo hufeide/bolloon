@@ -2,7 +2,7 @@
 title: Bolloon 当前状态
 source: session
 created: 2026-07-04
-last_confirmed: 2026-09-08
+last_confirmed: 2026-09-10
 schema_version: 2
 audience: self
 stage: current
@@ -17,6 +17,7 @@ compiled_from: [ablation-v0.2.7, ui-bugs-2026-07-12]
 
 | 功能 | 路径 | 验证 |
 |------|------|------|
+| || **Android 正式签名 APK + 发布到 bolloon-UI Release** (2026-09-10) | `android/app/build.gradle` + `android/keystore/` (未入库) | ① 固定 release keystore (RSA-4096/PKCS12/30 年, DN `CN=Bolloon, O=Bolloon, C=CN`, 证书 SHA-256 `0789146b…`), `signingConfigs.release` 从 `android/keystore/keystore.properties` 读凭证 (`*.jks`+`keystore.properties` 已被 android/.gitignore 覆盖); 凭证缺失时静默回退 unsigned (不影响他人 debug 构建); ② `./gradlew :app:assembleRelease` → `bolloon-0.4.20.apk` 18,750,037 B (17.88 MiB, 比 debug 小因去调试符号), versionCode 20 / minSdk 28 / targetSdk 35, **非 debuggable**, 仅 v2 签名方案, assets 与 debug 逐项一致 (140 项 / 11,891,814 B / mobile-core.js 3,051,457 B); ③ 发布为 bolloon-UI Release tag `android-v0.4.20-signed` (sha256 `3b5ad96d…`, 回下载复算一致), bolloon-UI 安装页 Android 栏目指向该资产; ④ **与 debug 包签名不同** (tag `android-v0.4.20`, CN=Android Debug) → 不可互相覆盖, 已装 debug 版需先卸载. 背景: 真机点开 debug 包无反应, 已排除下载/托管问题 (回下载 sha256 一致 + zip CRC 全 OK) | [build.gradle](../../android/app/build.gradle) |
 | || **Agent Gateway 全量引导 — 入网链接=网络启动包 + on-join 广播 + 共享 context** (2026-09-08) | `src/agents/gateway-network.ts` + `agent-registry.ts` + `network-link.ts` | ① 入网链接=全量引导: `NetworkBootstrap`(networkId/version/容量/sharedContextCid) 写入成员持久化 `gateway-networks.json`, `fetchNetworkMeta`(orbitdb meta / ipns network.json / http doc.meta); ② on-join 广播: `maybeAutoJoinGateway` 支持 `deps.self` → `networkShareSelf` 写回共享 store (orbitdb 可写, ipns/http 本地登记, 只读非致命); ③ 成员自描述同 schema: `AgentService` + `mergeRemoteServices`(agentId+service.name 去重) + `pullNetworkProfile`(画像: 谁在/会什么/报价); ④ 共享 context: `publishNetworkSharedContext`→OrbitDB CID + `pullNetworkSharedContext`(IPFS); ⑤ `shareNetworkLink` 写全量 meta (registry `writeMeta/readMeta`). 验证: tsc 0 + gateway-network 9 单测 + vitest 全量 + lefthook | [gateway-network.ts](../../src/agents/gateway-network.ts) |
 | || **手机端同协议 + 扫码入网 + CLI /net** (2026-09-08) | `src/web/mobile-gateway.ts` + `mobile-core.ts` + `mobile-agent.ts` + `mobile.html/mobile.js` + `qr.ts` + `src/index.ts` | ① 手机 browser-safe 入网: http registry 直接 fetch, orbitdb/ipns 经 `desktopBaseUrl` 转发桌面 `/api/gateway/join`; `mobileGatewayTool` 统一分派 (join/status/register/context); `get/setDesktopBaseUrl`(localStorage 持久化); ② 极简按钮: 网络 tab 🛜 加入网络(粘贴链接) + 📷 扫码入网(`<input capture>` 拍照→jsQR 解码→join) + Agent 网络成员列表; ③ `mobile-agent` `agent.chat.send` 收到网络链接自动 join; ④ CLI `/net` 快捷命令: join/status/ctx/`qr`(二维码面板, qrcode); ⑤ `network-link` 无依赖纯函数桌面/手机共用. 验证: tsc 0 + qr3/mobile-gateway9 单测 + build:web (mobile-core.js 3.03MB 内联 jsQR) + vitest 全量 | [mobile-gateway.ts](../../src/web/mobile-gateway.ts) |
 | || **Hermes TUI 学习落地: memo 消息列表 + 实时尺寸** (2026-09-08) | `src/cli/ink-app.tsx` | 学 Hermes Ink TUI 架构后首批优化: ① `React.memo(Messages)` — 原实现状态栏每秒 setStatus tick 重渲染整棵组件树 (含全部历史消息 <Text>), 长会话掉帧; msgs 引用不变即跳过, append 只渲染新增. ② 实时终端尺寸 — 原 startInk 在 mount 时冻结 process.stdout.columns/rows 传 prop, resize 后 `─`.repeat(terminalW) 分隔线/logo/弹窗宽度全错位; 改 useStdout + 'resize' 订阅, 渲染期用最新 W (Hermes 侧对应 resizeCoalescer + 实时 layout). 验证: tsc 0 错 + build:main + pty 冒烟 UI OK | [ink-app.tsx](../../src/cli/ink-app.tsx) |
