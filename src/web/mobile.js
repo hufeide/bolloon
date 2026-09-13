@@ -16,6 +16,9 @@
     },
   };
 
+  // 一键入网默认 prompt: 交给智能体去读网关入网说明并执行入网 (人类只点一下)
+  const DEFAULT_JOIN_PROMPT = 'read https://bolloon.cn/bolloon-gateway-join.md';
+
   const THEMES = {
     dark: { '--bg': '#1a1a18', '--bg-card': '#222220', '--bg-hover': '#2a2a26', '--text': '#d8d8c8', '--text-secondary': '#909088', '--accent': '#c4d640', '--border': '#3a3a36' },
     light: { '--bg': '#f5f5f0', '--bg-card': '#ffffff', '--bg-hover': '#eeeeea', '--text': '#1a1a18', '--text-secondary': '#606058', '--accent': '#8a9430', '--border': '#d0d0c8' },
@@ -681,6 +684,7 @@
   let chatEventSource = null;
   let chatStepCancel = null;
   let streamingBubble = null;
+  let chatLoadPromise = Promise.resolve();   // openChat 的首次历史加载 (供一键入网等自动发消息等它完成, 免被清屏抹掉)
 
    function openChat(ch) {
      activeChannel = ch;
@@ -710,7 +714,7 @@
        $('#chat-send').addEventListener('click', sendChat);
        $('#chat-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
        attachStepListener();
-       loadMessages();
+       chatLoadPromise = loadMessages().catch(() => {});
        openChatSse();
        window.__mobileTouch?.('chat', ch.id);
        }
@@ -1734,6 +1738,38 @@
   function showSheet(id) { const s = $(id); if (s) s.hidden = false; }
   function hideSheet(id) { const s = $(id); if (s) s.hidden = true; }
 
+  /**
+   * 一键入网 (全球智能体网络): 把默认 prompt 发给智能体, 由它读网关入网说明并执行入网。
+   * 人类只点一下 — 没有可用会话时先建一个 (与"新建会话"同一条路径)。
+   */
+  async function joinGlobalNetwork() {
+    showToast('正在加入全球智能体网络…');
+    try {
+      let ch = activeChannel;
+      if (!ch) {
+        let channels = [];
+        try { channels = await api.get('/channels'); } catch { channels = []; }
+        ch = (Array.isArray(channels) && channels[0]) || null;
+        if (!ch) {
+          await api.post('/api/channels/create', {});
+          await new Promise((r) => setTimeout(r, 700));
+          channels = await api.get('/channels').catch(() => []);
+          ch = (Array.isArray(channels) && channels[0]) || null;
+        }
+      }
+      if (!ch) { showToast('没有可用会话: 先在电脑端连上你的智能体'); return; }
+      openChat(ch);
+      await chatLoadPromise;   // 等首次历史加载完成再发, 免得用户气泡被清屏抹掉
+      const input = $('#chat-input');
+      if (!input) return;
+      input.value = DEFAULT_JOIN_PROMPT;
+      await sendChat();
+      showToast('入网指令已交给智能体');
+    } catch (e) {
+      showToast('入网失败: ' + ((e && e.message) || e));
+    }
+  }
+
   // 创建智能体: 无输入框, 底部滑入加载 sheet, 完成后滑出
   async function createSession() {
     showSheet('#create-sheet');
@@ -1855,6 +1891,10 @@
       try { const net = await api.get('/api/network/status'); const p2p = net && net.nodeId; alert('P2P ID (通信ID, ≠ DID):\n' + (p2p || '未连接')); }
       catch (e) { alert('P2P ID: 获取失败'); }
     });
+    // #1 一键入网 (全球智能体网络): 点一下 → 默认 prompt 交给智能体执行
+    const joinGlobalBtn = $('#item-join-global');
+    if (joinGlobalBtn) joinGlobalBtn.addEventListener('click', () => { void joinGlobalNetwork(); });
+
     // #2 加入网络 (点按式): sheet → [附近的电脑/设备] [扫电脑上的二维码] [粘贴链接兜底]
     const joinNetBtn = $('#item-join-net');
     if (joinNetBtn) joinNetBtn.addEventListener('click', () => showSheet('#network-sheet'));

@@ -64,10 +64,51 @@ async function main() {
     const js3 = JSON.parse(String(nearby.output));
     record('④ 「附近的设备」面板可点 + 有文案反馈', js3.visible && !!js3.hint, JSON.stringify(js3));
 
+    // ⑤ 一键入网 (全球智能体网络): 点一下 → 默认 prompt 发给智能体 (真点真断言)
+    //    页面里打桩 /channels 与 /message, 断言发出的正文就是网关入网默认 prompt
+    const stub = await session.execute({
+      action: 'js',
+      code: `(() => {
+        const core = window.BolloonCore;
+        window.__sent = [];
+        const origGet = core.resolve && core.resolve.bind(core);
+        const origPost = core.resolvePost && core.resolvePost.bind(core);
+        // 注意: mobile 的 resolve()/resolvePost() 返回的是 thunk (要被 api.get/post 再调一次)
+        core.resolve = (path) => {
+          if (path === '/channels') return () => Promise.resolve([{ id: 'ch-verify', name: '验证智能体' }]);
+          return origGet ? origGet(path) : null;
+        };
+        core.resolvePost = (path, body) => {
+          if (path === '/message') return () => { window.__sent.push(body); return Promise.resolve({ ok: true }); };
+          return origPost ? origPost(path, body) : null;
+        };
+        return 'stubbed';
+      })()`,
+    });
+    record('⑤ 打桩 /channels + /message 成功', String(stub.output).includes('stubbed'), String(stub.output).slice(0, 40));
+
+    await session.execute({ action: 'click', selector: '#item-join-global' });
+    await session.execute({ action: 'js', code: `new Promise(r=>setTimeout(r,1200)).then(()=>'ok')` });
+    const joined = await session.execute({
+      action: 'js',
+      code: `(() => {
+        const s = (window.__sent || [])[0] || {};
+        const bubbles = Array.from(document.querySelectorAll('#chat-messages .bubble.user')).map(b=>b.textContent);
+        return JSON.stringify({ text: s.text || '', channelId: s.channelId || '', chatOpen: !!document.querySelector('#chat-messages'), bubbles });
+      })()`,
+    });
+    const j5 = JSON.parse(String(joined.output));
+    const EXPECT = 'read https://bolloon.cn/bolloon-gateway-join.md';
+    record(
+      '⑥ 点「一键入网」→ 发出默认 prompt 并落到会话',
+      j5.text === EXPECT && j5.channelId === 'ch-verify' && j5.chatOpen && j5.bubbles.includes(EXPECT),
+      JSON.stringify(j5).slice(0, 220),
+    );
+
     // 截图存证 (browser 模块返回字段是 screenshotPath)
     const shot = await session.execute({ action: 'screenshot' });
     const shotPath = shot.screenshotPath || shot.path;
-    record('⑤ 截图存证', !!shotPath, String(shotPath || ''));
+    record('⑦ 截图存证', !!shotPath, String(shotPath || ''));
 
     await session.execute({ action: 'close' });
   } catch (e: any) {
