@@ -187,6 +187,8 @@ export const core = {
     if (p === '/api/desktop/url') return () => core.desktop.url();
     if (p === '/api/desktop/sync') return () => core.desktop.sync();
     if (p === '/api/judgments/cached') return () => core.desktop.judgments();
+    // 微信息 (x402 付费信息): 手机不持 EVM 私钥 → 列表走电脑端; 不可达就回 desktop-unreachable (不抛)
+    if (p === '/api/x402/info') return () => core.x402.list();
     // OrbitDB 本地副本 (库级复制)
     if (p === '/api/orbit/status') return () => core.orbit.status();
     if (p === '/api/orbit/replica') return () => core.orbit.replica();
@@ -282,6 +284,11 @@ export const core = {
     if (p === '/api/desktop/url') {
       const b = body || {};
       return () => core.desktop.setUrl(String(b.url || ''));
+    }
+    // 微信息 (x402 付费信息): 购买并验真 → 一律转发电脑端代付 (手机端不签名/不碰私钥)
+    if (p === '/api/x402/info/buy') {
+      const b = body || {};
+      return () => core.x402.buy(b);
     }
     if (p === '/api/network/connect') return () => core.network.connect();
     if (p === '/api/social/announce') return () => core.social.announce();
@@ -593,6 +600,47 @@ export const core = {
     async sync(): Promise<any> { const s = await import('./mobile-sync.js'); return s.syncFromDesktop(); },
     async status(): Promise<any> { const s = await import('./mobile-sync.js'); return s.getSyncStatus(); },
     async judgments(): Promise<any> { const s = await import('./mobile-sync.js'); return { judgments: s.getCachedJudgments() }; },
+  },
+
+  // 微信息 (x402 付费信息) — 手机端**不持 EVM 私钥**: 浏览与代付一律转发电脑端;
+  //   电脑端不可达就如实回 desktop-unreachable, 绝不返回假数据 (2026-09-13)
+  x402: {
+    /** 桌面基址 (设置页填; 与 mobile.js 的 desktopBaseUrl() 同一 localStorage key) */
+    async baseUrl(): Promise<string> {
+      try {
+        const g: any = await import('./mobile-gateway.js');
+        return String(g.getDesktopBaseUrl() || '').replace(/\/+$/, '');
+      } catch { return ''; }
+    },
+    /** 免费元数据列表 (电脑端已发布的付费信息); 不可达 → {count:0,items:[],note:'desktop-unreachable'} */
+    async list(): Promise<any> {
+      const base = await core.x402.baseUrl();
+      if (!base) return { count: 0, items: [], note: 'desktop-unreachable' };
+      try {
+        const r = await fetch(`${base}/api/x402/info`);
+        if (!r.ok) return { count: 0, items: [], note: 'desktop-unreachable' };
+        const d: any = await r.json();
+        if (!d || !Array.isArray(d.items)) return { count: 0, items: [], note: 'desktop-unreachable' };
+        return d;
+      } catch {
+        return { count: 0, items: [], note: 'desktop-unreachable' };
+      }
+    },
+    /** 购买并验真: 转发电脑端 /api/x402/info/buy 代付; 失败把后端 error 原文带回 (不吞错) */
+    async buy(body: any): Promise<any> {
+      const base = await core.x402.baseUrl();
+      if (!base) return { ok: false, error: '需要电脑端在线 (设置里填桌面地址)' };
+      try {
+        const r = await fetch(`${base}/api/x402/info/buy`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+        });
+        const d: any = await r.json().catch(() => null);
+        if (!r.ok) return { ok: false, status: r.status, error: (d && (d.error || d.message)) || `电脑端返回 ${r.status}` };
+        return d || { ok: false, error: '电脑端返回空响应' };
+      } catch (e: any) {
+        return { ok: false, error: '电脑端不可达: ' + String(e?.message || e).slice(0, 120) };
+      }
+    },
   },
 
   // 自动社交 (E1): 服务声明广播 / 发现 / 心跳 — 协议见 docs/wiki/agent-economic-protocol.md

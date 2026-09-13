@@ -64,8 +64,10 @@
   <!-- 网络 tab -->
   <section class="page" id="page-network" data-tab="network" hidden>
     <div class="list">
-      <div class="list-item" id="item-join-net"><span class="list-icon"><svg class="ico" viewBox="0 0 24 24"><path d="M3.5 9.5a13 13 0 0 1 17 0M6.5 13a8.5 8.5 0 0 1 11 0M9.6 16.3a4 4 0 0 1 4.8 0"/><circle cx="12" cy="19.5" r="1.1" fill="currentColor" stroke="none"/></svg></span><span>加入网络</span></div>
-      <div class="list-item" id="item-scan-net"><span class="list-icon"><svg class="ico" viewBox="0 0 24 24"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M4 12h16"/></svg></span><span>扫码入网</span></div>
+      <div class="list-item" id="item-join-net"><span class="list-icon"><svg class="ico" viewBox="0 0 24 24"><path d="M3.5 9.5a13 13 0 0 1 17 0M6.5 13a8.5 8.5 0 0 1 11 0M9.6 16.3a4 4 0 0 1 4.8 0"/><circle cx="12" cy="19.5" r="1.1" fill="currentColor" stroke="none"/></svg></span><span>加入网络</span><span class="list-arrow">›</span></div>
+      <div class="list-item" id="item-add-friend"><span class="list-icon"><svg class="ico" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.8-3 3-4.6 5.5-4.6S13.7 16 14.5 19"/><path d="M17 8v6M14 11h6"/></svg></span><span>连接好友</span><span class="list-arrow">›</span></div>
+      <div class="list-item" id="item-nearby"><span class="list-icon"><svg class="ico" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 16 0"/><path d="M7.5 12a4.5 4.5 0 0 1 9 0"/><circle cx="12" cy="12" r="1.4"/><path d="M12 13.6V19"/></svg></span><span>附近设备</span><span class="list-arrow">›</span></div>
+      <div class="list-item" id="item-scan-net"><span class="list-icon"><svg class="ico" viewBox="0 0 24 24"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M4 12h16"/></svg></span><span>扫码入网 / 加好友</span></div>
     </div>
     <input type="file" id="qr-scan-input" accept="image/*" capture="environment" style="display:none">
     <div class="section-label">P2P 连接</div>
@@ -81,6 +83,8 @@
     <div class="list">
       <div class="list-item" id="item-trade"><span class="list-icon"><svg class="ico" viewBox="0 0 24 24"><path d="M4 7h16M4 12h10M4 17h7"/><path d="M17.5 14.5l2.5 2.5-2.5 2.5"/></svg></span><span style="flex:1">资源交易</span><span class="list-arrow">›</span></div>
     </div>
+    <div class="section-label">微信息 (微支付)</div>
+    <div class="list" id="x402-info-list"></div>
     <div class="section-label">P2P 好友列表</div>
     <div class="list" id="contacts-list"></div>
     <div class="section-label">MCP 工具 (触控调用)</div>
@@ -132,13 +136,56 @@
   </div>
 </div>
 
-<!-- 添加好友: 底部滑出选择 sheet -->
+<!-- 添加好友: 底部滑出选择 sheet (点按式: 扫码 / 附近 / 待处理申请 / 手动) -->
 <div class="sheet" id="addfriend-sheet" hidden>
   <div class="sheet-inner sheet-inner-choices">
-    <div class="sheet-title">添加 P2P 好友</div>
+    <div class="sheet-title">连接好友</div>
+    <button class="sheet-choice" id="choice-nearby"><svg class="ico" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 16 0"/><path d="M7.5 12a4.5 4.5 0 0 1 9 0"/><circle cx="12" cy="12" r="1.4"/><path d="M12 13.6V19"/></svg> 附近的设备</button>
     <button class="sheet-choice" id="choice-scan"><svg class="ico" viewBox="0 0 24 24"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M4 12h16"/></svg> 扫码添加</button>
-    <button class="sheet-choice" id="choice-manual"><svg class="ico" viewBox="0 0 24 24"><path d="M10.5 13.5a3.5 3.5 0 0 1 0-5l2-2a3.5 3.5 0 0 1 5 5l-1 1"/><path d="M13.5 10.5a3.5 3.5 0 0 1 0 5l-2 2a3.5 3.5 0 0 1-5-5l1-1"/></svg> 手动输入地址</button>
+    <button class="sheet-choice" id="choice-requests"><svg class="ico" viewBox="0 0 24 24"><path d="M6 4h9l4 4v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M9 12h6M9 16h4"/></svg> 待处理申请</button>
+    <button class="sheet-choice sheet-cancel" id="choice-manual">⌨️ 手动输入地址 (兜底)</button>
     <button class="sheet-choice sheet-cancel" id="choice-cancel">取消</button>
+  </div>
+</div>
+
+<!-- 加入网络: 点按式 sheet (扫一扫 / 附近设备 / 手动粘贴兜底) -->
+<div class="sheet" id="network-sheet" hidden>
+  <div class="sheet-inner sheet-inner-choices">
+    <div class="sheet-title">加入网络</div>
+    <button class="sheet-choice" id="choice-join-nearby"><svg class="ico" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 16 0"/><path d="M7.5 12a4.5 4.5 0 0 1 9 0"/><circle cx="12" cy="12" r="1.4"/><path d="M12 13.6V19"/></svg> 附近的电脑 / 设备</button>
+    <button class="sheet-choice" id="choice-join-scan"><svg class="ico" viewBox="0 0 24 24"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M4 12h16"/></svg> 扫电脑上的二维码</button>
+    <button class="sheet-choice sheet-cancel" id="choice-join-manual">🔗 粘贴入网链接 (兜底)</button>
+    <button class="sheet-choice sheet-cancel" id="choice-join-cancel">取消</button>
+  </div>
+</div>
+
+<!-- 附近设备: 点按列表 (点一条即连接 / 建立好友) -->
+<div class="sheet" id="nearby-sheet" hidden>
+  <div class="sheet-inner">
+    <div class="sheet-title" id="nearby-title">附近设备</div>
+    <div class="sheet-text" id="nearby-hint">正在查找...</div>
+    <div class="list" id="nearby-list" style="width:100%;max-height:46vh;overflow-y:auto"></div>
+    <button class="sheet-choice" id="nearby-refresh">↻ 刷新</button>
+    <button class="sheet-choice sheet-cancel" id="nearby-close">关闭</button>
+  </div>
+</div>
+<!-- 微信息 (x402 付费信息): 点一条看详情 → 购买并验真 / 只看元数据 -->
+<div class="sheet" id="x402-sheet" hidden>
+  <div class="sheet-inner">
+    <div class="sheet-title" id="x402-title">微信息</div>
+    <div class="sheet-text" id="x402-body" style="width:100%;max-height:46vh;overflow-y:auto;text-align:left;white-space:pre-wrap;word-break:break-word"></div>
+    <button class="sheet-choice" id="x402-buy">购买并验真</button>
+    <button class="sheet-choice" id="x402-verify">只看元数据 (离线验真)</button>
+    <button class="sheet-choice sheet-cancel" id="x402-close">关闭</button>
+  </div>
+</div>
+
+<!-- 微信息结果: 内容 + 验真分档 (verified / self-attested / content-only / unverified) -->
+<div class="sheet" id="x402-result-sheet" hidden>
+  <div class="sheet-inner">
+    <div class="sheet-title" id="x402-result-title">验真结果</div>
+    <div class="sheet-text" id="x402-result-body" style="width:100%;max-height:56vh;overflow-y:auto;text-align:left;white-space:pre-wrap;word-break:break-word"></div>
+    <button class="sheet-choice sheet-cancel" id="x402-result-close">关闭</button>
   </div>
 </div>
 </div>

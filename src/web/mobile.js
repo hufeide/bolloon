@@ -75,7 +75,7 @@
     $('#topbar-title').textContent = TITLES[tab] || '会话';
     const cs = $('#btn-create-session'); if (cs) cs.hidden = tab !== 'main';
     const ta = $('#topbar-actions'); if (ta) ta.hidden = tab === 'me';   // 我 页不显示 加号/刷新
-    if (tab === 'network') { loadContacts(); loadMcpTools(); loadApprovals(); loadNetMembers(); loadP2PStatus(); loadAgentServices(); }
+    if (tab === 'network') { loadContacts(); loadMcpTools(); loadApprovals(); loadNetMembers(); loadP2PStatus(); loadAgentServices(); loadX402Info(); }
     if (tab === 'main') { loadAgentCovers(); }
     window.__mobileTouch?.('tab', tab);
   }
@@ -1855,17 +1855,43 @@
       try { const net = await api.get('/api/network/status'); const p2p = net && net.nodeId; alert('P2P ID (通信ID, ≠ DID):\n' + (p2p || '未连接')); }
       catch (e) { alert('P2P ID: 获取失败'); }
     });
-    // #2 极简入网按钮: 粘贴/输入链接 → BolloonCore.gateway.join (懒加载 mobile-gateway)
+    // #2 加入网络 (点按式): sheet → [附近的电脑/设备] [扫电脑上的二维码] [粘贴链接兜底]
     const joinNetBtn = $('#item-join-net');
-    if (joinNetBtn) joinNetBtn.addEventListener('click', async () => {
-      const link = (window.prompt && window.prompt('粘贴网络链接\n(orbitdb://  ipns://  https://.../registry)') || '').trim();
-      if (!link) return;
-      try {
-        const r = await (window.BolloonCore && window.BolloonCore.gateway && window.BolloonCore.gateway.join(link));
-        alert(r ? (r.output || '已处理') : 'BolloonCore.gateway 不可用');
-      } catch (e) { alert('加入失败: ' + String((e && e.message) || e).slice(0, 120)); }
-      loadNetMembers();
+    if (joinNetBtn) joinNetBtn.addEventListener('click', () => showSheet('#network-sheet'));
+    const cJoinNearby = $('#choice-join-nearby');
+    if (cJoinNearby) cJoinNearby.addEventListener('click', () => { hideSheet('#network-sheet'); openNearbySheet('join'); });
+    const cJoinScan = $('#choice-join-scan');
+    if (cJoinScan) cJoinScan.addEventListener('click', () => {
+      hideSheet('#network-sheet'); _qrMode = 'join';
+      const inp = $('#qr-scan-input'); if (inp) inp.click();
     });
+    const cJoinManual = $('#choice-join-manual');
+    if (cJoinManual) cJoinManual.addEventListener('click', () => { hideSheet('#network-sheet'); joinNetworkManual(); });
+    const cJoinCancel = $('#choice-join-cancel');
+    if (cJoinCancel) cJoinCancel.addEventListener('click', () => hideSheet('#network-sheet'));
+
+    // #2b 连接好友 (点按式) + 附近设备 + 待处理申请
+    const addFriendBtn = $('#item-add-friend');
+    if (addFriendBtn) addFriendBtn.addEventListener('click', () => showSheet('#addfriend-sheet'));
+    const cNearby = $('#choice-nearby');
+    if (cNearby) cNearby.addEventListener('click', () => { hideSheet('#addfriend-sheet'); openNearbySheet('friend'); });
+    const cRequests = $('#choice-requests');
+    if (cRequests) cRequests.addEventListener('click', () => { hideSheet('#addfriend-sheet'); openRequestsSheet(); });
+    const nearbyBtn = $('#item-nearby');
+    if (nearbyBtn) nearbyBtn.addEventListener('click', () => openNearbySheet('friend'));
+    const nearbyRefresh = $('#nearby-refresh');
+    if (nearbyRefresh) nearbyRefresh.addEventListener('click', () => loadNearbyList(_nearbyMode));
+    const nearbyClose = $('#nearby-close');
+    if (nearbyClose) nearbyClose.addEventListener('click', () => hideSheet('#nearby-sheet'));
+    // 微信息 (x402 付费信息): 详情 → 购买并验真 / 只看元数据
+    const x402Buy = $('#x402-buy');
+    if (x402Buy) x402Buy.addEventListener('click', () => buyX402Info());
+    const x402VerifyBtn = $('#x402-verify');
+    if (x402VerifyBtn) x402VerifyBtn.addEventListener('click', () => verifyX402Info());
+    const x402Close = $('#x402-close');
+    if (x402Close) x402Close.addEventListener('click', () => hideSheet('#x402-sheet'));
+    const x402ResultClose = $('#x402-result-close');
+    if (x402ResultClose) x402ResultClose.addEventListener('click', () => hideSheet('#x402-result-sheet'));
     // #3 扫码入网: 拍照/选图 → BolloonCore.qr.decode(jsQR) → gateway.join (免原生插件)
     const scanBtn = $('#item-scan-net');
     const scanInput = $('#qr-scan-input');
@@ -1908,6 +1934,370 @@
       img.onerror = () => { alert('图片读取失败'); URL.revokeObjectURL(url); };
       img.src = url;
     });
+  }
+
+  // ==================== 点按式联网 / 加好友 (2026-09-13) ====================
+  // 人类手机习惯: 点按钮选一条, 而不是粘贴网址。粘贴/手动输入只作兜底放在最下面。
+  let _nearbyMode = 'friend';   // 'join' = 加入网络 | 'friend' = 连接好友
+
+  /** 电脑端基地址 (未配置 → 空字符串, 走本机能力) */
+  async function desktopBaseUrl() {
+    try {
+      const u = await (window.BolloonCore && window.BolloonCore.desktop && window.BolloonCore.desktop.url && window.BolloonCore.desktop.url());
+      // BolloonCore.desktop.url() 返回 { url }, 但也兼容直接返回字符串的实现 —
+      // 直接 String(对象) 会得到 "[object Object]"，转发全部静默失败 (2026-09-13 修)
+      const raw = (u && typeof u === 'object') ? (u.url || u.baseUrl || '') : u;
+      return String(raw || '').replace(/\/+$/, '');
+    } catch (e) { return ''; }
+  }
+
+  /** 转发到电脑端 HTTP (手机自足模式下拿不到就返回 null, 不假装成功) */
+  async function desktopFetch(path, body) {
+    const base = await desktopBaseUrl();
+    if (!base) return null;
+    try {
+      const res = await fetch(base + path, body
+        ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+        : undefined);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) { return null; }
+  }
+
+  /** 加入网络 · 手动粘贴 (兜底入口, 从 sheet 底部小字进来) */
+  async function joinNetworkManual() {
+    const link = (window.prompt && window.prompt('粘贴网络链接\n(orbitdb://  ipns://  https://.../registry)') || '').trim();
+    if (!link) return;
+    try {
+      const r = await (window.BolloonCore && window.BolloonCore.gateway && window.BolloonCore.gateway.join(link));
+      alert(r ? (r.output || '已处理') : 'BolloonCore.gateway 不可用');
+    } catch (e) { alert('加入失败: ' + String((e && e.message) || e).slice(0, 120)); }
+    loadNetMembers();
+  }
+
+  function openNearbySheet(mode) {
+    _nearbyMode = mode;
+    const t = $('#nearby-title');
+    if (t) t.textContent = mode === 'join' ? '附近的电脑 / 设备' : '附近的设备';
+    showSheet('#nearby-sheet');
+    loadNearbyList(mode);
+  }
+
+  /** 扫一遍"附近": 电脑端 (同一 Wi-Fi) + 已连通的 P2P 设备 (+ 待处理申请) */
+  async function loadNearbyList(mode) {
+    const list = $('#nearby-list');
+    const hint = $('#nearby-hint');
+    if (!list) return;
+    list.innerHTML = '';
+    if (hint) hint.textContent = '正在查找...';
+    const rows = [];
+    try {
+      const addrs = await (window.BolloonCore && window.BolloonCore.network && window.BolloonCore.network.desktopAddrs());
+      const base = await desktopBaseUrl();
+      const firstAddr = (addrs && Array.isArray(addrs.addrs) && addrs.addrs[0]) || '';
+      if (base || firstAddr) {
+        rows.push({
+          icon: '🖥️',
+          title: '电脑端' + (addrs && addrs.peerId ? ' · ' + String(addrs.peerId).slice(0, 8) : ''),
+          sub: base || firstAddr,
+          kind: 'desktop',
+        });
+      }
+    } catch (e) { /* 电脑端不可达 */ }
+    try {
+      const peers = await api.get('/api/peers');
+      for (const p of (peers || [])) {
+        const key = p.publicKey || p.id || '';
+        rows.push({
+          icon: '📱',
+          title: p.name || String(key).slice(0, 12) || '设备',
+          sub: '已连通 · ' + String(key).slice(0, 16),
+          kind: 'peer',
+          key,
+        });
+      }
+    } catch (e) { /* 无对端 */ }
+    if (mode === 'friend') {
+      const fr = await desktopFetch('/api/friend-requests');
+      if (fr && fr.count > 0) {
+        rows.push({ icon: '📋', title: `待处理好友申请 ${fr.count} 个`, sub: '点一下处理', kind: 'requests' });
+      }
+    }
+    if (hint) hint.textContent = rows.length ? '点一条即操作' : '没找到设备 — 让电脑端开着 (同一 Wi-Fi), 或扫电脑上的二维码';
+    if (rows.length === 0) { list.innerHTML = '<div class="list-item">（暂无）</div>'; return; }
+    for (const r of rows) {
+      const el = document.createElement('div');
+      el.className = 'list-item';
+      el.innerHTML = `<span class="list-icon">${r.icon}</span><span><div>${escapeHtml(r.title)}</div><div style="font-size:12px;color:var(--text-muted)">${escapeHtml(r.sub || '')}</div></span><span class="list-arrow">›</span>`;
+      el.addEventListener('click', () => onNearbyTap(r, mode));
+      list.appendChild(el);
+    }
+  }
+
+  async function onNearbyTap(row, mode) {
+    if (row.kind === 'requests') { hideSheet('#nearby-sheet'); return openRequestsSheet(); }
+    if (row.kind === 'desktop') {
+      try {
+        const r = await (window.BolloonCore && window.BolloonCore.network && window.BolloonCore.network.connect());
+        const bad = r && r.ok === false;
+        alert(bad ? ('连接电脑端失败: ' + String(r.error || '').slice(0, 100)) : '已连接电脑端 (数据/网络开始同步)');
+        if (!bad && mode === 'join') {
+          try { await (window.BolloonCore.desktop && window.BolloonCore.desktop.sync && window.BolloonCore.desktop.sync()); } catch (e) {}
+        }
+        loadNetMembers(); loadP2PStatus();
+      } catch (e) { alert('连接失败: ' + String((e && e.message) || e).slice(0, 120)); }
+      return;
+    }
+    if (row.kind === 'peer') {
+      if (mode !== 'friend') { alert('这个设备已经和本机连通了。'); return; }
+      let me = '手机端用户';
+      try { const s = await api.get('/api/auth/status'); if (s && s.name) me = s.name; } catch (e) {}
+      const sent = await desktopFetch('/api/friend-request', { targetPublicKey: row.key, name: me, message: '手机端请求加好友' });
+      alert(sent ? '已发出好友申请' : '本机已记录该设备; 需要电脑端在线才能把申请发出去');
+    }
+  }
+
+  /** 待处理好友申请: 点一条 → 通过 (取消 = 忽略) */
+  async function openRequestsSheet() {
+    const t = $('#nearby-title'); if (t) t.textContent = '待处理好友申请';
+    showSheet('#nearby-sheet');
+    const list = $('#nearby-list'); const hint = $('#nearby-hint');
+    if (!list) return;
+    list.innerHTML = '';
+    if (hint) hint.textContent = '正在读取...';
+    const fr = await desktopFetch('/api/friend-requests');
+    if (!fr || !fr.requests || fr.requests.length === 0) {
+      if (hint) hint.textContent = fr ? '没有待处理申请' : '需要电脑端在线 (设置里填桌面地址) 才能读取';
+      list.innerHTML = '<div class="list-item">（空）</div>';
+      return;
+    }
+    if (hint) hint.textContent = '点一条 = 通过 · 取消 = 忽略';
+    for (const r of fr.requests) {
+      const el = document.createElement('div');
+      el.className = 'list-item';
+      el.innerHTML = `<span class="list-icon">👤</span><span><div>${escapeHtml(r.fromName || '陌生人')}</div><div style="font-size:12px;color:var(--text-muted)">${escapeHtml(r.note || r.message || '(无备注)')}</div></span>`;
+      el.addEventListener('click', async () => {
+        const ok = window.confirm(`通过 ${r.fromName || '对方'} 的好友申请?\n\n确定 = 通过并加为好友\n取消 = 忽略这条申请`);
+        if (ok) {
+          const acc = await desktopFetch('/api/friend-accept', { fromPublicKey: r.fromPublicKey, name: r.fromName, requestId: r.requestId });
+          alert(acc ? '已加为好友' : '通过失败 — 检查电脑端是否在线');
+        } else {
+          const ig = await desktopFetch('/api/friend-requests/ignore', { requestId: r.requestId });
+          alert(ig ? '已忽略' : '忽略失败 — 检查电脑端是否在线');
+        }
+        hideSheet('#nearby-sheet');
+        if (typeof loadContacts === 'function') loadContacts();
+      });
+      list.appendChild(el);
+    }
+  }
+
+  // ==================== 微信息 (x402 付费信息, 2026-09-13) ====================
+  // 人类手机操作: 浏览 → 点一条看详情 (价格/类别/哈希/来源) → 「购买并验真」→ 内容 + 验真分档。
+  // 安全边界 (**不能破**): 手机端不持 EVM 私钥, 付款一律经电脑端 /api/x402/info/buy 代付;
+  //   没配桌面地址 / 电脑端不可达 → 说人话提示, 绝不假装成功、绝不自己造数据。
+  let _x402Cache = [];        // 最近一次列表 (行点击按 id 找回)
+  let _x402Current = null;    // 详情 sheet 当前对应的 item
+
+  /** 售卖端点 (付费取内容): <桌面基址>/api/x402/info/<id> */
+  async function x402SellUrl(id) {
+    const base = await desktopBaseUrl();
+    return base ? base + '/api/x402/info/' + encodeURIComponent(String(id || '')) : '';
+  }
+
+  /**
+   * 转发到电脑端并**保留后端错误原文** (购买失败要如实显示 "需要钱包私钥"/"facilitator 不可达",
+   * 而 desktopFetch 失败时只回 null 会丢掉原因)。基地址仍走 desktopBaseUrl(), 不另起一套。
+   */
+  async function desktopPostRaw(path, body) {
+    const base = await desktopBaseUrl();
+    if (!base) return { ok: false, error: '需要电脑端在线 (设置里填桌面地址)' };
+    try {
+      const res = await fetch(base + path, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+      });
+      let data = null;
+      try { data = await res.json(); } catch (e) { data = null; }
+      if (!res.ok) {
+        return { ok: false, status: res.status, error: (data && (data.error || data.message)) || ('电脑端返回 ' + res.status), data };
+      }
+      return data || { ok: false, error: '电脑端返回空响应' };
+    } catch (e) {
+      return { ok: false, error: '电脑端不可达: ' + String((e && e.message) || e).slice(0, 120) };
+    }
+  }
+
+  /** 离线能核对的部分 (全部来自免费元数据, 不含内容本体) */
+  function x402MetaLines(item) {
+    const it = item || {};
+    const p = it.price || {};
+    const src = it.source || {};
+    const refs = Array.isArray(src.refs) ? src.refs : [];
+    const lines = [
+      `价格: ${p.amount || '0'} ${p.currency || ''} (网络 ${p.network || '未声明'})`,
+      `类别: ${it.category || 'other'}`,
+      `提供方: ${(it.provider && (it.provider.name || '未命名')) || '未知'} · ${String((it.provider && it.provider.did) || '').slice(0, 28)}${(it.provider && it.provider.did && String(it.provider.did).length > 28) ? '…' : ''}`,
+      `内容哈希: ${it.contentHash || '(无)'}`,
+      `来源声明: ${src.kind || '未声明'}${refs.length ? ' · 引用 ' + refs.length + ' 条' : ' · 无引用'}`,
+    ];
+    for (const r of refs) lines.push('  · ' + String(r));
+    if (src.note) lines.push(`来源备注: ${src.note}`);
+    if (it.description) lines.push(`说明: ${it.description}`);
+    lines.push('', '付款由电脑端代付 (手机端不拿私钥)');
+    return lines;
+  }
+
+  /** 拉列表: 有数据 / 桌面不可达 / 空列表 三种情况都给人话 */
+  async function loadX402Info() {
+    const list = $('#x402-info-list');
+    if (!list) return;
+    list.innerHTML = '<div class="list-item">正在读取微信息...</div>';
+    const base = await desktopBaseUrl();
+    const r = base ? await desktopFetch('/api/x402/info') : null;
+    if (!r || r.note === 'desktop-unreachable') {
+      // (b) 桌面不可达: 手机端不持私钥, 浏览/代付都只能靠电脑端 — 直接说, 不假装有数据
+      _x402Cache = [];
+      list.innerHTML = '<div class="list-item">需要电脑端在线 (设置里填桌面地址)</div>';
+      return;
+    }
+    const items = Array.isArray(r.items) ? r.items : [];
+    _x402Cache = items;
+    if (items.length === 0) {
+      // (c) 电脑端在线但没发布过
+      list.innerHTML = '<div class="list-item">电脑端还没发布任何付费信息</div>';
+      return;
+    }
+    // (a) 有数据 → 每条一行: 标题 + 价格 + 类别 + 提供方
+    list.innerHTML = '';
+    for (const it of items) {
+      const p = it.price || {};
+      const amount = p.amount ? `${p.amount} ${p.currency || ''}`.trim() : '免费';
+      const provName = (it.provider && (it.provider.name || it.provider.did)) || '未知提供方';
+      const el = document.createElement('div');
+      el.className = 'list-item';
+      el.innerHTML = `<span class="list-icon">💰</span><span><div>${escapeHtml(it.title || '(无标题)')}</div>` +
+        `<div style="font-size:12px;color:var(--text-muted)">${escapeHtml(amount)} · ${escapeHtml(it.category || 'other')} · ${escapeHtml(String(provName).slice(0, 20))}</div></span>` +
+        `<span class="list-arrow">›</span>`;
+      el.addEventListener('click', () => openX402Sheet(it));
+      list.appendChild(el);
+    }
+  }
+
+  /** 点一条 → 详情 sheet (价格/网络/类别/提供方 DID 前缀/内容哈希/来源) */
+  function openX402Sheet(item) {
+    if (!item) return;
+    _x402Current = item;
+    const t = $('#x402-title');
+    if (t) t.textContent = item.title || '微信息';
+    const body = $('#x402-body');
+    if (body) body.textContent = x402MetaLines(item).join('\n');
+    const buy = $('#x402-buy');
+    if (buy) { buy.disabled = false; buy.textContent = '购买并验真'; }
+    showSheet('#x402-sheet');
+  }
+
+  /** 结果 sheet: 内容 + 验真结论 (纯文本渲染, 不用 innerHTML) */
+  function showX402Result(title, text) {
+    const t = $('#x402-result-title');
+    if (t) t.textContent = title || '验真结果';
+    const b = $('#x402-result-body');
+    if (b) b.textContent = String(text || '');
+    showSheet('#x402-result-sheet');
+  }
+
+  /** 购买并验真: 一律转发电脑端代付 (手机端不签名, 不持 EVM 私钥) */
+  async function buyX402Info() {
+    const item = _x402Current;
+    if (!item) return;
+    const btn = $('#x402-buy');
+    const base = await desktopBaseUrl();
+    if (!base) {
+      alert('需要电脑端在线 (设置里填桌面地址) — 付款只能由电脑端代付, 手机端不保存私钥');
+      return;
+    }
+    const sellUrl = base + '/api/x402/info/' + encodeURIComponent(String(item.id || ''));
+    // 上限 = 标价上浮 20% (防挂单涨价); 标价读不到就不传上限
+    const amt = Number((item.price || {}).amount);
+    const maxPayment = Number.isFinite(amt) && amt > 0 ? String(Number((amt * 1.2).toFixed(8))) : undefined;
+    if (btn) { btn.disabled = true; btn.textContent = '付款中...'; }
+    try {
+      const r = await desktopPostRaw('/api/x402/info/buy', {
+        url: sellUrl,
+        ...(maxPayment ? { maxPayment } : {}),
+        allowLocalDev: true,
+      });
+      if (!r || r.ok !== true) {
+        // 如实转述后端原因 (缺私钥 / facilitator 不可达 / 电脑端不可达), 不吞错
+        alert('购买失败: ' + ((r && r.error) || '电脑端不可达 (检查设置里的桌面地址)'));
+        return;
+      }
+      const content = String(r.content || '');
+      const lines = [
+        r.verifySummary || ((r.verify && r.verify.trust) ? '验真档: ' + r.verify.trust : '后端未给验真结论'),
+        r.payment ? `支付模式: ${r.payment.mode || '?'}${r.payment.txHash ? ' · tx ' + String(r.payment.txHash).slice(0, 24) : ''}` : '',
+        `内容哈希: ${(r.item && r.item.contentHash) || item.contentHash || '?'}`,
+        `内容长度: ${content.length} 字`,
+        '',
+        '—— 内容 (前 2000 字) ——',
+        content.slice(0, 2000) + (content.length > 2000 ? '\n…(已截断)' : ''),
+      ].filter((x) => x !== '');
+      showX402Result('已购买并验真', lines.join('\n'));
+    } catch (e) {
+      alert('购买失败: ' + String((e && e.message) || e).slice(0, 160));
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '购买并验真'; }
+    }
+  }
+
+  /** 只看元数据 / 离线验真: 没付款就没有信封 → 明说还差什么, 不谎称"验真通过" */
+  async function verifyX402Info() {
+    const item = _x402Current;
+    if (!item) return;
+    const btn = $('#x402-verify');
+    const meta = x402MetaLines(item);
+    const sellUrl = await x402SellUrl(item.id);
+    if (!sellUrl) {
+      showX402Result('离线查看元数据', meta.join('\n') + '\n\n没配桌面地址 → 拿不到签名信封, 无法验真。');
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = '核对中...'; }
+    try {
+      const r = await desktopPostRaw('/api/x402/info/verify', { envelope: null, url: sellUrl });
+      // 注意: 后端 verify 的 ok = "信封验真是否通过", 不是 "HTTP 是否成功" —
+      //   只要拿到 report 就是一次成功的请求, 不能把 report.ok=false 当成"电脑端不可达"
+      const report = r && r.report ? r.report : null;
+      if (!report) {
+        showX402Result('还不能验真', ((r && r.error) || '电脑端不可达') + '\n\n离线可核对的:\n' + meta.join('\n'));
+        return;
+      }
+      const checks = Array.isArray(report.checks) ? report.checks : [];
+      // 没付款时后端拿到的是 402 的付款要求 (不是信封) → 报告必然是 unverified; 如实说明原因
+      const noEnvelope = report.trust === 'unverified' && !checks.some((c) => c.name === 'provider-signature' && c.ok);
+      if (noEnvelope) {
+        const p = item.price || {};
+        showX402Result('只看元数据 (还没付款)', [
+          '电脑端返回 402 付款要求 → 还没付款就拿不到签名信封, 此时无法验真。',
+          `付款要求 (来自元数据): ${p.amount || '0'} ${p.currency || ''} → ${String(p.payTo || '').slice(0, 20)}… (${p.network || '未声明'})`,
+          '',
+          '离线可核对的 (免费元数据):',
+          ...meta,
+          '',
+          '点「购买并验真」由电脑端代付后, 才能拿到信封做分档验真。',
+        ].join('\n'));
+        return;
+      }
+      showX402Result('验真结果', [
+        r.summary || ('验真档: ' + (report.trust || '?')),
+        report.warnings && report.warnings.length ? '提示: ' + report.warnings.join('; ') : '',
+        '',
+        '逐项检查:',
+        ...checks.map((c) => `${c.ok ? '✅' : '❌'} ${c.name}: ${c.detail}`),
+      ].filter((x) => x !== '').join('\n'));
+    } catch (e) {
+      showX402Result('核对失败', String((e && e.message) || e).slice(0, 200));
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '只看元数据 (离线验真)'; }
+    }
   }
 
   async function loadNetMembers() {

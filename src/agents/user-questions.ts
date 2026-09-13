@@ -146,11 +146,12 @@ export class UserQuestionStore {
     await this.save();
 
     const wait = new Promise<UserQuestion>((resolve) => {
-      const timer = setTimeout(() => {
+      const timer = setTimeout(async () => {
         // 定时器到点: 若仍在等 → 标记 expired (如实返回, 不伪造答案)
         if (this.waiters.delete(q.id) && q.status === 'pending') {
           q.status = 'expired';
-          void this.save();
+          // 落盘要先于 resolve: 否则调用方 (或人类界面) 紧接着读盘时可能看不到这条记录
+          await this.save();
         }
         resolve(q);
       }, timeoutMs);

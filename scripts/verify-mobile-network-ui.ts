@@ -64,9 +64,10 @@ async function main() {
     const js3 = JSON.parse(String(nearby.output));
     record('④ 「附近的设备」面板可点 + 有文案反馈', js3.visible && !!js3.hint, JSON.stringify(js3));
 
-    // 截图存证
+    // 截图存证 (browser 模块返回字段是 screenshotPath)
     const shot = await session.execute({ action: 'screenshot' });
-    record('⑤ 截图存证', !!shot.path, String(shot.path || ''));
+    const shotPath = shot.screenshotPath || shot.path;
+    record('⑤ 截图存证', !!shotPath, String(shotPath || ''));
 
     await session.execute({ action: 'close' });
   } catch (e: any) {
