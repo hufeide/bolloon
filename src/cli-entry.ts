@@ -68,8 +68,11 @@ ${BOLD}选项:${RESET}
   --help, -h          显示帮助信息
 
 ${BOLD}命令:${RESET}
+  bolloon setup                     初始化向导 (你的称呼 + 模型供应商 + API key + 连通性测试)
   bolloon update [--now]            检查更新 / 立即更新 (bolloon update --now)
   bolloon model [name] [model]      列出 / 切换模型供应商 (如: bolloon model deepseek deepseek-v4-flash)
+  bolloon model key <name>          配置某供应商的 API key (隐藏输入, 不回显)
+  bolloon model test [name]         测试供应商连通性
   bolloon read <file>               读取文档
   bolloon summarize <file>          总结文档
   bolloon improve <file> <req>      改进文档
@@ -168,6 +171,10 @@ function parseArgs(): { mode: string; args: string[] } {
       return { mode: 'update', args: args.slice(1) };
     case 'model':
       return { mode: 'model', args: args.slice(1) };
+    // 2026-09-13: 初始化向导 (用户身份 + 模型供应商 + API key)
+    case 'setup':
+    case 'init':
+      return { mode: 'setup', args: args.slice(1) };
     case 'read':
     case 'summarize':
     case 'improve':
@@ -349,32 +356,48 @@ async function handleModelCommand(modelArgs: string[]): Promise<void> {
     return;
   }
 
-  // 切换供应商
-  const name = modelArgs[0].toLowerCase();
-  const config = await llmConfigStore.getConfig();
-  const providers = config.providers as unknown as Record<string, { enabled: boolean; apiKey?: string; baseUrl: string; model: string; requiresApiKey?: boolean }>;
-  if (!providers[name]) {
-    console.error(`${MAGENTA}❌ 未知供应商: ${name}${RESET}`);
-    console.error(`   可用: ${Object.keys(providers).join(', ')}`);
-    process.exit(1);
-  }
-  const provider = providers[name];
-  if (provider.requiresApiKey && !provider.apiKey) {
-    console.error(`${MAGENTA}❌ ${name} 需要 API key (当前未配置)${RESET}`);
-    console.error(`   配置方式: ① Web UI API 配置页  ② 环境变量 (如 DEEPSEEK_API_KEY)`);
-    process.exit(1);
-  }
+  // 有参: 统一交给 setup-wizard 的 runModelCommand
+  //   (切换 / <provider> <model> / key <provider> / test / status 一套语义, 与 CLI 会话内 /model 完全一致)
+  const { runModelCommand, askHiddenLine } = await import('./cli/setup-wizard.js');
+  const out = await runModelCommand(modelArgs.join(' '), {
+    // 正常终端里可以安全收 key (隐藏输入, 不回显)
+    askHidden: (q: string) => askHiddenLine(q),
+  });
+  for (const line of String(out).split('\n')) console.log(line);
+}
 
-  await llmConfigStore.setActiveProvider(name as any);
-  let modelNote = '';
-  if (modelArgs[1]) {
-    await llmConfigStore.updateProvider(name as any, { model: modelArgs[1] });
-    modelNote = `, model=${modelArgs[1]}`;
+/** `bolloon setup` — 首次运行初始化向导 (用户身份 + 模型供应商 + API key + 连通性测试) */
+async function handleSetupCommand(setupArgs: string[]): Promise<void> {
+  const { runSetupWizard } = await import('./cli/setup-wizard.js');
+  const val = (name: string) => {
+    const i = setupArgs.indexOf(name);
+    return i >= 0 && i + 1 < setupArgs.length ? setupArgs[i + 1] : undefined;
+  };
+  if (setupArgs.includes('--help') || setupArgs.includes('-h')) {
+    console.log(`${BOLD}bolloon setup${RESET} — 初始化 Bolloon (用户身份 + 模型供应商 + API key)`);
+    console.log('');
+    console.log('  无参数            交互式向导 (推荐)');
+    console.log('  --provider <名>   指定供应商 (deepseek / minimax / openai / anthropic / ...)');
+    console.log('  --api-key <key>   直接给 key (脚本用; 交互模式会隐藏输入)');
+    console.log('  --model <名>      指定模型');
+    console.log('  --name <称呼>     你的称呼 (写入 ~/.bolloon/identity/user.json)');
+    console.log('  --no-test         跳过连通性测试');
+    return;
   }
-  const info = (PROVIDER_INFO as any)[name] || {};
-  console.log(`${GREEN}✅ 已切换到 ${name}${RESET} (${info.name || ''})${modelNote}`);
-  console.log(`   当前模型: ${modelArgs[1] || provider.model || (info.models && info.models[0]) || '默认'}`);
-  console.log(`   配置已持久化: ~/.bolloon/bolloon-config.json`);
+  const apiKey = val('--api-key');
+  const needsInteractive = !apiKey;
+  const r = await runSetupWizard({
+    interactive: needsInteractive,
+    provider: val('--provider'),
+    apiKey,
+    model: val('--model'),
+    name: val('--name'),
+    skipTest: setupArgs.includes('--no-test'),
+  });
+  if (!r.ok) {
+    console.error(`${MAGENTA}✗ 初始化失败: ${r.error}${RESET}`);
+    process.exit(1);
+  }
 }
 
 /** 引擎子命令: list / run */
@@ -622,6 +645,11 @@ async function main() {
 
     case 'model':
       await handleModelCommand(args);
+      break;
+
+    // 2026-09-13: bolloon setup — 首次运行初始化向导
+    case 'setup':
+      await handleSetupCommand(args);
       break;
 
     case 'passthrough':

@@ -11,6 +11,13 @@ import type { Tool, ToolResult } from './pi-sdk-types.js';
 import type { PersonaDoc } from '../social/heartbeat.js';
 import { getMinimax } from '../constraints/index.js';
 import { delegateToEngine } from '../external-engines/delegate.js';
+// 2026-09-13: 下一代工具集 (人机问答 / 精确补丁 / 桌面操作 / 技能分享)
+import { userQuestions, DEFAULT_QUESTION_TIMEOUT_MS } from './user-questions.js';
+import { registerPatchTools } from './patch-tool.js';
+import { registerComputerUseTools } from './computer-use.js';
+import { registerSkillShareTools } from './skill-share.js';
+// 2026-09-13: 微支付信息服务 (x402 付费信息 + 验真信封)
+import { registerPaidInfoTools } from './x402/paid-info-tools.js';
 
 /**
  * Tools 模块 — 从 pi-sdk.ts 抽出的 registerTools() / _registerWalletTools() / _setupInboxListener()
@@ -37,6 +44,8 @@ import { delegateToEngine } from '../external-engines/delegate.js';
 export const SIDE_EFFECT_TOOLS = new Set([
   'write_file', 'edit_file', 'shell_exec', 'git_commit', 'git_push', 'git_branch',
   'create_task', 'update_task', 'terminal', 'process',
+  // 2026-09-13: 幂等缓存同样适用于新工具 (重复调用不该产生第二次副作用)
+  'patch', 'computer_use', 'skill_import',
 ]);
 
 /**
@@ -3048,12 +3057,138 @@ export function registerBuiltinTools(ctx: ToolRegistryContext): void {
       }
     }
   });
+
+  // ============================================================
+  // 2026-09-13: 下一代工具补充 — 人机问答 / 代码执行 / git 补齐
+  // ============================================================
+
+  // clarify — 停下来问人, 等回答 (人机对话通道)
+  ctx.tools.set('clarify', {
+    name: 'clarify',
+    description: '向用户提问并等待回答。需要用户拍板、补充信息、确认范围时用它, 不要自己替用户猜。传 choices 时界面会渲染成可点选项 (用户回序号即可)。用户没回答会超时 (默认 600s), 这时如实返回"超时", 不要假装拿到答案。',
+    parameters: {
+      question: '要问用户的完整问题 (必填)',
+      choices: '可选: 候选选项, 用 | 分隔 (如 "方案A | 方案B | 都行")',
+      multi_select: '可选: "true" 表示允许多选 (choices 非空时有效)',
+      timeout_s: '可选: 等待秒数, 默认 600',
+    },
+    execute: async (args) => {
+      const question = String(args.question || '').trim();
+      if (!question) return { success: false, error: 'question 必填' };
+      const choiceList = String(args.choices || '')
+        .split('|').map((s) => s.trim()).filter(Boolean);
+      const timeoutMs = Number(args.timeout_s) > 0 ? Number(args.timeout_s) * 1000 : DEFAULT_QUESTION_TIMEOUT_MS;
+      // 无人值守 (后台/定时任务) 时问了也没人答 → 提前如实拒绝, 不空等
+      if (!userQuestions.hasHumanChannel()) {
+        return {
+          success: false,
+          error: '当前没有可交互的人类界面 (后台/无人值守模式), 无法提问。请把问题写进最终回复交给用户。',
+        };
+      }
+      const pending = await userQuestions.pending();
+      const q = await userQuestions.ask({
+        question,
+        choices: choiceList.length > 0 ? choiceList : undefined,
+        multiSelect: String(args.multi_select ?? '').toLowerCase() === 'true',
+        timeoutMs,
+        source: pending.length > 0 ? 'agent(queued)' : 'agent',
+      });
+      if (q.status === 'answered') {
+        return { success: true, output: `用户回答: ${q.answer}` };
+      }
+      if (q.status === 'cancelled') {
+        return { success: false, error: `问题已被取消 (id ${q.id})` };
+      }
+      return {
+        success: false,
+        error: `等待用户回答超时 (${Math.round(timeoutMs / 1000)}s, 问题 id ${q.id})。用户之后仍可在界面上回答; 现在不要假装已得到答案。`,
+      };
+    },
+  });
+
+  // execute_code — 独立代码执行工具 (与 terminal 的 code 便捷路径同源, 这里给独立入口)
+  ctx.tools.set('execute_code', {
+    name: 'execute_code',
+    description: '写一段代码并执行, 拿回 stdout/stderr/退出码。适合计算、数据处理、试算法、快速验证想法。支持 python / js / ts / shell / html。需要多步 shell 操作用 terminal; 需要长期进程用 terminal background=true。',
+    parameters: {
+      code: '要执行的代码 (必填)',
+      language: '语言: python | js | ts | shell (默认 python)',
+      timeout_ms: '可选: 超时毫秒, 默认 60000',
+    },
+    execute: async (args) => {
+      const code = String(args.code ?? '');
+      if (!code.trim()) return { success: false, error: 'code 必填' };
+      const language = String(args.language || 'python').trim().toLowerCase();
+      const timeoutMs = Number(args.timeout_ms) > 0 ? Number(args.timeout_ms) : 60000;
+      try {
+        return await runCodeSnippet({ code, language, timeoutMs, cwd: ctx.cwd });
+      } catch (e: any) {
+        return { success: false, error: `执行失败: ${String(e?.message || e).slice(0, 200)}` };
+      }
+    },
+  });
+
+  // git 补齐: status / add / restore (diff/log/show/stash/commit/push/branch 已有)
+  ctx.tools.set('git_status', {
+    name: 'git_status',
+    description: '查看 git 工作区状态 (当前分支 + 已改/已暂存/未跟踪文件). 改代码前后都该先看它.',
+    parameters: { porcelain: '可选: "true" 只输出机器可解析的 --porcelain 格式' },
+    execute: async (args) => {
+      const porcelain = String(args.porcelain ?? '').toLowerCase() === 'true';
+      const argv = porcelain ? ['status', '--porcelain'] : ['status', '--short', '--branch'];
+      const r = await shellExec('git', argv, { timeoutMs: 10_000 });
+      if (r.deniedByGuard) return { success: false, error: r.error };
+      if (!r.success) return { success: false, error: r.error, output: r.output };
+      return { success: true, output: (r.output || '').slice(0, 8000) || '(工作区干净)' };
+    },
+  });
+
+  ctx.tools.set('git_add', {
+    name: 'git_add',
+    description: '把指定文件加入暂存区 (只加显式给出的路径, 不会 add -A 误收无关改动). 路径用空格分隔.',
+    parameters: { paths: '要暂存的文件路径, 空格分隔 (必填, 支持 . 表示当前目录)' },
+    execute: async (args) => {
+      const raw = String(args.paths || '').trim();
+      if (!raw) return { success: false, error: 'paths 必填 (只加你要提交的文件)' };
+      const paths = raw.split(/\s+/).filter(Boolean);
+      const r = await shellExec('git', ['add', ...paths], { timeoutMs: 10_000 });
+      if (r.deniedByGuard) return { success: false, error: r.error };
+      if (!r.success) return { success: false, error: r.error, output: r.output };
+      return { success: true, output: `✅ 已暂存 ${paths.length} 项: ${paths.join(' ')}` };
+    },
+  });
+
+  ctx.tools.set('git_restore', {
+    name: 'git_restore',
+    description: '丢弃指定文件的改动 (git restore). staged=true 时从暂存区撤回 (--staged), 否则丢弃工作区改动。危险: 未提交改动会丢, 用前先 git_diff 确认。',
+    parameters: { paths: '要还原的文件路径, 空格分隔 (必填)', staged: '可选: "true" = 只从暂存区撤回 (工作区保留)' },
+    execute: async (args) => {
+      const raw = String(args.paths || '').trim();
+      if (!raw) return { success: false, error: 'paths 必填' };
+      const paths = raw.split(/\s+/).filter(Boolean);
+      const staged = String(args.staged ?? '').toLowerCase() === 'true';
+      const r = await shellExec('git', ['restore', ...(staged ? ['--staged'] : []), ...paths], { timeoutMs: 10_000 });
+      if (r.deniedByGuard) return { success: false, error: r.error };
+      if (!r.success) return { success: false, error: r.error, output: r.output };
+      return { success: true, output: `✅ 已${staged ? '从暂存区撤回' : '还原'} ${paths.length} 项: ${paths.join(' ')}` };
+    },
+  });
+
+  // 独立模块注册 (各自一个文件, 便于维护与单测)
+  registerPatchTools(ctx);
+  registerComputerUseTools(ctx);
+  registerSkillShareTools(ctx);
+  registerPaidInfoTools(ctx);
+  // 浏览器 (CDP 模块可选加载: 缺失时不影响其它工具)
+  import('./browser-cdp.js')
+    .then(({ registerBrowserTools }) => registerBrowserTools(ctx))
+    .catch((e) => { console.warn('[registerTools] browser 工具注册失败 (非致命):', (e as Error)?.message ?? e); });
 }
 
 // ─── IPFS/IPNS 通用 helper (2026-08-04) ─────────────────────────────────────
 // 复用 publish_did 的 checkKuboSetup 自动安装/启动本地 Kubo (darwin-arm64 v0.28.0)
 
-async function ensureKuboReady(): Promise<void> {
+export async function ensureKuboReady(): Promise<void> {
   const sdk = await import('@diap/sdk');
   const checkKuboSetup = (sdk as any).checkKuboSetup;
   if (typeof checkKuboSetup === 'function') {
