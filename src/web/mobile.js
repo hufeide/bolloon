@@ -69,7 +69,7 @@
     });
   } catch (e) {}
 
-  const TITLES = { main: '首页', network: '网络', me: '我' };
+  const TITLES = { main: '首页', friends: '好友', network: '网络', me: '我' };
   let currentTab = 'main';
   function switchTab(tab) {
     currentTab = tab;
@@ -78,7 +78,8 @@
     $('#topbar-title').textContent = TITLES[tab] || '会话';
     const cs = $('#btn-create-session'); if (cs) cs.hidden = tab !== 'main';
     const ta = $('#topbar-actions'); if (ta) ta.hidden = tab === 'me';   // 我 页不显示 加号/刷新
-    if (tab === 'network') { loadContacts(); loadTouchControl(); loadApprovals(); loadNetMembers(); loadP2PStatus(); loadAgentServices(); loadX402Info(); }
+    if (tab === 'friends') { loadContacts(); loadP2PStatus(); }
+    if (tab === 'network') { loadTouchControl(); loadApprovals(); loadNetMembers(); loadAgentServices(); loadX402Info(); }
     if (tab === 'main') { loadAgentCovers(); }
     window.__mobileTouch?.('tab', tab);
   }
@@ -1507,14 +1508,25 @@
   }
 
   // === API 配置 (LLM 供应商) ===
-  const LLM_PROVIDERS = ['deepseek', 'openai', 'anthropic', 'minimax', 'openrouter', '自定义'];
-  const LLM_DEFAULTS = {
-    deepseek: { baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
-    openai: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
-    anthropic: { baseUrl: 'https://api.anthropic.com/v1', model: 'claude-3-5-sonnet-latest' },
-    minimax: { baseUrl: 'https://api.minimax.chat/v1', model: 'MiniMax-M2.7' },
-    openrouter: { baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini' },
-  };
+  // 注意: 手机端 RemoteLlm 走 OpenAI 兼容协议 (baseUrl + /chat/completions) —— 新增 provider 必须是
+  // OpenAI 兼容端点 (gemini 用 /v1beta/openai, 智谱 v4 / dashscope compatible-mode 都兼容)。
+  const LLM_PROVIDERS = [
+    { id: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+    { id: 'openai', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+    { id: 'anthropic', label: 'Anthropic', baseUrl: 'https://api.anthropic.com/v1', model: 'claude-3-5-sonnet-latest' },
+    { id: 'gemini', label: 'Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash' },
+    { id: 'xai', label: 'Grok', baseUrl: 'https://api.x.ai/v1', model: 'grok-2-latest' },
+    { id: 'qwen', label: '通义千问', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+    { id: 'zhipu', label: '智谱 GLM', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-plus' },
+    { id: 'moonshot', label: 'Kimi', baseUrl: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+    { id: 'minimax', label: 'MiniMax', baseUrl: 'https://api.minimax.chat/v1', model: 'MiniMax-M2.7' },
+    { id: 'siliconflow', label: '硅基流动', baseUrl: 'https://api.siliconflow.cn/v1', model: 'deepseek-ai/DeepSeek-V3' },
+    { id: 'groq', label: 'Groq', baseUrl: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
+    { id: 'openrouter', label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini' },
+    { id: 'ollama', label: '本地 Ollama', baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5:7b' },
+    { id: 'custom', label: '自定义', baseUrl: '', model: '' },
+  ];
+  const LLM_BY_ID = LLM_PROVIDERS.reduce((m, p) => (m[p.id] = p, m), {});
   async function openApiConfig() {
     let cfg;
     try { cfg = await api.get('/api/llm-config'); } catch { cfg = null; }
@@ -1530,10 +1542,11 @@
         <div style="flex:1;font-weight:600">API 配置</div>
       </div>
       <div style="padding:12px;display:flex;flex-direction:column;gap:12px">
-        <label style="font-size:13px;color:var(--text-secondary)">供应商</label>
-        <select id="api-provider" style="padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-hover);color:var(--text)">
-          ${LLM_PROVIDERS.map((p) => `<option value="${p}" ${p === provider ? 'selected' : ''}>${p}</option>`).join('')}
-        </select>
+        <label style="font-size:13px;color:var(--text-secondary)">供应商 <span id="api-provider-count" style="opacity:.55"></span></label>
+        <div class="provider-chips" id="api-provider-chips">
+          ${LLM_PROVIDERS.map((p) => `<button type="button" class="provider-chip${p.id === provider ? ' active' : ''}" data-provider="${p.id}">${p.label}</button>`).join('')}
+        </div>
+        <div id="api-hint" style="font-size:12px;color:var(--text-muted)"></div>
         <label style="font-size:13px;color:var(--text-secondary)">Base URL</label>
         <input id="api-baseurl" placeholder="https://api.xxx.com/v1" value="${escapeHtml(pc.baseUrl || '')}" style="padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-hover);color:var(--text)">
         <label style="font-size:13px;color:var(--text-secondary)">API Key</label>
@@ -1544,15 +1557,37 @@
       </div>`;
     document.body.appendChild(page);
     $('#api-config-back').addEventListener('click', () => page.remove());
-    const provSel = $('#api-provider');
-    provSel.addEventListener('change', () => {
-      const p = provSel.value;
-      const d = LLM_DEFAULTS[p];
-      if (d) { $('#api-baseurl').value = d.baseUrl; $('#api-model').value = d.model; }
-      if (p === '自定义') { $('#api-baseurl').value = ''; $('#api-model').value = ''; $('#api-key').value = ''; }
+    // 供应商选择: 芯片式 (原来是一个原生 select, 小屏上难点、也看不出有哪些可选)
+    let picked = LLM_BY_ID[provider] ? provider : 'deepseek';
+    const fillFrom = (id) => {
+      const saved = (cfg.providers && cfg.providers[id]) || {};
+      const d = LLM_BY_ID[id] || {};
+      $('#api-baseurl').value = saved.baseUrl || d.baseUrl || '';
+      $('#api-model').value = saved.model || d.model || '';
+      $('#api-key').value = saved.apiKey || '';
+      const hint = $('#api-hint');
+      if (hint) {
+        hint.textContent = id === 'custom'
+          ? '自定义: 填任意 OpenAI 兼容的 baseUrl (/chat/completions)'
+          : (saved.apiKey ? '该供应商已保存过 key（改完记得再点保存）'
+                          : '填官方文档里的 API key; 保存后本机智能体就走它');
+      }
+    };
+    const paintChips = () => {
+      $$('#api-provider-chips .provider-chip').forEach((c) => c.classList.toggle('active', c.dataset.provider === picked));
+    };
+    const configured = Object.keys(cfg.providers || {}).filter((k) => cfg.providers[k] && cfg.providers[k].apiKey);
+    $('#api-provider-count').textContent = configured.length ? `（已配 ${configured.length} 个: ${configured.join(' / ')}）` : '';
+    $('#api-provider-chips').addEventListener('click', (e) => {
+      const b = e.target.closest && e.target.closest('.provider-chip');
+      if (!b) return;
+      picked = b.dataset.provider;
+      paintChips();
+      fillFrom(picked);
     });
+    fillFrom(picked);
     $('#api-save').addEventListener('click', async () => {
-      const p = provSel.value === '自定义' ? 'custom' : provSel.value;
+      const p = picked;
       const next = (cfg && cfg.providers) ? cfg : { activeProvider: cfg.activeProvider, providers: {}, updatedAt: Date.now() };
       next.activeProvider = p;
       next.providers[p] = Object.assign({}, (next.providers[p] || {}), {
@@ -2459,11 +2494,85 @@
     } catch (e) {}
   }
 
+  // === 手势 (2026-09-14): 滑动切 tab / 点空白关弹窗 / 右滑返回上一层 ===
+  // 优先级: 有浮层 → 右滑 = 返回上一层 (关浮层); 无浮层 → 左右滑 = 依次切 tab
+  function topOverlay() {
+    const all = $$('.crop-modal:not([hidden]), .sheet:not([hidden]), .chat-page:not([hidden]), .card-detail:not([hidden])');
+    if (!all.length) return null;
+    return all
+      .map((el) => ({ el, z: parseFloat(getComputedStyle(el).zIndex) || 0 }))
+      .sort((a, b) => a.z - b.z)
+      .pop().el;
+  }
+  function closeOverlay(el) {
+    if (!el) return false;
+    if (el.classList.contains('sheet')) { el.hidden = true; return true; }
+    if (el.classList.contains('card-detail')) {
+      const b = el.querySelector('#detail-back'); if (b) { b.click(); return true; }
+      el.hidden = true; return true;
+    }
+    if (el.classList.contains('crop-modal')) {
+      const b = el.querySelector('[id$="-cancel"], [id$="-close"], .icon-btn');
+      if (b) { b.click(); return true; }
+      el.hidden = true; return true;
+    }
+    if (el.classList.contains('chat-page')) {
+      const b = el.querySelector('.chat-topbar .icon-btn');   // 各页左上角 ← : 走它自带的清理
+      if (b) { b.click(); return true; }
+      el.remove(); return true;
+    }
+    return false;
+  }
+  function goBack() { return closeOverlay(topOverlay()); }
+  function inHorizontalScroller(node) {
+    for (let n = node; n && n !== document.body && n.nodeType === 1; n = n.parentElement) {
+      if (!n.scrollWidth || n.scrollWidth <= n.clientWidth + 4) continue;
+      const ox = getComputedStyle(n).overflowX;
+      if (ox === 'auto' || ox === 'scroll') return true;
+    }
+    return false;
+  }
+  function setupGestures() {
+    const TAB_ORDER = ['main', 'friends', 'network', 'me'];
+    let sx = 0, sy = 0, st = 0, active = false, startTarget = null;
+    document.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) { active = false; return; }
+      sx = e.touches[0].clientX; sy = e.touches[0].clientY;
+      st = Date.now(); active = true; startTarget = e.target;
+    }, { passive: true });
+    document.addEventListener('touchend', (e) => {
+      if (!active) return;
+      active = false;
+      const t = e.changedTouches[0];
+      const dx = t.clientX - sx, dy = t.clientY - sy;
+      if (Date.now() - st > 900) return;                                  // 慢拖不算滑
+      if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.4) return;  // 不够横向
+      if (inHorizontalScroller(startTarget)) return;                       // 横向列表/卡片轨道里不抢手势
+      const ov = topOverlay();
+      if (ov) {
+        if (dx > 0) closeOverlay(ov);           // 浮层内右滑 = 返回上一层 (输入框选中文本时不触发: dx 门槛已过滤)
+        return;
+      }
+      const i = TAB_ORDER.indexOf(currentTab);
+      if (dx < 0) { if (i + 1 < TAB_ORDER.length) switchTab(TAB_ORDER[i + 1]); }
+      else { if (i > 0) switchTab(TAB_ORDER[i - 1]); }
+    }, { passive: true });
+
+    // 点空白关弹窗: 点 sheet 的暗背景 (非 .sheet-inner 内容) 即关
+    document.addEventListener('click', (e) => {
+      const t = e.target;
+      if (!t || !t.closest) return;
+      const sheet = t.closest('.sheet');
+      if (sheet && !sheet.hasAttribute('hidden') && !t.closest('.sheet-inner')) sheet.hidden = true;
+    });
+  }
+
   function init() {
     bindMenu();
     applyTheme(resolveThemePref(), false);
     switchTab('main');
     setupUiControl();
+    setupGestures();
     installDeepLinkListeners();
     loadAgentCovers();
     loadMe();

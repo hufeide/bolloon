@@ -664,3 +664,27 @@ body {
 .list-icon .ico { width: 21px; height: 21px; }
 
 .icon-btn .ico { width: 20px; height: 20px; }
+
+/* 供应商选择: 芯片式 (API 配置页, 2026-09-14) */
+.provider-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.provider-chip {
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.2;
+  -webkit-tap-highlight-color: transparent;
+}
+.provider-chip:active { transform: scale(.96); }
+.provider-chip.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
