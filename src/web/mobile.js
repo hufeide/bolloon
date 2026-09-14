@@ -78,7 +78,7 @@
     $('#topbar-title').textContent = TITLES[tab] || '会话';
     const cs = $('#btn-create-session'); if (cs) cs.hidden = tab !== 'main';
     const ta = $('#topbar-actions'); if (ta) ta.hidden = tab === 'me';   // 我 页不显示 加号/刷新
-    if (tab === 'network') { loadContacts(); loadMcpTools(); loadApprovals(); loadNetMembers(); loadP2PStatus(); loadAgentServices(); loadX402Info(); }
+    if (tab === 'network') { loadContacts(); loadTouchControl(); loadApprovals(); loadNetMembers(); loadP2PStatus(); loadAgentServices(); loadX402Info(); }
     if (tab === 'main') { loadAgentCovers(); }
     window.__mobileTouch?.('tab', tab);
   }
@@ -134,30 +134,40 @@
     } catch (e) { /* 忽略 */ }
   }
 
-  async function loadMcpTools() {
-    const box = $('#mcp-tools');
+  // 触控控制: 收敛成一个按钮 (原来把 MCP 工具摊成列表, 用户要先看懂 MCP 再逐条点,
+  // 而且真正的前提 —— 系统里的无障碍服务 —— 原 UI 完全不提示)。
+  let _touchReady = false;   // 上次查询到的无障碍就绪状态 (按钮行为据此分流)
+  async function loadTouchControl() {
+    const box = $('#touch-control');
     if (!box) return;
-    box.innerHTML = '<div style="padding:12px 16px;color:var(--text-muted)">加载 MCP 工具...</div>';
-    try {
-      const r = await api.get('/api/mcp/tools').catch(() => null);
-      const tools = r?.tools || r || [];
-      if (!Array.isArray(tools) || tools.length === 0) {
-        box.innerHTML = '<div style="padding:12px 16px;color:var(--text-muted)">暂无可用 MCP 工具</div>';
+    const cap = window.Capacitor;
+    const bridge = cap && cap.Plugins && cap.Plugins.RokidBridge;
+    const icon = '<svg class="ico" viewBox="0 0 24 24"><path d="M9 3.5v4.5M15 3.5v4.5"/><path d="M6.5 8h11v3.2a5.5 5.5 0 0 1-11 0z"/><path d="M12 16.7V20.5"/></svg>';
+    const paint = (name, sub) => {
+      box.innerHTML = `<div class="list-item" id="item-touch-control"><span class="list-icon">${icon}</span>
+        <span style="flex:1"><span style="display:block">${escapeHtml(name)}</span>
+        <span class="conv-preview" style="display:block">${escapeHtml(sub)}</span></span>
+        <span class="list-arrow">›</span></div>`;
+      const el = $('#item-touch-control');
+      if (el) el.addEventListener('click', onTap);
+    };
+    async function onTap() {
+      if (_touchReady) {
+        alert('触控已就绪：电脑端可直接发 phone.tap / phone.swipe，或在电脑端让智能体操作这台手机');
         return;
       }
-      box.innerHTML = '';
-      tools.forEach((t) => {
-        const name = t.name || t.function?.name || '工具';
-        const desc = t.description || t.function?.description || '';
-        const el = document.createElement('div');
-        el.className = 'conv-item';
-        el.innerHTML = `<div class="conv-avatar"><svg class="ico" viewBox="0 0 24 24"><path d="M9 3.5v4.5M15 3.5v4.5"/><path d="M6.5 8h11v3.2a5.5 5.5 0 0 1-11 0z"/><path d="M12 16.7V20.5"/></svg></div>
-          <div class="conv-body"><div class="conv-name">${escapeHtml(name)}</div>
-          <div class="conv-preview">${escapeHtml(desc)}</div></div>`;
-        el.addEventListener('click', () => { window.__mobileTouch?.('mcp', name); });
-        box.appendChild(el);
-      });
-    } catch (e) { box.innerHTML = '<div style="padding:12px 16px;color:var(--text-muted)">MCP 工具加载失败</div>'; }
+      try { await bridge.openAccessibilitySettings(); }
+      catch (e) { alert('请手动开启：设置 → 辅助功能 → 已安装的服务 → Bolloon Agent'); }
+    }
+    if (!bridge) { _touchReady = false; paint('触控控制仅真机可用', '浏览器里没有无障碍能力，请在 Android App 内使用'); return; }
+    let st = {};
+    try { st = (await bridge.touchStatus()) || {}; } catch (e) { st = {}; }
+    _touchReady = !!st.ready;
+    const enabled = !!st.enabled;
+    paint(
+      _touchReady ? '触控控制 已就绪' : (enabled ? '触控控制 未连上' : '开启触控控制'),
+      st.hint || (enabled ? '服务已勾选，点一下重新检查' : '点一下去系统设置打开 Bolloon Agent 无障碍服务')
+    );
   }
 
   async function loadApprovals() {

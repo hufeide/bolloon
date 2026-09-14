@@ -1,9 +1,12 @@
 package com.bolloon.agent.rokid
 
 import android.accessibilityservice.AccessibilityService
+import android.content.ComponentName
+import android.content.Context
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONArray
@@ -29,6 +32,25 @@ class BolloonAccessibilityService : AccessibilityService() {
 
         /** UI 树最大节点数 (防超大窗口 OOM) */
         const val MAX_NODES = 800
+
+        /**
+         * 2026-09-14: 服务是否已在系统设置里勾选。
+         * 与 instance != null 不同 —— "勾选了但当前进程刚重启还没连上" 也算 enabled,
+         * 用于「触控控制」按钮给出准确引导 (别再让用户反复开关)。
+         */
+        fun isEnabledInSettings(context: Context): Boolean {
+            return try {
+                val flat = ComponentName(context, BolloonAccessibilityService::class.java).flattenToString()
+                val short = ComponentName(context, BolloonAccessibilityService::class.java).flattenToShortString()
+                val enabled = Settings.Secure.getString(
+                    context.contentResolver,
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                ) ?: return false
+                enabled.split(':').any { it.equals(flat, true) || it.equals(short, true) }
+            } catch (e: Exception) {
+                false
+            }
+        }
     }
 
     /** 主线程 Handler: 无障碍手势/UI 树读取必须在主线程执行 (Android 限制) */

@@ -26,8 +26,8 @@ android {
         applicationId 'com.bolloon.agent.rokid'
         minSdk 28
         targetSdk 35
-        versionCode 22
-        versionName '0.4.22'
+        versionCode 23
+        versionName '0.4.22.1'
     }
 
     signingConfigs {

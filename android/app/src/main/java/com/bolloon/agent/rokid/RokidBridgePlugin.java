@@ -4,8 +4,10 @@ import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.provider.Settings;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
@@ -418,6 +420,50 @@ public class RokidBridgePlugin extends Plugin {
     public void cancelAgent(PluginCall call) {
         boolean ok = AgentRuntimeHolder.INSTANCE.cancelAgent("user cancel");
         call.resolve(new JSObject().put("cancelRequested", ok));
+    }
+
+    // ============ 触控控制一键入口 (2026-09-14) ============
+    // 背景: 原来手机端把「MCP 工具 (触控调用)」摊成一个列表, 用户要先看懂 MCP 再逐条点,
+    // 认知负担大; 而且触控真正的前提是无障碍服务在系统里被勾选 —— 这一点原来 UI 完全不提示。
+    // 现在收敛为一个按钮: 查状态 → 未开就跳系统无障碍设置 → 已开就显示就绪。
+
+    /** 触控是否就绪 (无障碍服务是否已勾选 / 是否已连接) */
+    @PluginMethod
+    public void touchStatus(PluginCall call) {
+        JSObject r = new JSObject();
+        boolean ready;
+        boolean enabled;
+        try {
+            ready = AgentRuntimeHolder.INSTANCE.isAccessibilityReady();
+        } catch (Exception e) {
+            ready = false;
+        }
+        try {
+            enabled = BolloonAccessibilityService.Companion.isEnabledInSettings(getContext());
+        } catch (Exception e) {
+            enabled = false;
+        }
+        r.put("ready", ready);
+        r.put("enabled", enabled);
+        r.put("hint", ready
+                ? "触控已就绪：电脑端可发 phone.tap / phone.swipe，或本机 macro replay"
+                : (enabled
+                    ? "无障碍服务已勾选但未连上：点一下重新检查（或重启 App）"
+                    : "无障碍服务未开启：点一下去系统设置里打开 Bolloon Agent"));
+        call.resolve(r);
+    }
+
+    /** 跳系统无障碍设置页 (用户在里面勾选 Bolloon Agent) */
+    @PluginMethod
+    public void openAccessibilitySettings(PluginCall call) {
+        try {
+            Intent it = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(it);
+            call.resolve(new JSObject().put("opened", true));
+        } catch (Exception e) {
+            call.reject("无法打开无障碍设置: " + e.getMessage());
+        }
     }
 
     // ============ 宏录制/重放 (2026-08-13, 借鉴 Ghost MacroRecorder) ============
