@@ -16,6 +16,9 @@
     },
   };
 
+  // 一键入网默认 prompt: 交给智能体去读网关入网说明并执行入网 (人类只点一下)
+  const DEFAULT_JOIN_PROMPT = 'read https://bolloon.cn/bolloon-gateway-join.md';
+
   const THEMES = {
     dark: { '--bg': '#1a1a18', '--bg-card': '#222220', '--bg-hover': '#2a2a26', '--text': '#d8d8c8', '--text-secondary': '#909088', '--accent': '#c4d640', '--border': '#3a3a36' },
     light: { '--bg': '#f5f5f0', '--bg-card': '#ffffff', '--bg-hover': '#eeeeea', '--text': '#1a1a18', '--text-secondary': '#606058', '--accent': '#8a9430', '--border': '#d0d0c8' },
@@ -75,7 +78,7 @@
     $('#topbar-title').textContent = TITLES[tab] || '会话';
     const cs = $('#btn-create-session'); if (cs) cs.hidden = tab !== 'main';
     const ta = $('#topbar-actions'); if (ta) ta.hidden = tab === 'me';   // 我 页不显示 加号/刷新
-    if (tab === 'network') { loadContacts(); loadMcpTools(); loadApprovals(); loadNetMembers(); }
+    if (tab === 'network') { loadContacts(); loadMcpTools(); loadApprovals(); loadNetMembers(); loadP2PStatus(); loadAgentServices(); loadX402Info(); }
     if (tab === 'main') { loadAgentCovers(); }
     window.__mobileTouch?.('tab', tab);
   }
@@ -681,6 +684,7 @@
   let chatEventSource = null;
   let chatStepCancel = null;
   let streamingBubble = null;
+  let chatLoadPromise = Promise.resolve();   // openChat 的首次历史加载 (供一键入网等自动发消息等它完成, 免被清屏抹掉)
 
    function openChat(ch) {
      activeChannel = ch;
@@ -710,7 +714,7 @@
        $('#chat-send').addEventListener('click', sendChat);
        $('#chat-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChat(); });
        attachStepListener();
-       loadMessages();
+       chatLoadPromise = loadMessages().catch(() => {});
        openChatSse();
        window.__mobileTouch?.('chat', ch.id);
        }
@@ -1048,6 +1052,292 @@
     setTimeout(() => t.remove(), 1600);
   }
 
+  // === Agent 服务 (E1 自动发现) + 资源交易 (E2/E3/E4) ===
+  let _svcCache = [];
+  async function loadAgentServices() {
+    const box = $('#agent-services');
+    if (!box) return;
+    box.innerHTML = '<div class="list-item"><span style="color:var(--text-secondary);font-size:13px">正在发现…</span></div>';
+    let r = { services: [], error: '' };
+    try { r = await api.get('/api/social/discover'); } catch (e) { r = { services: [], error: (e && e.message) || String(e) }; }
+    const list = (r && r.services) || [];
+    _svcCache = list;
+    if (!list.length) {
+      box.innerHTML = `<div class="list-item"><span style="font-size:12px;color:var(--text-secondary);line-height:1.6">暂未发现其他智能体${r && r.error ? '（' + escapeHtml(r.error) + '）' : ''}<br>连上电脑端或对端节点后会自动出现</span></div>`;
+      return;
+    }
+    box.innerHTML = list.map((s, i) => {
+      const pr = (s.service && s.service.price) || s.price || {};
+      const amount = (pr && pr.amount) || (typeof pr === 'string' ? pr : '') || '';
+      const cur = (pr && pr.currency) || '';
+      const name = (s.service && s.service.name) || s.serviceName || s.name || s.agentId || 'agent';
+      const desc = (s.service && s.service.description) || s.description || '';
+      const score = (s.reputation && (s.reputation.score ?? s.reputation)) ?? '';
+      return `<div class="list-item" data-i="${i}"><span style="flex:1;min-width:0"><div style="font-size:14px">${escapeHtml(String(name))}</div><div style="font-size:11px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(String(desc))}</div></span><span style="font-size:11px;color:var(--text-secondary);text-align:right">${escapeHtml(String(amount ? amount + ' ' + cur : '未定价'))}${score !== '' ? '<br>信誉 ' + escapeHtml(String(score)) : ''}</span></div>`;
+    }).join('');
+    box.querySelectorAll('[data-i]').forEach((el) => el.addEventListener('click', () => openTradeCall(_svcCache[Number(el.dataset.i)])));
+  }
+
+  async function openTradeCall(entry) {
+    const svc = {
+      name: (entry.service && entry.service.name) || entry.serviceName || entry.name || 'service',
+      agentId: entry.agent_id || entry.agentId,
+      payTo: entry.wallet || (entry.service && entry.service.payTo),
+      price: (entry.service && entry.service.price) || entry.price || { amount: '0', currency: 'USDC' },
+      endpoint: (entry.service && entry.service.endpoint) || entry.endpoint,
+      reputation: (entry.reputation && (entry.reputation.score ?? entry.reputation)) ?? entry.reputation,
+    };
+    const page = document.createElement('div');
+    page.className = 'chat-page'; page.id = 'trade-page';
+    page.innerHTML = `
+      <div class="chat-topbar"><button class="icon-btn" id="td-back">←</button><div style="flex:1;font-weight:600">资源交易</div><button class="icon-btn" id="td-hist">≡</button></div>
+      <div style="padding:12px;display:flex;flex-direction:column;gap:10px" id="td-body">
+        <div class="identity-row"><div class="k">服务</div><div class="v">${escapeHtml(svc.name)}</div></div>
+        <div class="identity-row"><div class="k">价格</div><div class="v">${escapeHtml(String((svc.price && svc.price.amount) || '') + ' ' + String((svc.price && svc.price.currency) || ''))}</div></div>
+        <div class="identity-row"><div class="k">收款方</div><div class="v" style="word-break:break-all">${escapeHtml(svc.payTo || '—')}</div></div>
+        <input id="td-req" placeholder="请求内容 (如: 帮我查一条链上数据)" style="${_walletInput}">
+        <button id="td-call" style="${_walletBtn}">调用服务 (402 → 策略 → 支付)</button>
+        <div id="td-out" style="font-size:13px;line-height:1.7;color:var(--text-secondary)"></div>
+      </div>`;
+    document.body.appendChild(page);
+    $('#td-back').addEventListener('click', () => page.remove());
+    $('#td-hist').addEventListener('click', () => openTradeHistory());
+    $('#td-call').addEventListener('click', async () => {
+      const req = (page.querySelector('#td-req').value || '').trim();
+      const out = page.querySelector('#td-out');
+      out.textContent = '调用中…';
+      try {
+        const r = await api.post('/api/trade/call', { service: svc, request: { text: req } });
+        const map = { denied: '⛔ 被策略拦截：', needsApproval: '⏸ 需要人工确认：', replayed: '🔁 重复请求被拒：', failed: '❌ 调用失败：' };
+        if (r && r.status && map[r.status]) out.textContent = map[r.status] + (r.reason || '');
+        else if (r && r.ok) {
+          const cid = r.resultCid || (r.proof && r.proof.cid) || '';
+          out.textContent = '✅ 成功' + (r.txHash ? '（tx ' + String(r.txHash).slice(0, 14) + '…）' : '') + '\n'
+            + (typeof r.result === 'string' ? r.result : JSON.stringify(r.result || {}).slice(0, 400))
+            + (cid ? '\n结果 CID: ' + cid + (r.proof && r.proof.provider ? '（' + r.proof.provider + '）' : '（仅本地计算）') : '');
+        }
+        else out.textContent = (r && (r.error || r.reason)) || '未知结果';
+      } catch (e) { out.textContent = '调用失败: ' + ((e && e.message) || e); }
+    });
+  }
+
+  async function openTradeHistory() {
+    const page = document.createElement('div');
+    page.className = 'chat-page'; page.id = 'trade-hist';
+    page.innerHTML = `<div class="chat-topbar"><button class="icon-btn" id="th-back">←</button><div style="flex:1;font-weight:600">交易记录</div></div><div id="th-body" style="padding:12px;font-size:13px;line-height:1.8;color:var(--text-secondary)">加载中…</div>`;
+    document.body.appendChild(page);
+    $('#th-back').addEventListener('click', () => page.remove());
+    let list = [];
+    try { const r = await api.get('/api/trade/trades'); list = (r && r.trades) || []; } catch (e) {}
+    const body = page.querySelector('#th-body');
+    if (!list.length) { body.textContent = '暂无交易记录。'; return; }
+    body.innerHTML = list.map((t) => `<div style="padding:8px 10px;border:1px solid var(--border);border-radius:10px;margin-bottom:8px;background:var(--bg-card)">
+      <div style="color:var(--text)">${escapeHtml(String(t.service || ''))} · ${escapeHtml(String(t.amount || ''))} ${escapeHtml(String(t.currency || ''))}</div>
+      <div style="font-size:11px">${escapeHtml(String(t.status || ''))}${t.txHash ? ' · tx ' + escapeHtml(String(t.txHash).slice(0, 12)) + '…' : ''} · ${new Date(t.ts || Date.now()).toLocaleString()}</div>
+      ${t.reason ? '<div style="font-size:11px">' + escapeHtml(String(t.reason)) + '</div>' : ''}
+    </div>`).join('');
+  }
+
+  // === 本机 IPFS 节点 (Helia 真节点: 前台在线, 可收发块) ===
+  async function openHeliaPage() {
+    const page = document.createElement('div');
+    page.className = 'chat-page'; page.id = 'helia-page';
+    page.innerHTML = `
+      <div class="chat-topbar"><button class="icon-btn" id="hl-back">←</button><div style="flex:1;font-weight:600">本机 IPFS 节点</div></div>
+      <div style="padding:12px;display:flex;flex-direction:column;gap:12px">
+        <div style="font-size:13px;color:var(--text-secondary);line-height:1.7">在手机上跑一个真的 IPFS 节点（Helia + libp2p）：有 PeerID、本地块存储、能通过拨出的连接收发块。<br>限制：手机不能监听端口（只能主动连对端）；iOS 进后台会被系统挂起，所以节点只在前台在线 —— 这不是 bug，是系统限制。</div>
+        <button id="hl-toggle" style="${_walletBtn}">…</button>
+        <button id="hl-test" style="padding:12px;border:none;background:var(--bg-hover);color:var(--text);border-radius:10px">测试：把一个对象存进本机节点</button>
+        <div id="hl-status" style="font-size:13px;line-height:1.8;color:var(--text-secondary);word-break:break-all"></div>
+      </div>`;
+    document.body.appendChild(page);
+    $('#hl-back').addEventListener('click', () => page.remove());
+    const draw = async () => {
+      let st = {};
+      try { st = await api.get('/api/helia/status'); } catch (e) { st = { error: (e && e.message) || String(e) }; }
+      const on = !!(st && st.running);
+      const btn = page.querySelector('#hl-toggle');
+      btn.textContent = on ? '停止节点' : '启动节点';
+      page.querySelector('#hl-status').innerHTML = [
+        '状态: ' + (on ? '运行中' : (st && st.enabled ? '已启用但未运行' : '已停止')),
+        st && st.peerId ? 'PeerID: ' + escapeHtml(String(st.peerId)) : '',
+        '已连对端: ' + (((st && st.peers) || []).length) + ' 个',
+        st && typeof st.blockCount === 'number' ? '本地块数: ' + st.blockCount : '',
+        st && st.error ? '错误: ' + escapeHtml(String(st.error)) : '',
+      ].filter(Boolean).join('<br>');
+      return st;
+    };
+    await draw();
+    page.querySelector('#hl-toggle').addEventListener('click', async () => {
+      const st = await draw();
+      const on = !!(st && st.running);
+      showToast(on ? '正在停止节点…' : '正在启动节点…');
+      try { await api.post('/api/helia/enabled', { enabled: !on }); showToast(on ? '节点已停止' : '节点已启动'); }
+      catch (e) { showToast('操作失败: ' + ((e && e.message) || e)); }
+      await draw();
+    });
+    page.querySelector('#hl-test').addEventListener('click', async () => {
+      const out = page.querySelector('#hl-status');
+      out.textContent = '写入中…';
+      try {
+        const r = await api.post('/api/helia/add', { value: { hello: 'bolloon-mobile-node', ts: Date.now() } });
+        const g = r && r.cid ? await api.post('/api/helia/get', { cid: r.cid }) : null;
+        out.innerHTML = 'CID: ' + escapeHtml(String((r && r.cid) || '')) + '<br>取回来源: ' + escapeHtml(String((r && g && g.from) || '-')) + '<br>' + escapeHtml(JSON.stringify((g && g.value) || {}).slice(0, 200));
+      } catch (e) { out.textContent = '失败: ' + ((e && e.message) || e); }
+    });
+  }
+
+  // === IPFS 存储配置 (本地算 CID 恒定可用; 上传/取回按此配置) ===
+  async function openIpfsConfig() {
+    let cfg = {};
+    try { cfg = await api.get('/api/ipfs/config'); } catch (e) {}
+    const page = document.createElement('div');
+    page.className = 'chat-page'; page.id = 'ipfs-config-page';
+    page.innerHTML = `
+      <div class="chat-topbar"><button class="icon-btn" id="ic-back">←</button><div style="flex:1;font-weight:600">IPFS 存储</div></div>
+      <div style="padding:12px;display:flex;flex-direction:column;gap:10px">
+        <div style="font-size:13px;color:var(--text-secondary);line-height:1.7">本地算 CID / 校验 CID 永远可用（离线）。上传/取回按下面配置：public=只走公共网关（只读为主）；remote=自建/远程 IPFS 节点；pinata=用 Pinata 上传+固定。</div>
+        <input id="ic-mode" placeholder="public / remote / pinata" value="${escapeHtml(String(cfg.mode || 'public'))}" style="${_walletInput}">
+        <input id="ic-api" placeholder="远程节点 API (http://host:5001)" value="${escapeHtml(String(cfg.apiUrl || ''))}" style="${_walletInput}">
+        <input id="ic-gw" placeholder="网关 (https://ipfs.io)" value="${escapeHtml(String(cfg.gatewayUrl || ''))}" style="${_walletInput}">
+        <input id="ic-pk" placeholder="Pinata API Key" value="${escapeHtml(String(cfg.pinataKey || ''))}" style="${_walletInput}">
+        <input id="ic-ps" placeholder="Pinata Secret" value="${escapeHtml(String(cfg.pinataSecret || ''))}" style="${_walletInput}">
+        <button id="ic-save" style="${_walletBtn}">保存</button>
+        <button id="ic-test" style="padding:12px;border:none;background:var(--bg-hover);color:var(--text);border-radius:10px">测试：算一个 CID</button>
+        <div id="ic-out" style="font-size:12px;color:var(--text-secondary);line-height:1.7;word-break:break-all"></div>
+      </div>`;
+    document.body.appendChild(page);
+    $('#ic-back').addEventListener('click', () => page.remove());
+    $('#ic-save').addEventListener('click', async () => {
+      const body = {
+        mode: (page.querySelector('#ic-mode').value || 'public').trim(),
+        apiUrl: (page.querySelector('#ic-api').value || '').trim(),
+        gatewayUrl: (page.querySelector('#ic-gw').value || '').trim(),
+        pinataKey: (page.querySelector('#ic-pk').value || '').trim(),
+        pinataSecret: (page.querySelector('#ic-ps').value || '').trim(),
+      };
+      try { const r = await api.post('/api/ipfs/config', body); page.querySelector('#ic-out').textContent = r && r.ok === false ? ('保存失败: ' + (r.error || '')) : '已保存'; showToast('IPFS 配置已保存'); }
+      catch (e) { page.querySelector('#ic-out').textContent = '保存失败: ' + ((e && e.message) || e); }
+    });
+    $('#ic-test').addEventListener('click', async () => {
+      const out = page.querySelector('#ic-out');
+      out.textContent = '计算中…';
+      try { const r = await api.post('/api/ipfs/cid', { value: { hello: 'bolloon', ts: 1 } }); out.textContent = 'CID: ' + ((r && r.cid) || JSON.stringify(r)); }
+      catch (e) { out.textContent = '失败: ' + ((e && e.message) || e); }
+    });
+  }
+
+  // === 链上配置 (手机端独立支付/上链用的 RPC 与网络) ===
+  async function openChainConfig() {
+    let cfg = {};
+    try { cfg = await api.get('/api/chain/config'); } catch (e) {}
+    const page = document.createElement('div');
+    page.className = 'chat-page'; page.id = 'chain-config-page';
+    page.innerHTML = `
+      <div class="chat-topbar"><button class="icon-btn" id="cc-back">←</button><div style="flex:1;font-weight:600">链上配置</div></div>
+      <div style="padding:12px;display:flex;flex-direction:column;gap:12px">
+        <div style="font-size:13px;color:var(--text-secondary);line-height:1.7">手机端自己签名/发交易用这个 RPC（默认 Base 主网）。x402 支付由收款方/facilitator 提交，不需要你付 gas；自己上链注册（铸 NFT）则需要该账户有一点 gas。</div>
+        <input id="cc-rpc" placeholder="https://mainnet.base.org" value="${escapeHtml(String(cfg.rpcUrl || ''))}" style="${_walletInput}">
+        <input id="cc-chain" placeholder="8453" value="${escapeHtml(String(cfg.chainId || ''))}" style="${_walletInput}">
+        <input id="cc-network" placeholder="base / base-sepolia / mainnet / sepolia" value="${escapeHtml(String(cfg.network || ''))}" style="${_walletInput}">
+        <button id="cc-save" style="${_walletBtn}">保存</button>
+        <div id="cc-out" style="font-size:13px;color:var(--text-secondary);line-height:1.7"></div>
+      </div>`;
+    document.body.appendChild(page);
+    $('#cc-back').addEventListener('click', () => page.remove());
+    $('#cc-save').addEventListener('click', async () => {
+      const body = {
+        rpcUrl: (page.querySelector('#cc-rpc').value || '').trim(),
+        chainId: Number((page.querySelector('#cc-chain').value || '').trim()) || undefined,
+        network: (page.querySelector('#cc-network').value || '').trim() || undefined,
+      };
+      try { const r = await api.post('/api/chain/config', body); page.querySelector('#cc-out').textContent = '已保存: ' + JSON.stringify(r || {}); showToast('链上配置已保存'); }
+      catch (e) { page.querySelector('#cc-out').textContent = '保存失败: ' + ((e && e.message) || e); }
+    });
+  }
+
+  // === P2P 连接状态 (手机 WebView 不能 listen → 必须主动拨入电脑端) ===
+  async function loadP2PStatus() {
+    const box = $('#p2p-status');
+    if (!box) return;
+    let net = {}; let url = '';
+    try { net = await api.get('/api/network/status'); } catch (e) {}
+    try { const u = await api.get('/api/desktop/url'); url = (u && u.url) || ''; } catch (e) {}
+    let d = { ok: false, addrs: [], error: '' };
+    try { d = await api.get('/api/network/desktop-addrs'); } catch (e) {}
+    // 2026-09-11: 可拨入地址 (/p2p-circuit) —— 手机在 WebView 里不能 listen,
+    // 向中继预约是它唯一能被别人拨入的途径。两个节点 (P2P / Helia) 都看一眼。
+    let helia = {};
+    try { helia = await api.get('/api/helia/status'); } catch (e) {}
+    const conn = !!(net && net.connected);
+    const peers = ((net && net.peerIds) || []).length;
+    const nodeId = (net && net.nodeId) || '';
+    const addrs = (d && d.addrs) || [];
+    const circuitAddrs = ((net && net.circuitAddrs) || []).length
+      ? net.circuitAddrs
+      : (((helia && helia.circuitAddrs) || []));
+    const relays = ((net && net.relays) || []).length ? net.relays : (((helia && helia.relays) || []));
+    const relayRes = ((net && net.relayReservations) || []).find((r) => r && !r.ok);
+    const row = (k, v, small) => `<div class="list-item"><span style="flex:1">${k}</span><span style="font-size:${small ? 11 : 13}px;color:var(--text-secondary);text-align:right;word-break:break-all;max-width:60%">${escapeHtml(v)}</span></div>`;
+    let html = '';
+    html += row('状态', conn ? '已启动' : '未启动');
+    if (nodeId) html += row('本机节点', nodeId.slice(0, 20) + '…', true);
+    html += row('已连对端', peers + ' 个');
+    html += row('电脑端', url || '未配置', true);
+    if (addrs.length) html += row('可拨地址', addrs[0], true);
+    // 可拨入地址: 没有就是「暂时不能被别人拨入」, 用大白话说清原因, 不假装成功
+    html += circuitAddrs.length
+      ? row('可拨入地址', circuitAddrs[0], true)
+      : row('可拨入地址', relayRes ? ('预约失败: ' + String(relayRes.error || '').slice(0, 60)) : '无 (没有可用中继 / 还没预约上)', true);
+    if (relays.length) html += row('已预约中继', relays.length + ' 个', true);
+    box.innerHTML = html;
+    // 有可拨入地址 → 给一个复制入口 (别人要用它拨你)
+    if (circuitAddrs.length) {
+      const cp = document.createElement('div');
+      cp.className = 'list-item';
+      cp.id = 'p2p-copy-circuit';
+      cp.innerHTML = `<span class="list-icon">${ICONS.globe}</span><span style="flex:1">复制可拨入地址</span>`;
+      cp.addEventListener('click', async () => {
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(circuitAddrs[0]);
+          else throw new Error('无剪贴板权限');
+          showToast('已复制可拨入地址');
+        } catch (e) { showToast('复制失败: ' + ((e && e.message) || e)); }
+      });
+      box.appendChild(cp);
+    }
+    // 连接/重连按钮 + 人话提示
+    const btn = document.createElement('div');
+    btn.className = 'list-item';
+    btn.id = 'p2p-connect';
+    btn.innerHTML = `<span class="list-icon">${ICONS.globe}</span><span style="flex:1">${conn ? '重新连接电脑端' : '连接电脑端'}</span>`;
+    btn.addEventListener('click', async () => {
+      showToast('正在连接电脑端…');
+      try {
+        const r = await api.post('/api/network/connect', {});
+        showToast(r && r.connected ? 'P2P 已启动' : '没能连上：确认电脑端在运行、同网段、且以 BOLLOON_HOST=0.0.0.0 启动');
+      } catch (e) { showToast('连接失败: ' + (e.message || e)); }
+      loadP2PStatus();
+    });
+    box.appendChild(btn);
+    // 独立入网: 手机可拨任意可拨节点 (不必非电脑端)
+    const addNode = document.createElement('div');
+    addNode.className = 'list-item';
+    addNode.id = 'p2p-add-node';
+    addNode.innerHTML = `<span class="list-icon">${ICONS.globe}</span><span style="flex:1">添加节点地址 (独立入网)</span>`;
+    addNode.addEventListener('click', () => addFriendManual());
+    box.appendChild(addNode);
+    const hint = document.createElement('div');
+    hint.style.cssText = 'padding:10px 12px;font-size:12px;color:var(--text-secondary);line-height:1.6';
+    hint.textContent = !url && !addrs.length
+      ? '手机在 WebView 里不能自己监听端口 → 需要「拨入」至少一个节点才能进网。电脑端是**可选**的：点「添加节点地址」填任意可拨节点的 multiaddr (如 /ip4/1.2.3.4/tcp/4001/ws)，手机就能独立入网并从该节点收发服务请求。'
+      : (conn ? (peers ? '已连上 ' + peers + ' 个对端，可收发消息/服务请求（手机拨入的连接是双向的，所以别人也能调用你的服务）。' : '已连上节点，等待其他对端…') : ('未连接：' + ((d && d.error) || '点「连接电脑端」或「添加节点地址」')));
+    if (conn && !circuitAddrs.length) {
+      hint.textContent += '\n「可拨入地址」还是空的 —— 手机自己不能被别人拨入，必须成功预约到中继才有。确认电脑端已开启中继 (电脑端 /api/p2p/mobile-connect 里 isRelay=true)，再点「重新连接电脑端」。';
+    }
+    box.appendChild(hint);
+  }
+
   // === 判断力 API (电脑端同步下来的判断库) ===
   async function openJudgments() {
     const page = document.createElement('div');
@@ -1167,6 +1457,9 @@
         <div class="conv-item" id="theme-toggle"><span class="list-icon" id="theme-icon">${ICONS.themeAuto}</span><span id="theme-text">跟随系统</span></div>
         <div class="conv-item" id="settings-network"><span class="list-icon">${ICONS.globe}</span><span>网络与同步</span><span class="list-arrow">›</span></div>
         <div class="conv-item" id="settings-desktop"><span class="list-icon">${ICONS.globe}</span><span>电脑端同步</span><span class="list-arrow">›</span></div>
+        <div class="conv-item" id="settings-chain"><span class="list-icon">${ICONS.chip}</span><span>链上配置 (RPC/网络)</span><span class="list-arrow">›</span></div>
+        <div class="conv-item" id="settings-ipfs"><span class="list-icon">${ICONS.chip}</span><span>IPFS 存储</span><span class="list-arrow">›</span></div>
+        <div class="conv-item" id="settings-helia"><span class="list-icon">${ICONS.globe}</span><span>本机 IPFS 节点</span><span class="list-arrow">›</span></div>
         <div class="conv-item" id="settings-selfcard"><span class="list-icon">${ICONS.chip}</span><span id="selfcard-text">显示本机卡片: 开</span></div>
         <div class="conv-item" id="settings-did"><span class="list-icon">${ICONS.idcard}</span><span>DID</span></div>
       </div>`;
@@ -1187,6 +1480,12 @@
       if (el) el.textContent = '显示本机卡片: ' + (on ? '开' : '关');
     };
     drawSelfCardToggle();
+    const sc = $('#settings-chain');
+    if (sc) sc.addEventListener('click', openChainConfig);
+    const si = $('#settings-ipfs');
+    if (si) si.addEventListener('click', openIpfsConfig);
+    const sh = $('#settings-helia');
+    if (sh) sh.addEventListener('click', openHeliaPage);
     $('#settings-selfcard').addEventListener('click', () => {
       const hidden = (() => { try { return localStorage.getItem(SELF_CARD_HIDDEN_KEY) === '1'; } catch { return false; } })();
       try { localStorage.setItem(SELF_CARD_HIDDEN_KEY, hidden ? '0' : '1'); } catch (e) {}
@@ -1439,6 +1738,38 @@
   function showSheet(id) { const s = $(id); if (s) s.hidden = false; }
   function hideSheet(id) { const s = $(id); if (s) s.hidden = true; }
 
+  /**
+   * 一键入网 (全球智能体网络): 把默认 prompt 发给智能体, 由它读网关入网说明并执行入网。
+   * 人类只点一下 — 没有可用会话时先建一个 (与"新建会话"同一条路径)。
+   */
+  async function joinGlobalNetwork() {
+    showToast('正在加入全球智能体网络…');
+    try {
+      let ch = activeChannel;
+      if (!ch) {
+        let channels = [];
+        try { channels = await api.get('/channels'); } catch { channels = []; }
+        ch = (Array.isArray(channels) && channels[0]) || null;
+        if (!ch) {
+          await api.post('/api/channels/create', {});
+          await new Promise((r) => setTimeout(r, 700));
+          channels = await api.get('/channels').catch(() => []);
+          ch = (Array.isArray(channels) && channels[0]) || null;
+        }
+      }
+      if (!ch) { showToast('没有可用会话: 先在电脑端连上你的智能体'); return; }
+      openChat(ch);
+      await chatLoadPromise;   // 等首次历史加载完成再发, 免得用户气泡被清屏抹掉
+      const input = $('#chat-input');
+      if (!input) return;
+      input.value = DEFAULT_JOIN_PROMPT;
+      await sendChat();
+      showToast('入网指令已交给智能体');
+    } catch (e) {
+      showToast('入网失败: ' + ((e && e.message) || e));
+    }
+  }
+
   // 创建智能体: 无输入框, 底部滑入加载 sheet, 完成后滑出
   async function createSession() {
     showSheet('#create-sheet');
@@ -1468,9 +1799,14 @@
       alert('添加失败: ' + (e.message || e));
     }
   }
+  // 扫码统一入口: 真机用「拍照/选图」走 jsQR 管线 (免原生插件, iOS 也可用)
+  let _qrMode = 'join';   // 'join' = 入网 | 'friend' = 加好友
   function addFriendScan() {
     hideSheet('#addfriend-sheet');
-    alert('扫码添加 (真机可用相机扫码)');
+    _qrMode = 'friend';
+    const inp = $('#qr-scan-input');
+    if (!inp) { alert('此设备不支持扫码'); return; }
+    inp.click();
   }
 
   // === 复制 (助记词/私钥/地址 快捷复制; 全局委托 [data-copy]) ===
@@ -1545,21 +1881,57 @@
     const csMan = $('#choice-manual'); if (csMan) csMan.addEventListener('click', addFriendManual);
     const csCan = $('#choice-cancel'); if (csCan) csCan.addEventListener('click', () => hideSheet('#addfriend-sheet'));
     $('#item-p2p').addEventListener('click', () => { switchTab('network'); });
+    const itTrade = $('#item-trade');
+    if (itTrade) itTrade.addEventListener('click', async () => {
+      await loadAgentServices();
+      const first = _svcCache[0];
+      if (first) openTradeCall(first); else openTradeHistory();
+    });
     $('#item-p2p-id').addEventListener('click', async () => {
       try { const net = await api.get('/api/network/status'); const p2p = net && net.nodeId; alert('P2P ID (通信ID, ≠ DID):\n' + (p2p || '未连接')); }
       catch (e) { alert('P2P ID: 获取失败'); }
     });
-    // #2 极简入网按钮: 粘贴/输入链接 → BolloonCore.gateway.join (懒加载 mobile-gateway)
+    // #1 一键入网 (全球智能体网络): 点一下 → 默认 prompt 交给智能体执行
+    const joinGlobalBtn = $('#item-join-global');
+    if (joinGlobalBtn) joinGlobalBtn.addEventListener('click', () => { void joinGlobalNetwork(); });
+
+    // #2 加入网络 (点按式): sheet → [附近的电脑/设备] [扫电脑上的二维码] [粘贴链接兜底]
     const joinNetBtn = $('#item-join-net');
-    if (joinNetBtn) joinNetBtn.addEventListener('click', async () => {
-      const link = (window.prompt && window.prompt('粘贴网络链接\n(orbitdb://  ipns://  https://.../registry)') || '').trim();
-      if (!link) return;
-      try {
-        const r = await (window.BolloonCore && window.BolloonCore.gateway && window.BolloonCore.gateway.join(link));
-        alert(r ? (r.output || '已处理') : 'BolloonCore.gateway 不可用');
-      } catch (e) { alert('加入失败: ' + String((e && e.message) || e).slice(0, 120)); }
-      loadNetMembers();
+    if (joinNetBtn) joinNetBtn.addEventListener('click', () => showSheet('#network-sheet'));
+    const cJoinNearby = $('#choice-join-nearby');
+    if (cJoinNearby) cJoinNearby.addEventListener('click', () => { hideSheet('#network-sheet'); openNearbySheet('join'); });
+    const cJoinScan = $('#choice-join-scan');
+    if (cJoinScan) cJoinScan.addEventListener('click', () => {
+      hideSheet('#network-sheet'); _qrMode = 'join';
+      const inp = $('#qr-scan-input'); if (inp) inp.click();
     });
+    const cJoinManual = $('#choice-join-manual');
+    if (cJoinManual) cJoinManual.addEventListener('click', () => { hideSheet('#network-sheet'); joinNetworkManual(); });
+    const cJoinCancel = $('#choice-join-cancel');
+    if (cJoinCancel) cJoinCancel.addEventListener('click', () => hideSheet('#network-sheet'));
+
+    // #2b 连接好友 (点按式) + 附近设备 + 待处理申请
+    const addFriendBtn = $('#item-add-friend');
+    if (addFriendBtn) addFriendBtn.addEventListener('click', () => showSheet('#addfriend-sheet'));
+    const cNearby = $('#choice-nearby');
+    if (cNearby) cNearby.addEventListener('click', () => { hideSheet('#addfriend-sheet'); openNearbySheet('friend'); });
+    const cRequests = $('#choice-requests');
+    if (cRequests) cRequests.addEventListener('click', () => { hideSheet('#addfriend-sheet'); openRequestsSheet(); });
+    const nearbyBtn = $('#item-nearby');
+    if (nearbyBtn) nearbyBtn.addEventListener('click', () => openNearbySheet('friend'));
+    const nearbyRefresh = $('#nearby-refresh');
+    if (nearbyRefresh) nearbyRefresh.addEventListener('click', () => loadNearbyList(_nearbyMode));
+    const nearbyClose = $('#nearby-close');
+    if (nearbyClose) nearbyClose.addEventListener('click', () => hideSheet('#nearby-sheet'));
+    // 微信息 (x402 付费信息): 详情 → 购买并验真 / 只看元数据
+    const x402Buy = $('#x402-buy');
+    if (x402Buy) x402Buy.addEventListener('click', () => buyX402Info());
+    const x402VerifyBtn = $('#x402-verify');
+    if (x402VerifyBtn) x402VerifyBtn.addEventListener('click', () => verifyX402Info());
+    const x402Close = $('#x402-close');
+    if (x402Close) x402Close.addEventListener('click', () => hideSheet('#x402-sheet'));
+    const x402ResultClose = $('#x402-result-close');
+    if (x402ResultClose) x402ResultClose.addEventListener('click', () => hideSheet('#x402-result-sheet'));
     // #3 扫码入网: 拍照/选图 → BolloonCore.qr.decode(jsQR) → gateway.join (免原生插件)
     const scanBtn = $('#item-scan-net');
     const scanInput = $('#qr-scan-input');
@@ -1580,6 +1952,19 @@
           const id = c2.getImageData(0, 0, c.width, c.height);
           const text = await (window.BolloonCore && window.BolloonCore.qr && window.BolloonCore.qr.decode(id.data, id.width, id.height));
           if (!text) { alert('未识别到二维码 (试试 /net qr 重新出码)'); return; }
+          // 加好友模式: multiaddr → peers/add; 其他内容(入网链接) → gateway.join
+          if (_qrMode === 'friend') {
+            _qrMode = 'join';
+            if (/^\/(ip4|ip6|dns|dns4|dns6|p2p)\//.test(String(text).trim())) {
+              const r = await api.post('/api/peers/add', { addr: String(text).trim() });
+              alert(r && r.ok ? (r.connected ? '已连接好友' : '已记录好友地址, 连接中…') : ((r && r.error) || '添加失败'));
+            } else {
+              const r2 = await (window.BolloonCore && window.BolloonCore.gateway && window.BolloonCore.gateway.join(text));
+              alert(r2 ? (r2.output || '已处理') : '这个二维码不是好友地址 (也不是入网链接)');
+            }
+            if (currentTab === 'network') { loadContacts(); loadP2PStatus(); }
+            return;
+          }
           const r = await (window.BolloonCore && window.BolloonCore.gateway && window.BolloonCore.gateway.join(text));
           alert(r ? (r.output || '已入网') : 'gateway.join 不可用');
           loadNetMembers();
@@ -1589,6 +1974,370 @@
       img.onerror = () => { alert('图片读取失败'); URL.revokeObjectURL(url); };
       img.src = url;
     });
+  }
+
+  // ==================== 点按式联网 / 加好友 (2026-09-13) ====================
+  // 人类手机习惯: 点按钮选一条, 而不是粘贴网址。粘贴/手动输入只作兜底放在最下面。
+  let _nearbyMode = 'friend';   // 'join' = 加入网络 | 'friend' = 连接好友
+
+  /** 电脑端基地址 (未配置 → 空字符串, 走本机能力) */
+  async function desktopBaseUrl() {
+    try {
+      const u = await (window.BolloonCore && window.BolloonCore.desktop && window.BolloonCore.desktop.url && window.BolloonCore.desktop.url());
+      // BolloonCore.desktop.url() 返回 { url }, 但也兼容直接返回字符串的实现 —
+      // 直接 String(对象) 会得到 "[object Object]"，转发全部静默失败 (2026-09-13 修)
+      const raw = (u && typeof u === 'object') ? (u.url || u.baseUrl || '') : u;
+      return String(raw || '').replace(/\/+$/, '');
+    } catch (e) { return ''; }
+  }
+
+  /** 转发到电脑端 HTTP (手机自足模式下拿不到就返回 null, 不假装成功) */
+  async function desktopFetch(path, body) {
+    const base = await desktopBaseUrl();
+    if (!base) return null;
+    try {
+      const res = await fetch(base + path, body
+        ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+        : undefined);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) { return null; }
+  }
+
+  /** 加入网络 · 手动粘贴 (兜底入口, 从 sheet 底部小字进来) */
+  async function joinNetworkManual() {
+    const link = (window.prompt && window.prompt('粘贴网络链接\n(orbitdb://  ipns://  https://.../registry)') || '').trim();
+    if (!link) return;
+    try {
+      const r = await (window.BolloonCore && window.BolloonCore.gateway && window.BolloonCore.gateway.join(link));
+      alert(r ? (r.output || '已处理') : 'BolloonCore.gateway 不可用');
+    } catch (e) { alert('加入失败: ' + String((e && e.message) || e).slice(0, 120)); }
+    loadNetMembers();
+  }
+
+  function openNearbySheet(mode) {
+    _nearbyMode = mode;
+    const t = $('#nearby-title');
+    if (t) t.textContent = mode === 'join' ? '附近的电脑 / 设备' : '附近的设备';
+    showSheet('#nearby-sheet');
+    loadNearbyList(mode);
+  }
+
+  /** 扫一遍"附近": 电脑端 (同一 Wi-Fi) + 已连通的 P2P 设备 (+ 待处理申请) */
+  async function loadNearbyList(mode) {
+    const list = $('#nearby-list');
+    const hint = $('#nearby-hint');
+    if (!list) return;
+    list.innerHTML = '';
+    if (hint) hint.textContent = '正在查找...';
+    const rows = [];
+    try {
+      const addrs = await (window.BolloonCore && window.BolloonCore.network && window.BolloonCore.network.desktopAddrs());
+      const base = await desktopBaseUrl();
+      const firstAddr = (addrs && Array.isArray(addrs.addrs) && addrs.addrs[0]) || '';
+      if (base || firstAddr) {
+        rows.push({
+          icon: '🖥️',
+          title: '电脑端' + (addrs && addrs.peerId ? ' · ' + String(addrs.peerId).slice(0, 8) : ''),
+          sub: base || firstAddr,
+          kind: 'desktop',
+        });
+      }
+    } catch (e) { /* 电脑端不可达 */ }
+    try {
+      const peers = await api.get('/api/peers');
+      for (const p of (peers || [])) {
+        const key = p.publicKey || p.id || '';
+        rows.push({
+          icon: '📱',
+          title: p.name || String(key).slice(0, 12) || '设备',
+          sub: '已连通 · ' + String(key).slice(0, 16),
+          kind: 'peer',
+          key,
+        });
+      }
+    } catch (e) { /* 无对端 */ }
+    if (mode === 'friend') {
+      const fr = await desktopFetch('/api/friend-requests');
+      if (fr && fr.count > 0) {
+        rows.push({ icon: '📋', title: `待处理好友申请 ${fr.count} 个`, sub: '点一下处理', kind: 'requests' });
+      }
+    }
+    if (hint) hint.textContent = rows.length ? '点一条即操作' : '没找到设备 — 让电脑端开着 (同一 Wi-Fi), 或扫电脑上的二维码';
+    if (rows.length === 0) { list.innerHTML = '<div class="list-item">（暂无）</div>'; return; }
+    for (const r of rows) {
+      const el = document.createElement('div');
+      el.className = 'list-item';
+      el.innerHTML = `<span class="list-icon">${r.icon}</span><span><div>${escapeHtml(r.title)}</div><div style="font-size:12px;color:var(--text-muted)">${escapeHtml(r.sub || '')}</div></span><span class="list-arrow">›</span>`;
+      el.addEventListener('click', () => onNearbyTap(r, mode));
+      list.appendChild(el);
+    }
+  }
+
+  async function onNearbyTap(row, mode) {
+    if (row.kind === 'requests') { hideSheet('#nearby-sheet'); return openRequestsSheet(); }
+    if (row.kind === 'desktop') {
+      try {
+        const r = await (window.BolloonCore && window.BolloonCore.network && window.BolloonCore.network.connect());
+        const bad = r && r.ok === false;
+        alert(bad ? ('连接电脑端失败: ' + String(r.error || '').slice(0, 100)) : '已连接电脑端 (数据/网络开始同步)');
+        if (!bad && mode === 'join') {
+          try { await (window.BolloonCore.desktop && window.BolloonCore.desktop.sync && window.BolloonCore.desktop.sync()); } catch (e) {}
+        }
+        loadNetMembers(); loadP2PStatus();
+      } catch (e) { alert('连接失败: ' + String((e && e.message) || e).slice(0, 120)); }
+      return;
+    }
+    if (row.kind === 'peer') {
+      if (mode !== 'friend') { alert('这个设备已经和本机连通了。'); return; }
+      let me = '手机端用户';
+      try { const s = await api.get('/api/auth/status'); if (s && s.name) me = s.name; } catch (e) {}
+      const sent = await desktopFetch('/api/friend-request', { targetPublicKey: row.key, name: me, message: '手机端请求加好友' });
+      alert(sent ? '已发出好友申请' : '本机已记录该设备; 需要电脑端在线才能把申请发出去');
+    }
+  }
+
+  /** 待处理好友申请: 点一条 → 通过 (取消 = 忽略) */
+  async function openRequestsSheet() {
+    const t = $('#nearby-title'); if (t) t.textContent = '待处理好友申请';
+    showSheet('#nearby-sheet');
+    const list = $('#nearby-list'); const hint = $('#nearby-hint');
+    if (!list) return;
+    list.innerHTML = '';
+    if (hint) hint.textContent = '正在读取...';
+    const fr = await desktopFetch('/api/friend-requests');
+    if (!fr || !fr.requests || fr.requests.length === 0) {
+      if (hint) hint.textContent = fr ? '没有待处理申请' : '需要电脑端在线 (设置里填桌面地址) 才能读取';
+      list.innerHTML = '<div class="list-item">（空）</div>';
+      return;
+    }
+    if (hint) hint.textContent = '点一条 = 通过 · 取消 = 忽略';
+    for (const r of fr.requests) {
+      const el = document.createElement('div');
+      el.className = 'list-item';
+      el.innerHTML = `<span class="list-icon">👤</span><span><div>${escapeHtml(r.fromName || '陌生人')}</div><div style="font-size:12px;color:var(--text-muted)">${escapeHtml(r.note || r.message || '(无备注)')}</div></span>`;
+      el.addEventListener('click', async () => {
+        const ok = window.confirm(`通过 ${r.fromName || '对方'} 的好友申请?\n\n确定 = 通过并加为好友\n取消 = 忽略这条申请`);
+        if (ok) {
+          const acc = await desktopFetch('/api/friend-accept', { fromPublicKey: r.fromPublicKey, name: r.fromName, requestId: r.requestId });
+          alert(acc ? '已加为好友' : '通过失败 — 检查电脑端是否在线');
+        } else {
+          const ig = await desktopFetch('/api/friend-requests/ignore', { requestId: r.requestId });
+          alert(ig ? '已忽略' : '忽略失败 — 检查电脑端是否在线');
+        }
+        hideSheet('#nearby-sheet');
+        if (typeof loadContacts === 'function') loadContacts();
+      });
+      list.appendChild(el);
+    }
+  }
+
+  // ==================== 微信息 (x402 付费信息, 2026-09-13) ====================
+  // 人类手机操作: 浏览 → 点一条看详情 (价格/类别/哈希/来源) → 「购买并验真」→ 内容 + 验真分档。
+  // 安全边界 (**不能破**): 手机端不持 EVM 私钥, 付款一律经电脑端 /api/x402/info/buy 代付;
+  //   没配桌面地址 / 电脑端不可达 → 说人话提示, 绝不假装成功、绝不自己造数据。
+  let _x402Cache = [];        // 最近一次列表 (行点击按 id 找回)
+  let _x402Current = null;    // 详情 sheet 当前对应的 item
+
+  /** 售卖端点 (付费取内容): <桌面基址>/api/x402/info/<id> */
+  async function x402SellUrl(id) {
+    const base = await desktopBaseUrl();
+    return base ? base + '/api/x402/info/' + encodeURIComponent(String(id || '')) : '';
+  }
+
+  /**
+   * 转发到电脑端并**保留后端错误原文** (购买失败要如实显示 "需要钱包私钥"/"facilitator 不可达",
+   * 而 desktopFetch 失败时只回 null 会丢掉原因)。基地址仍走 desktopBaseUrl(), 不另起一套。
+   */
+  async function desktopPostRaw(path, body) {
+    const base = await desktopBaseUrl();
+    if (!base) return { ok: false, error: '需要电脑端在线 (设置里填桌面地址)' };
+    try {
+      const res = await fetch(base + path, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+      });
+      let data = null;
+      try { data = await res.json(); } catch (e) { data = null; }
+      if (!res.ok) {
+        return { ok: false, status: res.status, error: (data && (data.error || data.message)) || ('电脑端返回 ' + res.status), data };
+      }
+      return data || { ok: false, error: '电脑端返回空响应' };
+    } catch (e) {
+      return { ok: false, error: '电脑端不可达: ' + String((e && e.message) || e).slice(0, 120) };
+    }
+  }
+
+  /** 离线能核对的部分 (全部来自免费元数据, 不含内容本体) */
+  function x402MetaLines(item) {
+    const it = item || {};
+    const p = it.price || {};
+    const src = it.source || {};
+    const refs = Array.isArray(src.refs) ? src.refs : [];
+    const lines = [
+      `价格: ${p.amount || '0'} ${p.currency || ''} (网络 ${p.network || '未声明'})`,
+      `类别: ${it.category || 'other'}`,
+      `提供方: ${(it.provider && (it.provider.name || '未命名')) || '未知'} · ${String((it.provider && it.provider.did) || '').slice(0, 28)}${(it.provider && it.provider.did && String(it.provider.did).length > 28) ? '…' : ''}`,
+      `内容哈希: ${it.contentHash || '(无)'}`,
+      `来源声明: ${src.kind || '未声明'}${refs.length ? ' · 引用 ' + refs.length + ' 条' : ' · 无引用'}`,
+    ];
+    for (const r of refs) lines.push('  · ' + String(r));
+    if (src.note) lines.push(`来源备注: ${src.note}`);
+    if (it.description) lines.push(`说明: ${it.description}`);
+    lines.push('', '付款由电脑端代付 (手机端不拿私钥)');
+    return lines;
+  }
+
+  /** 拉列表: 有数据 / 桌面不可达 / 空列表 三种情况都给人话 */
+  async function loadX402Info() {
+    const list = $('#x402-info-list');
+    if (!list) return;
+    list.innerHTML = '<div class="list-item">正在读取微信息...</div>';
+    const base = await desktopBaseUrl();
+    const r = base ? await desktopFetch('/api/x402/info') : null;
+    if (!r || r.note === 'desktop-unreachable') {
+      // (b) 桌面不可达: 手机端不持私钥, 浏览/代付都只能靠电脑端 — 直接说, 不假装有数据
+      _x402Cache = [];
+      list.innerHTML = '<div class="list-item">需要电脑端在线 (设置里填桌面地址)</div>';
+      return;
+    }
+    const items = Array.isArray(r.items) ? r.items : [];
+    _x402Cache = items;
+    if (items.length === 0) {
+      // (c) 电脑端在线但没发布过
+      list.innerHTML = '<div class="list-item">电脑端还没发布任何付费信息</div>';
+      return;
+    }
+    // (a) 有数据 → 每条一行: 标题 + 价格 + 类别 + 提供方
+    list.innerHTML = '';
+    for (const it of items) {
+      const p = it.price || {};
+      const amount = p.amount ? `${p.amount} ${p.currency || ''}`.trim() : '免费';
+      const provName = (it.provider && (it.provider.name || it.provider.did)) || '未知提供方';
+      const el = document.createElement('div');
+      el.className = 'list-item';
+      el.innerHTML = `<span class="list-icon">💰</span><span><div>${escapeHtml(it.title || '(无标题)')}</div>` +
+        `<div style="font-size:12px;color:var(--text-muted)">${escapeHtml(amount)} · ${escapeHtml(it.category || 'other')} · ${escapeHtml(String(provName).slice(0, 20))}</div></span>` +
+        `<span class="list-arrow">›</span>`;
+      el.addEventListener('click', () => openX402Sheet(it));
+      list.appendChild(el);
+    }
+  }
+
+  /** 点一条 → 详情 sheet (价格/网络/类别/提供方 DID 前缀/内容哈希/来源) */
+  function openX402Sheet(item) {
+    if (!item) return;
+    _x402Current = item;
+    const t = $('#x402-title');
+    if (t) t.textContent = item.title || '微信息';
+    const body = $('#x402-body');
+    if (body) body.textContent = x402MetaLines(item).join('\n');
+    const buy = $('#x402-buy');
+    if (buy) { buy.disabled = false; buy.textContent = '购买并验真'; }
+    showSheet('#x402-sheet');
+  }
+
+  /** 结果 sheet: 内容 + 验真结论 (纯文本渲染, 不用 innerHTML) */
+  function showX402Result(title, text) {
+    const t = $('#x402-result-title');
+    if (t) t.textContent = title || '验真结果';
+    const b = $('#x402-result-body');
+    if (b) b.textContent = String(text || '');
+    showSheet('#x402-result-sheet');
+  }
+
+  /** 购买并验真: 一律转发电脑端代付 (手机端不签名, 不持 EVM 私钥) */
+  async function buyX402Info() {
+    const item = _x402Current;
+    if (!item) return;
+    const btn = $('#x402-buy');
+    const base = await desktopBaseUrl();
+    if (!base) {
+      alert('需要电脑端在线 (设置里填桌面地址) — 付款只能由电脑端代付, 手机端不保存私钥');
+      return;
+    }
+    const sellUrl = base + '/api/x402/info/' + encodeURIComponent(String(item.id || ''));
+    // 上限 = 标价上浮 20% (防挂单涨价); 标价读不到就不传上限
+    const amt = Number((item.price || {}).amount);
+    const maxPayment = Number.isFinite(amt) && amt > 0 ? String(Number((amt * 1.2).toFixed(8))) : undefined;
+    if (btn) { btn.disabled = true; btn.textContent = '付款中...'; }
+    try {
+      const r = await desktopPostRaw('/api/x402/info/buy', {
+        url: sellUrl,
+        ...(maxPayment ? { maxPayment } : {}),
+        allowLocalDev: true,
+      });
+      if (!r || r.ok !== true) {
+        // 如实转述后端原因 (缺私钥 / facilitator 不可达 / 电脑端不可达), 不吞错
+        alert('购买失败: ' + ((r && r.error) || '电脑端不可达 (检查设置里的桌面地址)'));
+        return;
+      }
+      const content = String(r.content || '');
+      const lines = [
+        r.verifySummary || ((r.verify && r.verify.trust) ? '验真档: ' + r.verify.trust : '后端未给验真结论'),
+        r.payment ? `支付模式: ${r.payment.mode || '?'}${r.payment.txHash ? ' · tx ' + String(r.payment.txHash).slice(0, 24) : ''}` : '',
+        `内容哈希: ${(r.item && r.item.contentHash) || item.contentHash || '?'}`,
+        `内容长度: ${content.length} 字`,
+        '',
+        '—— 内容 (前 2000 字) ——',
+        content.slice(0, 2000) + (content.length > 2000 ? '\n…(已截断)' : ''),
+      ].filter((x) => x !== '');
+      showX402Result('已购买并验真', lines.join('\n'));
+    } catch (e) {
+      alert('购买失败: ' + String((e && e.message) || e).slice(0, 160));
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '购买并验真'; }
+    }
+  }
+
+  /** 只看元数据 / 离线验真: 没付款就没有信封 → 明说还差什么, 不谎称"验真通过" */
+  async function verifyX402Info() {
+    const item = _x402Current;
+    if (!item) return;
+    const btn = $('#x402-verify');
+    const meta = x402MetaLines(item);
+    const sellUrl = await x402SellUrl(item.id);
+    if (!sellUrl) {
+      showX402Result('离线查看元数据', meta.join('\n') + '\n\n没配桌面地址 → 拿不到签名信封, 无法验真。');
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = '核对中...'; }
+    try {
+      const r = await desktopPostRaw('/api/x402/info/verify', { envelope: null, url: sellUrl });
+      // 注意: 后端 verify 的 ok = "信封验真是否通过", 不是 "HTTP 是否成功" —
+      //   只要拿到 report 就是一次成功的请求, 不能把 report.ok=false 当成"电脑端不可达"
+      const report = r && r.report ? r.report : null;
+      if (!report) {
+        showX402Result('还不能验真', ((r && r.error) || '电脑端不可达') + '\n\n离线可核对的:\n' + meta.join('\n'));
+        return;
+      }
+      const checks = Array.isArray(report.checks) ? report.checks : [];
+      // 没付款时后端拿到的是 402 的付款要求 (不是信封) → 报告必然是 unverified; 如实说明原因
+      const noEnvelope = report.trust === 'unverified' && !checks.some((c) => c.name === 'provider-signature' && c.ok);
+      if (noEnvelope) {
+        const p = item.price || {};
+        showX402Result('只看元数据 (还没付款)', [
+          '电脑端返回 402 付款要求 → 还没付款就拿不到签名信封, 此时无法验真。',
+          `付款要求 (来自元数据): ${p.amount || '0'} ${p.currency || ''} → ${String(p.payTo || '').slice(0, 20)}… (${p.network || '未声明'})`,
+          '',
+          '离线可核对的 (免费元数据):',
+          ...meta,
+          '',
+          '点「购买并验真」由电脑端代付后, 才能拿到信封做分档验真。',
+        ].join('\n'));
+        return;
+      }
+      showX402Result('验真结果', [
+        r.summary || ('验真档: ' + (report.trust || '?')),
+        report.warnings && report.warnings.length ? '提示: ' + report.warnings.join('; ') : '',
+        '',
+        '逐项检查:',
+        ...checks.map((c) => `${c.ok ? '✅' : '❌'} ${c.name}: ${c.detail}`),
+      ].filter((x) => x !== '').join('\n'));
+    } catch (e) {
+      showX402Result('核对失败', String((e && e.message) || e).slice(0, 200));
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '只看元数据 (离线验真)'; }
+    }
   }
 
   async function loadNetMembers() {
@@ -1623,14 +2372,94 @@
     });
   }
 
+  // === 深链 (bolloon://) — iOS 系统入口 (Siri / 快捷指令 / Spotlight) 驱动智能体 (2026-09-11) ===
+  // 协议: bolloon://agent/run|status?name=<name>[&goal=<text>]
+  // 三条投递路径, 任意一条通就够, 互不依赖 (缺的自动跳过, 不报错):
+  //   1. @capacitor/app 的 appUrlOpen —— 该插件**当前没装** (package.json 无 @capacitor/app);
+  //      装上以后下面这段自动生效, 不需要再改这里。
+  //   2. Swift 侧 (ios/App/App/BolloonIntents.swift) 往 WKWebView 注入 window.__bolloonPendingDeepLink
+  //      并派发 'bolloon:deeplink' 事件 —— 不走插件, 现在就能用。
+  //   3. 纯浏览器回退: 页面 URL 自身就是 bolloon:// (手动粘贴测试用)。
+  let _lastDeepLinkKey = '';
+  function handleDeepLinkUrl(rawUrl) {
+    const c = window.BolloonCore;
+    let res;
+    try {
+      res = c && c.handleDeepLink
+        ? c.handleDeepLink(String(rawUrl || ''))
+        : { ok: false, error: 'BolloonCore.handleDeepLink 不可用' };
+    } catch (e) { res = { ok: false, error: (e && e.message) || String(e) }; }
+    if (!res || res.ok !== true) {
+      showToast('这个链接没认出来: ' + ((res && res.error) || String(rawUrl || '')));
+      return res;
+    }
+    const key = res.action + '|' + res.name + '|' + (res.goal || '');
+    if (key === _lastDeepLinkKey) return res;      // 同一链接被两条路径重复投递 → 只处理一次
+    _lastDeepLinkKey = key;
+    openDeepLinkTarget(res).catch(() => {});
+    return res;
+  }
+
+  async function openDeepLinkTarget(res) {
+    switchTab('main');
+    let cards = Array.isArray(allAgentCards) ? allAgentCards : [];
+    if (!cards.length) { try { await loadAgentCovers(); } catch (e) {} cards = Array.isArray(allAgentCards) ? allAgentCards : []; }
+    const want = String(res.name || '').trim();
+    const card = want
+      ? cards.find((x) => x && (x.name === want || String(x.name || '').includes(want)))
+      : cards[0];
+    if (!card) { showToast('没找到叫「' + (want || '(空)') + '」的智能体'); return; }
+    if (res.action === 'status') {
+      const idx = cards.indexOf(card);
+      if (idx >= 0) openCardDetail(idx);
+      showToast('智能体「' + card.name + '」: ' + (card.status === 'online' ? '在线' : '离线'));
+      return;
+    }
+    // action === 'run': 打开它的对话页 (带 goal 就直接发一条)
+    openChat(card);
+    if (res.goal) {
+      try { await api.post('/message', { text: String(res.goal), channelId: card.id }); }
+      catch (e) { showToast('发送失败: ' + ((e && e.message) || e)); }
+    }
+  }
+
+  function installDeepLinkListeners() {
+    // 2. Swift 注入的 pending (冷启动时原生先注入, 这里读到)
+    try {
+      if (window.__bolloonPendingDeepLink) handleDeepLinkUrl(window.__bolloonPendingDeepLink);
+    } catch (e) {}
+    window.addEventListener('bolloon:deeplink', (ev) => {
+      const u = (ev && ev.detail) || window.__bolloonPendingDeepLink || '';
+      if (u) handleDeepLinkUrl(u);
+    });
+    // 1. @capacitor/app (未安装 → 直接跳过)
+    try {
+      const AppPlugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
+      if (AppPlugin && typeof AppPlugin.addListener === 'function') {
+        AppPlugin.addListener('appUrlOpen', (e) => { if (e && e.url) handleDeepLinkUrl(e.url); });
+        if (typeof AppPlugin.getLaunchUrl === 'function') {
+          AppPlugin.getLaunchUrl().then((r) => { if (r && r.url) handleDeepLinkUrl(r.url); }).catch(() => {});
+        }
+      }
+    } catch (e) {}
+    // 3. 纯浏览器回退
+    try {
+      const href = String((window.location && window.location.href) || '');
+      if (/^bolloon:\/\//i.test(href)) handleDeepLinkUrl(href);
+    } catch (e) {}
+  }
+
   function init() {
     bindMenu();
     applyTheme(resolveThemePref(), false);
     switchTab('main');
     setupUiControl();
+    installDeepLinkListeners();
     loadAgentCovers();
     loadMe();
     if (core?.network?.start) core.network.start().catch(() => {});
+    // 本机 IPFS 节点: 若已启用则在启动时拉起 (iOS 回前台也走这里)
+    api.get('/api/helia/status').then((st) => { if (st && st.enabled && !st.running) api.post('/api/helia/start', {}).catch(() => {}); }).catch(() => {});
   }
   document.addEventListener('DOMContentLoaded', init);
   if (document.readyState !== 'loading') init();

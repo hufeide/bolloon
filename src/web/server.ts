@@ -17,6 +17,8 @@ import { registerJudgmentsRoutes } from './routes-judgments.js';
 import { registerLlmConfigRoutes } from './routes-llm-config.js';
 import { registerExternalEngineRoutes } from './routes-external-engines.js';
 import { registerTaskRoutes } from './routes-tasks.js';
+// 2026-09-13: 微支付信息服务 (x402) 路由
+import { registerX402InfoRoutes } from './routes-x402-info.js';
 import { loadPeerTier, recordInteraction, recordViolation, checkToolAccess, tierLabel } from '../social/dunbar-tier.js';
 import { registerHearthRoutes } from './routes-hearth.js';
 import { loadOrCreateAgentIdentity } from '../agents/agent-identity.js';
@@ -2459,6 +2461,36 @@ export async function createWebServer(port: number = 3000, options: CreateWebSer
         console.warn('[heartbeat] 启动失败 (non-fatal):', (hbErr as Error)?.message);
       }
 
+      // 2026-09-13: 定时任务调度器 (clock) — 带 tick 锁 + 执行记录 + 看门狗 + 勿扰闸门.
+      //   勿扰: 主任务 (人类这条消息跑 agent) 期间 tick 会被 resolveDnd 挡下并记 deferred,
+      //   主任务结束后下一个 tick 补跑, 不抢前台、不刷屏 (事件只走 monitor.log / SSE)。
+      try {
+        const { startCronScheduler, setCronLogSink, enterMainTask, exitMainTask } = await import('../cron/index.js');
+        setCronLogSink((evt: any) => {
+          try { broadcast({ type: 'cron', ...evt }); } catch { /* 广播失败不致命 */ }
+        });
+        const cronHandle = await startCronScheduler({
+          intervalMs: Number(process.env.BOLLOON_CRON_HEARTBEAT_MS) || 60_000,
+          exec: async (job) => {
+            const channels = await loadChannels();
+            const target = channels.find((c) => c.currentSessionId) || channels[0];
+            if (!target) throw new Error('无可用 channel, 跳过定时任务');
+            const agent = await getAgentForChannel(target.id);
+            if (!agent || typeof (agent as any).promptStream !== 'function') {
+              throw new Error('无可用 agent, 跳过定时任务');
+            }
+            // 前缀 [cron] 标记后台执行来源 (供审计/日志区分人类消息与定时任务)
+            await (agent as any).promptStream(`[cron] ${job.name}: ${job.prompt}`, () => {}, undefined, target.id);
+          },
+        });
+        (global as any).cronScheduler = cronHandle;
+        if (!cronHandle.disabled) console.log(`[cron] 调度器已启动 (每 ${Math.round((Number(process.env.BOLLOON_CRON_HEARTBEAT_MS) || 60_000) / 1000)}s 一轮, tick 带锁 + DND)`);
+        // 暴露给 /message 使用 (主任务闸门)
+        (global as any).__bolloonMainTask = { enterMainTask, exitMainTask };
+      } catch (cronErr) {
+        console.warn('[cron] 调度器启动失败 (non-fatal):', (cronErr as Error)?.message);
+      }
+
       // 社交决策: 让本地 agent (用第一个本地 channel 的身份) 判断是否主动联络某 peer
       // 目标感知: ctx.goal 是当前要达成的目标, 决策应服务于它, 达成后可声明 goalAchieved 进入 RESTING
       async function llmSocialDecide(ctx: { self: any; peers: any[]; goal?: any }): Promise<{
@@ -2918,6 +2950,36 @@ ${goalDesc}
     }
   });
 
+  // 2026-09-08: 手机端 P2P 拨入信息 — 手机(WebView)不能 listen, 只能主动拨桌面的 /ws 地址
+  app.get('/api/p2p/mobile-connect', async (_req, res) => {
+    try {
+      const { p2pNetwork } = await import('../network/p2p.js');
+      const wsAddrs = p2pNetwork.getWsMultiaddrs();
+      // 2026-09-11: 中继语义 — 这些 /ws 地址同时是 circuit relay v2 中继地址。
+      // 手机 dial 它之后即可预约, 拿到 <relay>/p2p-circuit/p2p/<手机PeerId> 这个「可拨入地址」。
+      const relay = p2pNetwork.getRelayServiceInfo();
+      const relayAddrs = relay.enabled ? p2pNetwork.getRelayAddrs() : [];
+      res.json({
+        ok: true,
+        peerId: p2pNetwork.getNodePeerId(),
+        wsAddrs,
+        // 单独字段: 明确「这是中继, 不是普通对端」(手机端看到 relayAddrs 就该去预约, 而不是只当 bootstrap)
+        isRelay: relay.enabled,
+        relayAddrs,
+        relayProtocol: relay.protocol,
+        relayReservations: relay.reservations,
+        relayMaxReservations: relay.maxReservations,
+        hint: wsAddrs.length
+          ? (relay.enabled
+              ? '拨 relayAddrs 里的任意地址 → 手机会自动预约中继并拿到 /p2p-circuit 可拨入地址'
+              : '桌面 P2P 在跑, 但中继服务未启用 (中继地址暂不可用; 手机只连不预约)')
+          : '桌面 P2P 未启动或未监听 ws',
+      });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: e?.message });
+    }
+  });
+
   // 2026-09-08: 手机端 OrbitDB 库级复制 — 列可复制 store / 读全量条目 / 合并写回
   app.get('/api/orbitdb/stores', async (_req, res) => {
     try {
@@ -3088,6 +3150,40 @@ ${goalDesc}
       const link = await groupLink(String(req.params.id));
       if (!link) return res.status(404).json({ error: '群组不存在' });
       res.json({ ok: true, link });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message });
+    }
+  });
+
+  // 2026-09-13: 人机问答通道 (clarify) — 智能体提问, 人类在 Web/手机点选项或输入回答
+  //   智能体侧 clarify 工具 ask() → 这里广播 agent-question → 前端渲染选项按钮
+  void import('../agents/user-questions.js').then(({ userQuestions }) => {
+    userQuestions.onQuestion((q) => {
+      try {
+        broadcast({ type: 'agent-question', question: q });
+      } catch { /* 广播失败不影响提问 (CLI 侧仍能看到) */ }
+    });
+  }).catch(() => {});
+
+  app.get('/api/questions', async (_req, res) => {
+    try {
+      const { userQuestions } = await import('../agents/user-questions.js');
+      res.json({ pending: await userQuestions.pending() });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message });
+    }
+  });
+
+  // POST /api/questions/answer { id?, text } — 回答 (id 省略则回答最早的一个待处理问题)
+  app.post('/api/questions/answer', async (req, res) => {
+    try {
+      const { id, text } = req.body || {};
+      const { userQuestions } = await import('../agents/user-questions.js');
+      const r = await userQuestions.answer(id ? String(id) : null, String(text ?? ''));
+      if (!r.ok) return res.status(400).json({ error: r.error });
+      // 人类回答后清掉前端提示 + 让 agent 侧的 await 立即返回
+      broadcast({ type: 'agent-question-answered', id: r.question?.id, answer: r.question?.answer });
+      res.json({ ok: true, question: r.question });
     } catch (e: any) {
       res.status(500).json({ error: e?.message });
     }
@@ -3689,6 +3785,14 @@ ${goalDesc}
     const { text, channelId, channelDid, attachments } = req.body;
     if (!text) {
       return res.status(400).json({ error: 'No text provided' });
+    }
+
+    // 2026-09-13: 主任务闸门 — 人类这条消息跑 agent 期间, 后台定时任务进入勿扰 (DND).
+    //   用 res 'close' 释放 (正常结束/中断都覆盖), 不需要改动本 handler 内部的分支.
+    const mainTask = (global as any).__bolloonMainTask;
+    if (mainTask?.enterMainTask) {
+      try { mainTask.enterMainTask('web-message'); } catch { /* 闸门失败不阻塞对话 */ }
+      res.on('close', () => { try { mainTask.exitMainTask(); } catch { /* 忽略 */ } });
     }
 
     // 2026-08-02: / 斜杠命令路由 — 用户输入 /plan /todo /task 等快捷命令时,
@@ -5865,6 +5969,9 @@ app.post('/active-channel', async (req, res) => {
 
   // 2026-07-06: Task Queue API 抽到 ./routes-tasks.ts
   registerTaskRoutes(app, { broadcast, getAgentForChannel });
+
+  // 2026-09-13: 微支付信息服务 (x402) — 发布 / 402 收款 / 买方代付 / 验真
+  registerX402InfoRoutes(app);
 
   // 2026-07-06: LLM/Video/Audio 配置路由抽到 ./routes-llm-config.ts
   registerLlmConfigRoutes(app);

@@ -25,6 +25,22 @@ function busSubscribe(fn: BusHandler): () => void {
   return () => busHandlers.delete(fn);
 }
 
+/**
+ * 手机端已解锁钱包的私钥 —— 私钥隔离: 只在内部签名处读取, 绝不返回给调用方/LLM.
+ * 未解锁或没有钱包 → null (调用方给出人话提示).
+ */
+async function phonePrivateKey(walletId?: string): Promise<string | null> {
+  try {
+    const w: any = await import('./mobile-wallet.js');
+    const st: any = await w.listWallets();
+    const list: any[] = (st && st.wallets) || [];
+    const target = walletId ? list.find((x) => x.id === walletId) : list.find((x) => x.unlocked);
+    if (!target || !target.unlocked) return null;
+    const r: any = await w.exportWallet(target.id);
+    return (r && (r.privateKey || r.priv)) || null;
+  } catch { return null; }
+}
+
 // ============ P2P 消息路由: 数据同步 (data.*) vs Agent 功能 (agent.*) ============
 
 /** 统一发送封装 (mobile-p2p), 供 data/agent 层注入 */
@@ -58,6 +74,16 @@ async function routeIncomingMessage(payload: string, fromPeer: string): Promise<
       await dataLayer.handleIncomingDataMessage(type, msgBody, fromPeer);
       return;
     }
+    // 社交/服务注册协议 → 自动社交层
+    if (/^(registry\.|agent\.hello)/.test(type)) {
+      try {
+        const social = await import('./mobile-social.js');
+        const ag = await import('./mobile-agent.js');
+        const id = await ag.ensureIdentity();
+        await social.handleSocialMessage(type, msgBody, fromPeer, { ownDid: id.did, send: sendViaP2P, store: social.getDefaultSocialStore() });
+      } catch { /* 社交消息失败不影响其它路由 */ }
+      return;
+    }
     // agent.* → Agent 功能层
     if (type.startsWith('agent.')) {
       const agentLayer = await import('./mobile-agent.js');
@@ -73,6 +99,54 @@ async function routeIncomingMessage(payload: string, fromPeer: string): Promise<
   } catch { /* 路由失败静默 */ }
 }
 
+// ============ 深链 (bolloon://) — iOS 系统入口 (Siri / 快捷指令 / Spotlight) ============
+// 协议与 ios/App/App/BolloonIntents.swift 一一对应:
+//   bolloon://agent/run?name=<name>[&goal=<text>]   运行智能体
+//   bolloon://agent/status?name=<name>              查看智能体状态
+// 这里只做**纯解析** (不抛异常, 非法就 ok:false);
+// 具体打开哪个页面由 mobile.js 的 handleDeepLinkUrl() 决定 (它在 window 上监听原生事件).
+
+export interface DeepLinkResult {
+  ok: boolean;
+  action?: 'run' | 'status';
+  name?: string;
+  goal?: string;
+  error?: string;
+}
+
+/** 解析 bolloon:// 深链; 非法/不认识的 URL → {ok:false,error}, 绝不抛。 */
+export function handleDeepLink(rawUrl: unknown): DeepLinkResult {
+  try {
+    const raw = String(rawUrl ?? '').trim();
+    if (!raw) return { ok: false, error: '空链接' };
+    const m = /^bolloon:\/\/([^/?#]*)(\/[^?#]*)?(?:\?([^#]*))?/i.exec(raw);
+    if (!m) return { ok: false, error: '不是 bolloon:// 链接' };
+    const host = (m[1] || '').toLowerCase();
+    const pathSeg = (m[2] || '').replace(/^\/+/, '').split('/')[0].toLowerCase();
+    const actionRaw = pathSeg || host;
+    if (actionRaw !== 'run' && actionRaw !== 'status') {
+      return { ok: false, error: '不认识的 action: ' + (actionRaw || '(空)') };
+    }
+    if (pathSeg && host !== 'agent') return { ok: false, error: '不认识的 host: ' + host };
+    const action = actionRaw as 'run' | 'status';
+    let name = '';
+    let goal = '';
+    for (const pair of (m[3] || '').split('&')) {
+      if (!pair) continue;
+      const eq = pair.indexOf('=');
+      const k = decodeURIComponent((eq >= 0 ? pair.slice(0, eq) : pair).replace(/\+/g, ' '));
+      const v = (eq >= 0 ? pair.slice(eq + 1) : '').replace(/\+/g, ' ');
+      if (k === 'name') name = decodeURIComponent(v);
+      else if (k === 'goal') goal = decodeURIComponent(v);
+    }
+    const out: DeepLinkResult = { ok: true, action, name };
+    if (goal) out.goal = goal;
+    return out;
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
 // ============ 内核 API (mobile.js 对接面, 路由到 data/agent 层) ============
 
 export const core = {
@@ -86,6 +160,26 @@ export const core = {
     if (p === '/api/payments/pending') return () => core.payments.pending();
     if (p === '/api/llm-config') return () => core.data.getLlmConfig();
     if (p === '/api/network/status') return () => core.network.status();
+    if (p === '/api/network/desktop-addrs') return () => core.network.desktopAddrs();
+    if (p === '/api/social/discover') return () => core.social.discover();
+    if (p === '/api/chain/config') return () => core.chain.config();
+    if (p === '/api/ipfs/config') return () => core.ipfs.config();
+    // 深链探针: GET /api/deeplink?url=<encodeURIComponent(bolloon://...)> → DeepLinkResult
+    if (p === '/api/deeplink' || p.startsWith('/api/deeplink?')) {
+      const q = p.indexOf('?');
+      let urlParam = '';
+      for (const pair of (q >= 0 ? p.slice(q + 1) : '').split('&')) {
+        if (!pair) continue;
+        const eq = pair.indexOf('=');
+        if ((eq >= 0 ? pair.slice(0, eq) : pair) !== 'url') continue;
+        const v = eq >= 0 ? pair.slice(eq + 1) : '';
+        try { urlParam = decodeURIComponent(v.replace(/\+/g, ' ')); } catch { urlParam = v; }
+      }
+      return () => Promise.resolve(handleDeepLink(urlParam));
+    }
+    if (p === '/api/helia/status') return () => core.helia.status();
+    if (p === '/api/social/status') return () => core.social.status();
+    if (p === '/api/trade/trades') return () => core.trade.trades();
     if (p === '/api/wallet/status') return () => core.wallet.status();
     if (p === '/api/wallet/balance') return () => core.wallet.balance();
     // 电脑端数据同步 (登录后/手动): 快照 + 状态 + 判断力缓存
@@ -93,6 +187,8 @@ export const core = {
     if (p === '/api/desktop/url') return () => core.desktop.url();
     if (p === '/api/desktop/sync') return () => core.desktop.sync();
     if (p === '/api/judgments/cached') return () => core.desktop.judgments();
+    // 微信息 (x402 付费信息): 手机不持 EVM 私钥 → 列表走电脑端; 不可达就回 desktop-unreachable (不抛)
+    if (p === '/api/x402/info') return () => core.x402.list();
     // OrbitDB 本地副本 (库级复制)
     if (p === '/api/orbit/status') return () => core.orbit.status();
     if (p === '/api/orbit/replica') return () => core.orbit.replica();
@@ -189,6 +285,76 @@ export const core = {
       const b = body || {};
       return () => core.desktop.setUrl(String(b.url || ''));
     }
+    // 微信息 (x402 付费信息): 购买并验真 → 一律转发电脑端代付 (手机端不签名/不碰私钥)
+    if (p === '/api/x402/info/buy') {
+      const b = body || {};
+      return () => core.x402.buy(b);
+    }
+    if (p === '/api/network/connect') return () => core.network.connect();
+    if (p === '/api/social/announce') return () => core.social.announce();
+    if (p === '/api/chain/config') { const b = body || {}; return () => core.chain.config(b); }
+    if (p === '/api/ipfs/config') { const b = body || {}; return () => core.ipfs.setConfig(b); }
+    if (p === '/api/helia/enabled') { const b = body || {}; return () => core.helia.setEnabled(!!b.enabled); }
+    if (p === '/api/helia/add') { const b = body || {}; return () => core.helia.add(b.value); }
+    if (p === '/api/helia/get') { const b = body || {}; return () => core.helia.get(String(b.cid || '')); }
+    if (p === '/api/helia/start') return () => core.helia.start();
+    if (p === '/api/helia/stop') return () => core.helia.stop();
+    if (p === '/api/ipfs/upload') { const b = body || {}; return () => core.ipfs.upload(String(b.content ?? ''), b.name ? String(b.name) : undefined); }
+    if (p === '/api/ipfs/fetch') { const b = body || {}; return () => core.ipfs.fetch(String(b.cid || '')); }
+    if (p === '/api/ipfs/cid') { const b = body || {}; return () => core.ipfs.cid(b.value); }
+    if (p === '/api/chain/x402-sign') { const b = body || {}; return () => core.chain.signX402(b); }
+    if (p === '/api/chain/transfer') { const b = body || {}; return () => core.chain.transfer(b); }
+    if (p === '/api/chain/register') { const b = body || {}; return () => core.chain.register(b); }
+    if (p === '/api/trade/call') {
+      const b = body || {};
+      return async () => {
+        const t = await import('./mobile-trade.js');
+        const w = await import('./mobile-wallet.js');
+        const out: any = await t.callService({
+          service: b.service,
+          request: b.request || {},
+          deps: {
+            fetchImpl: fetch,
+            walletForAgent: (aid: string) => w.walletForAgent(aid),
+            getPrivateKey: async (id: string) => { const r: any = await w.exportWallet(id); return r && (r.privateKey || r.priv); },
+            // 手机端独立支付: 自己签 x402 授权 (EIP-712/EIP-3009, 无需 gas 无需电脑端)
+            payFn: async (spec: any) => {
+              const pk = await phonePrivateKey(b.walletId);
+              if (!pk) return { success: false, error: '手机钱包未解锁 (我 → 钱包 → 解锁后重试)' };
+              const c: any = await import('./mobile-chain.js');
+              const sig: any = await c.signX402Authorization({
+                privateKey: pk,
+                to: spec.to || spec.payTo,
+                amount: String(spec.amount ?? ''),
+                currency: spec.currency,
+                network: spec.network,
+              });
+              if (!sig || sig.ok === false) return { success: false, error: (sig && sig.error) || 'x402 签名失败' };
+              return { success: true, header: sig.header, signature: sig.signature, authorization: sig.authorization };
+            },
+            policy: b.policy,
+          },
+        });
+        // PROOF 阶段 (协议): 结果算 CID + 尽力上远端 IPFS, 便于别人按 CID 取且可校验
+        if (out && out.ok) {
+          try {
+            const i: any = await import('./mobile-ipfs.js');
+            const cid = await i.resultCid(out.result);
+            out.resultCid = cid;
+            const up: any = await i.ipfsUpload(JSON.stringify(out.result ?? null), 'bolloon-result');
+            out.proof = up && up.ok ? { cid: up.cid, provider: up.provider } : { cid, local: true };
+          } catch { /* PROOF 失败不影响交易结果 */ }
+        }
+        return out;
+      };
+    }
+    if (p === '/api/trade/settle') {
+      const b = body || {};
+      return async () => {
+        const t = await import('./mobile-trade.js');
+        return t.settleAndRate({ ok: b.ok, service: b.service });
+      };
+    }
     if (p === '/api/desktop/sync') return () => core.desktop.sync();
     if (p === '/api/orbit/put') {
       const b = body || {};
@@ -208,6 +374,10 @@ export const core = {
 
   /** P2P 网络 — 启动浏览器 libp2p 节点, 并注入 data/agent 两层传输 */
   network: {
+    /** 电脑端可拨的 P2P ws 地址 (手机不能 listen, 展示+连接用) */
+    async desktopAddrs(): Promise<any> { const s = await import('./mobile-sync.js'); return s.desktopP2PAddrs(); },
+    /** 连接: start() 内部会自动向电脑端要地址 (无种子时) */
+    async connect(): Promise<any> { return core.network.start(); },
     async start(seedAddrs?: string[]): Promise<any> {
       try {
         const { startMobileP2P, getMobileP2PState, onMobileP2PMessage } = await import('./mobile-p2p.js');
@@ -215,7 +385,36 @@ export const core = {
         const dataLayer = await import('./mobile-data.js');
 
         const id = await agentLayer.ensureIdentity();
-        const st = await startMobileP2P({ seedAddrs, ownDid: id.did });
+        // 手机(WebView)不能 listen → 没有种子时必须向电脑端要可拨地址, 否则节点起来了也没有任何连接
+        let seeds = seedAddrs && seedAddrs.length ? seedAddrs : undefined;
+        let relayAddrs: string[] | undefined;
+        let desktopPeer = '';
+        if (!seeds) {
+          try {
+            const sync = await import('./mobile-sync.js');
+            const d = await sync.desktopP2PAddrs();
+            if (d.ok && d.addrs.length) { seeds = d.addrs; desktopPeer = d.peerId || ''; }
+            // 2026-09-11: 电脑端是中继 → 拿 relayAddrs 显式预约, 手机才有可拨入地址
+            if (d.ok && Array.isArray(d.relayAddrs) && d.relayAddrs.length) relayAddrs = d.relayAddrs;
+          } catch { /* 电脑端不可达 → 单机模式 */ }
+        }
+        const st = await startMobileP2P({ seedAddrs: seeds, ownDid: id.did, relayAddrs });
+        if (desktopPeer) busBroadcast({ type: 'p2p-desktop', peerId: desktopPeer, addrs: seeds || [] });
+        // 自动社交 (E1 DISCOVERY): 广播自身服务声明 + 欢迎已连对端 + 心跳 (协议 5 分钟)
+        try {
+          const social = await import('./mobile-social.js');
+          const syncMod = await import('./mobile-sync.js');
+          const sStore = social.createLocalStorageStore();
+          const desktopUrl = syncMod.getDesktopUrl();
+          social.announceSelf({ ownDid: id.did, ownName: id.name, send: sendViaP2P, peerId: desktopPeer || '*', desktopUrl, fetchImpl: fetch, store: sStore }).catch(() => {});
+          for (const pid of (st.peerIds || [])) {
+            social.onPeerConnected(pid, { ownDid: id.did, send: sendViaP2P, store: sStore }).catch(() => {});
+          }
+          setInterval(() => {
+            social.heartbeat({ ownDid: id.did, send: sendViaP2P, peerId: desktopPeer || '*', desktopUrl, fetchImpl: fetch, store: sStore }).catch(() => {});
+          }, social.DEFAULT_HEARTBEAT_MS);
+          busBroadcast({ type: 'social-started' });
+        } catch { /* 社交层不可用不影响基础连接 */ }
 
         // 注入传输: data/agent 两层用同一发送通道
         dataLayer.setDataTransport((type, payload, peerId) => sendViaP2P(type, payload, peerId));
@@ -403,6 +602,129 @@ export const core = {
     async judgments(): Promise<any> { const s = await import('./mobile-sync.js'); return { judgments: s.getCachedJudgments() }; },
   },
 
+  // 微信息 (x402 付费信息) — 手机端**不持 EVM 私钥**: 浏览与代付一律转发电脑端;
+  //   电脑端不可达就如实回 desktop-unreachable, 绝不返回假数据 (2026-09-13)
+  x402: {
+    /** 桌面基址 (设置页填; 与 mobile.js 的 desktopBaseUrl() 同一 localStorage key) */
+    async baseUrl(): Promise<string> {
+      try {
+        const g: any = await import('./mobile-gateway.js');
+        return String(g.getDesktopBaseUrl() || '').replace(/\/+$/, '');
+      } catch { return ''; }
+    },
+    /** 免费元数据列表 (电脑端已发布的付费信息); 不可达 → {count:0,items:[],note:'desktop-unreachable'} */
+    async list(): Promise<any> {
+      const base = await core.x402.baseUrl();
+      if (!base) return { count: 0, items: [], note: 'desktop-unreachable' };
+      try {
+        const r = await fetch(`${base}/api/x402/info`);
+        if (!r.ok) return { count: 0, items: [], note: 'desktop-unreachable' };
+        const d: any = await r.json();
+        if (!d || !Array.isArray(d.items)) return { count: 0, items: [], note: 'desktop-unreachable' };
+        return d;
+      } catch {
+        return { count: 0, items: [], note: 'desktop-unreachable' };
+      }
+    },
+    /** 购买并验真: 转发电脑端 /api/x402/info/buy 代付; 失败把后端 error 原文带回 (不吞错) */
+    async buy(body: any): Promise<any> {
+      const base = await core.x402.baseUrl();
+      if (!base) return { ok: false, error: '需要电脑端在线 (设置里填桌面地址)' };
+      try {
+        const r = await fetch(`${base}/api/x402/info/buy`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+        });
+        const d: any = await r.json().catch(() => null);
+        if (!r.ok) return { ok: false, status: r.status, error: (d && (d.error || d.message)) || `电脑端返回 ${r.status}` };
+        return d || { ok: false, error: '电脑端返回空响应' };
+      } catch (e: any) {
+        return { ok: false, error: '电脑端不可达: ' + String(e?.message || e).slice(0, 120) };
+      }
+    },
+  },
+
+  // 自动社交 (E1): 服务声明广播 / 发现 / 心跳 — 协议见 docs/wiki/agent-economic-protocol.md
+  social: {
+    async announce(): Promise<any> {
+      const s = await import('./mobile-social.js');
+      const ag = await import('./mobile-agent.js');
+      const syncMod = await import('./mobile-sync.js');
+      const id = await ag.ensureIdentity();
+      return s.announceSelf({ ownDid: id.did, ownName: id.name, send: sendViaP2P, peerId: '*', desktopUrl: syncMod.getDesktopUrl(), fetchImpl: fetch, store: s.createLocalStorageStore(), force: true });
+    },
+    async discover(query?: string): Promise<any> {
+      const s = await import('./mobile-social.js');
+      const ag = await import('./mobile-agent.js');
+      const syncMod = await import('./mobile-sync.js');
+      const id = await ag.ensureIdentity();
+      return s.discoverAgents({ ownDid: id.did, ownName: id.name, query, send: sendViaP2P, desktopUrl: syncMod.getDesktopUrl(), fetchImpl: fetch, store: s.createLocalStorageStore() });
+    },
+    async status(): Promise<any> {
+      const s = await import('./mobile-social.js');
+      return s.getHeartbeatState(s.createLocalStorageStore());
+    },
+  },
+
+  // 手机端独立链上能力 (自己签名/发交易, 不需要电脑端; 需在设置里配 RPC)
+  chain: {
+    async config(cfg?: any): Promise<any> {
+      const c: any = await import('./mobile-chain.js');
+      return cfg ? c.setChainConfig(cfg) : c.getChainConfig();
+    },
+    async signX402(opts: any): Promise<any> {
+      const pk = await phonePrivateKey(opts.walletId);
+      if (!pk) return { ok: false, error: '手机钱包未解锁' };
+      const c: any = await import('./mobile-chain.js');
+      const r = await c.signX402Authorization({ ...opts, privateKey: pk });
+      return r && r.ok ? { ok: true, header: r.header, authorization: r.authorization } : { ok: false, error: r && r.error };
+    },
+    async transfer(opts: any): Promise<any> {
+      const pk = await phonePrivateKey(opts.walletId);
+      if (!pk) return { ok: false, error: '手机钱包未解锁' };
+      const c: any = await import('./mobile-chain.js');
+      return c.erc20Transfer({ ...opts, privateKey: pk });
+    },
+    async register(opts: any): Promise<any> {
+      const pk = await phonePrivateKey(opts.walletId);
+      if (!pk) return { ok: false, error: '手机钱包未解锁' };
+      const c: any = await import('./mobile-chain.js');
+      return c.registerServiceOnChain({ ...opts, privateKey: pk });
+    },
+  },
+
+  // 本机 IPFS 节点 (Helia + js-libp2p, 真节点: PeerID/blockstore/bitswap)
+  //   注意: WebView 不能 listen → 只能拨出; iOS 后台会挂起 → 只在前台在线
+  helia: {
+    async status(): Promise<any> {
+      const h: any = await import('./mobile-helia.js');
+      const st = await h.heliaStatus();
+      return { ...(st || {}), enabled: h.heliaEnabled() };
+    },
+    async add(value: any): Promise<any> { const h: any = await import('./mobile-helia.js'); return h.heliaAddJson(value); },
+    async get(cid: string): Promise<any> { const h: any = await import('./mobile-helia.js'); return h.heliaGetJson(cid); },
+    async start(): Promise<any> { const h: any = await import('./mobile-helia.js'); const r = await h.startMobileHelia(); if (r && r.ok) h.setHeliaEnabled(true); return r; },
+    async stop(): Promise<any> { const h: any = await import('./mobile-helia.js'); const r = await h.stopMobileHelia(); h.setHeliaEnabled(false); return r; },
+    async setEnabled(enabled: boolean): Promise<any> {
+      const h: any = await import('./mobile-helia.js');
+      h.setHeliaEnabled(enabled);
+      return enabled ? h.startMobileHelia() : h.stopMobileHelia();
+    },
+  },
+
+  // IPFS (协议 PROOF/资源存储): 本地算验 CID + 远端读写 + 网关回退
+  ipfs: {
+    async config(cfg?: any): Promise<any> { const i: any = await import('./mobile-ipfs.js'); return cfg ? i.setIpfsConfig(cfg) : i.getIpfsConfig(); },
+    async setConfig(cfg: any): Promise<any> { const i: any = await import('./mobile-ipfs.js'); return i.setIpfsConfig(cfg); },
+    async upload(content: string, name?: string): Promise<any> { const i: any = await import('./mobile-ipfs.js'); return i.ipfsUpload(content, name); },
+    async fetch(cid: string): Promise<any> { const i: any = await import('./mobile-ipfs.js'); return i.ipfsFetch(cid); },
+    async cid(value: any): Promise<any> { const i: any = await import('./mobile-ipfs.js'); return { ok: true, cid: await i.computeCid(value) }; },
+  },
+
+  // 资源交易 (E2/E3/E4): 402 → 策略 → 支付 → 结果 → 信誉
+  trade: {
+    async trades(limit?: number): Promise<any> { const t = await import('./mobile-trade.js'); return { trades: t.listTrades(undefined, limit ? { limit } : undefined) }; },
+  },
+
   // OrbitDB 本地副本 (库级复制): 手机端持有与电脑端同地址 store 的副本, 离线可读
   orbit: {
     async status(): Promise<any> { const o = await import('./mobile-orbit.js'); return o.replicaStats(); },
@@ -534,6 +856,8 @@ export const core = {
       return decodeQrImageData(data, w, h);
     },
   },
+  // 深链解析 (bolloon://) — iOS 系统入口 (Siri / 快捷指令 / Spotlight) 走这条 (2026-09-11)
+  handleDeepLink,
 };
 
 // 全局暴露给 mobile.js

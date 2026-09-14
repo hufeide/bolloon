@@ -93,6 +93,13 @@ const TOOL_WHITELIST = new Set<string>([
   'kanban_create', 'kanban_list', 'kanban_get', 'kanban_claim', 'kanban_complete', 'kanban_status',
   // 2026-08-07: Bolloon 自身配置读写 (bolloon-config.json, agent 有修改自身配置权限)
   'bolloon_config_get', 'bolloon_config_set',
+  // 2026-09-13: 下一代工具集 (人机问答 / 精确补丁 / 代码执行 / 桌面操作 / 技能分享 / 浏览器)
+  'clarify', 'patch', 'execute_code',
+  'git_status', 'git_add', 'git_restore',
+  'computer_use', 'browser',
+  'skill_export', 'skill_import', 'skill_share',
+  // 2026-09-13: 微支付信息服务 (x402 付费信息 + 验真)
+  'x402_info_publish', 'x402_info_list', 'x402_info_unpublish', 'x402_info_buy', 'x402_info_verify',
 ]);
 
 export const gateWhitelist: GateResult = { gate: 'whitelist', allowed: true };

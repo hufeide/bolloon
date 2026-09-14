@@ -869,16 +869,35 @@ async function startCLI(commReady: Promise<HyperswarmCommunicator | null>): Prom
     setTimeout(() => { cliOrganizeHeartbeat?.runOnce().catch(() => {}); }, 3000);
   } catch { /* 自动整理启动失败不阻塞 CLI */ }
 
-  // ==================== 2026-08-11: cron 调度心跳 (借鉴 Hermes cron/scheduler.py) ====================
+  // ==================== 2026-09-13: 人机问答通道 (clarify) ====================
+  // agent 运行中用 clarify 工具提问 → 这里渲染问题框; 用户下一次输入即为回答 (processInput 路由)
+  let cliUnsubQuestions: (() => void) | null = null;
+  try {
+    const { userQuestions, formatQuestion } = await import('./agents/user-questions.js');
+    cliUnsubQuestions = userQuestions.onQuestion((q) => {
+      appendLine(renderMessageBox({
+        title: '❓ 智能体在问你',
+        body: `${formatQuestion(q)}\n\n${C_DIM}直接在输入框回答 · /questions 查看待答${RESET}`,
+        color: C_ACCENT,
+        maxLines: 10,
+      }));
+    });
+  } catch { /* 问答通道注册失败不阻塞 CLI */ }
+
+  // ==================== 定时任务调度 (clock: tick 锁 + 勿扰 + 执行记录) ====================
   // 轻量定时任务: 每隔一段时间扫一次 due 的 job, 把 job.prompt 投给 agent 执行.
   // 不阻塞启动, 失败不崩溃 (各自 try/catch), 继承 organize heartbeat 的"静默降级"心智.
-  let cliCronTimer: NodeJS.Timeout | null = null;
+  let cliCronTimer: NodeJS.Timeout | null = null;   // 兼容旧引用 (新结构用 cliCronHandle.stop)
+  let cliCronHandle: { stop: () => void; disabled?: boolean } | null = null;
   try {
-    const { Scheduler } = await import('./cron/scheduler.js');
-    const cronScheduler = new Scheduler({
-      now: () => new Date(),
+    // 2026-09-13: 换用完整 clock 结构 — tick 锁 (跨进程互斥) + 执行记录 + 看门狗 + 勿扰闸门.
+    //   DND: processInput 里 enterMainTask/exitMainTask 包住人类这一轮, 期间后台 job 记 deferred,
+    //   主任务结束后下一个 tick 补跑 (不抢前台, 不往 TUI 打印).
+    const { startCronScheduler, enterMainTask, exitMainTask } = await import('./cron/index.js');
+    cliCronHandle = await startCronScheduler({
+      intervalMs: Number(process.env.BOLLOON_CRON_HEARTBEAT_MS) || 60_000,
       exec: async (job) => {
-        // 借 agent 执行任务 prompt (脱壳为 text 提示). 无 agent / 超时 / 失败 → 抛出交给 scheduler 记录失败
+        // 借 agent 执行任务 prompt (脱壳为 text 提示). 无 agent / 超时 / 失败 → 抛出交给 scheduler 记录
         const a = await Promise.race([
           await getAgent().catch(() => null),
           new Promise<null>((res) => setTimeout(() => res(null), 8000)),
@@ -889,14 +908,7 @@ async function startCLI(commReady: Promise<HyperswarmCommunicator | null>): Prom
         await (a as any).promptStream?.(`[cron] ${job.name}: ${job.prompt}`, () => {}, undefined, cliActiveChannelId || undefined);
       },
     });
-    const cronIntervalMs = Number(process.env.BOLLOON_CRON_HEARTBEAT_MS) || 60_000;
-    cliCronTimer = setInterval(() => {
-      cronScheduler.tick().catch((e: any) => {
-        console.error('[cron] 调度心跳失败 (不影响主流程):', e?.message ?? e);
-      });
-    }, cronIntervalMs);
-    // 启动延迟一轮, 避开启动峰值
-    setTimeout(() => { cronScheduler.tick().catch(() => {}); }, 15_000);
+    (globalThis as any).__bolloonMainTask = { enterMainTask, exitMainTask };
   } catch { /* cron 调度启动失败不阻塞 CLI */ }
 
   // 启动会话面板 (大框): 栈式 = face 艺术字居中 + BOLLOON 字标 logo 在其下 + 预设信息(skills/工具/模型/目录/Session/分支/时间)
@@ -921,12 +933,33 @@ async function startCLI(commReady: Promise<HyperswarmCommunicator | null>): Prom
   stopInk();
   appendLine(`\n${CYAN}👋 再见！${RESET}`);
   try { cliOrganizeHeartbeat?.stop(); } catch { /* 非致命 */ }
+  try { cliUnsubQuestions?.(); } catch { /* 非致命 */ }
   if (cliCronTimer) clearInterval(cliCronTimer);
+  try { cliCronHandle?.stop(); } catch { /* 非致命 */ }
   comm?.stop();
   process.exit(0);
 }
 
+/**
+ * 2026-09-13: 主任务闸门 (勿扰/DND) — 人类这一轮跑 agent 期间, 后台定时任务不抢前台.
+ * 实现方式: 包住 processInputInner, 用 cron/dnd 的 enterMainTask/exitMainTask (跨进程可见的锁文件),
+ * scheduler 的每个 tick 会先查 resolveDnd(), 处于勿扰时把 due job 记 deferred 并留到下一轮.
+ */
 async function processInput(input: string, comm: HyperswarmCommunicator | null): Promise<void> {
+  const gate = (globalThis as any).__bolloonMainTask;
+  if (gate?.enterMainTask) {
+    try { gate.enterMainTask('cli-turn'); } catch { /* 闸门失败不阻塞对话 */ }
+    try {
+      await processInputInner(input, comm);
+    } finally {
+      try { gate.exitMainTask(); } catch { /* 释放失败不致命 */ }
+    }
+    return;
+  }
+  await processInputInner(input, comm);
+}
+
+async function processInputInner(input: string, comm: HyperswarmCommunicator | null): Promise<void> {
   const trimmed = input.trim();
   // TUI tool call state (local to this invocation)
   const tuiToolCalls: Array<{ tool: string; args: any; _t: number }> = [];
@@ -935,6 +968,37 @@ async function processInput(input: string, comm: HyperswarmCommunicator | null):
   const runEndOkSteps: Array<{ status: string; name: string; output?: string }> = [];
   // each iteration
   let lastToolEvent: { tool: string; args: any } | null = null;
+
+  // ===== 2026-09-13: clarify — 有等待回答的问题时, 这一行输入就是回答 =====
+  //   (斜杠命令照旧可用; 想显式回答用 /answer <文本>)
+  try {
+    const { userQuestions } = await import('./agents/user-questions.js');
+    const pending = await userQuestions.pending();
+    if (pending.length > 0) {
+      const q = pending[0];
+      const isAnswerCmd = trimmed.toLowerCase().startsWith('/answer ');
+      const isOwnCommand = trimmed.startsWith('/') && !isAnswerCmd;
+      if (!isOwnCommand) {
+        const raw = isAnswerCmd ? trimmed.slice('/answer '.length).trim() : trimmed;
+        const r = await userQuestions.answer(q.id, raw);
+        if (r.ok) {
+          appendLine(renderMessageBox({
+            title: '💬 已回复智能体',
+            body: `${q.question}\n\n→ ${r.question?.answer || raw}`,
+            color: C_ACCENT,
+            maxLines: 8,
+          }));
+        } else {
+          appendLine(`${C_WARN}${r.error}${RESET}`);
+        }
+        return;
+      }
+      if (isAnswerCmd) {
+        appendLine(`${C_DIM}用法: /answer <文本> — 回答当前待处理问题${RESET}`);
+        return;
+      }
+    }
+  } catch { /* 问答通道异常不阻塞主流程 */ }
 
   // !command — 直接执行终端命令. 2026-08-12 (Task4): 支持多命令 (&& / ;) 逐段顺序执行 + 加载显示.
   if (trimmed.startsWith('!')) {
@@ -1216,8 +1280,20 @@ async function processInput(input: string, comm: HyperswarmCommunicator | null):
     return;
   }
 
-  // /model — 模型供应商选择器 (ink 交互渲染, 复用 MentionPopup)
-  if (cmd === '/model') {
+  // /model — 无参: 交互选择器 (ink 渲染, 复用 MentionPopup); 有参: 直接切换/测连通/看状态
+  if (cmd === '/model' || cmd.startsWith('/model ')) {
+    const modelArg = trimmed.slice('/model'.length).trim();
+    if (modelArg) {
+      try {
+        const { runModelCommand } = await import('./cli/setup-wizard.js');
+        // 会话内不提供隐藏输入 (避免 API key 留在会话回显/记录里) → 需要 key 时给出系统终端指引
+        const out = await runModelCommand(modelArg);
+        for (const line of String(out).split('\n')) appendLine(`${C_DIM}${line}${RESET}`);
+      } catch (e: any) {
+        appendLine(`${C_ERROR}/model 失败: ${String(e?.message || e).slice(0, 150)}${RESET}`);
+      }
+      return;
+    }
     try {
       const { llmConfigStore, PROVIDER_INFO } = await import('./llm/config-store.js');
       await llmConfigStore.initialize();
@@ -1240,6 +1316,147 @@ async function processInput(input: string, comm: HyperswarmCommunicator | null):
       });
     } catch (e: any) {
       appendLine(`${C_ERROR}/model 失败: ${String(e.message || e).slice(0, 150)}${RESET}`);
+    }
+    return;
+  }
+
+  // /questions — 待回答的问题 (clarify 人机问答通道)
+  if (cmd === '/questions' || cmd === '/q') {
+    try {
+      const { userQuestions, formatQuestion } = await import('./agents/user-questions.js');
+      const pending = await userQuestions.pending();
+      if (pending.length === 0) {
+        appendLine(`${C_DIM}当前没有等待回答的问题。智能体用 clarify 工具提问时会出现在这里。${RESET}`);
+        return;
+      }
+      appendLine(`${C_ACCENT}待回答 (${pending.length}):${RESET}`);
+      for (const q of pending.slice(0, 5)) {
+        appendLine(renderMessageBox({
+          title: `❓ 智能体在问你 (${q.id})`,
+          body: `${formatQuestion(q)}\n\n${C_DIM}直接在输入框回答即可${RESET}`,
+          color: C_ACCENT,
+          maxLines: 10,
+        }));
+      }
+    } catch (e: any) {
+      appendLine(`${C_ERROR}/questions 失败: ${String(e?.message || e).slice(0, 120)}${RESET}`);
+    }
+    return;
+  }
+
+  // /answer — 显式回答当前问题 (等价于直接输入文本)
+  if (cmd === '/answer' || cmd.startsWith('/answer ')) {
+    const text = trimmed.slice('/answer'.length).trim();
+    try {
+      const { userQuestions } = await import('./agents/user-questions.js');
+      const r = await userQuestions.answer(null, text);
+      appendLine(r.ok
+        ? `${C_OK}✓ 已回复 (${r.question?.id})${RESET}`
+        : `${C_WARN}${r.error}${RESET} 用法: /answer <文本>${RESET}`);
+    } catch (e: any) {
+      appendLine(`${C_ERROR}/answer 失败: ${String(e?.message || e).slice(0, 120)}${RESET}`);
+    }
+    return;
+  }
+
+  // /setup — 初始化 / 配置总览 (身份 + 供应商 + 配置路径)
+  if (cmd === '/setup') {
+    try {
+      const { readUserIdentity, formatProviderStatus, getUserIdentityFile } = await import('./cli/setup-wizard.js');
+      appendLine(`${C_ACCENT}初始化状态:${RESET}`);
+      const id = await readUserIdentity();
+      appendLine(id
+        ? `  ${C_DIM}身份:${RESET} ${id.name} ${C_DIM}(${id.did.slice(0, 34)}…)${RESET}`
+        : `  ${C_WARN}还没有用户身份 — 退出后在系统终端跑 bolloon setup${RESET}`);
+      appendLine(`  ${C_DIM}身份文件:${RESET} ${getUserIdentityFile()}`);
+      for (const line of (await formatProviderStatus()).split('\n')) appendLine(`  ${C_DIM}${line}${RESET}`);
+      appendLine(`${C_DIM}补 key: 系统终端执行 bolloon model key <provider> · 或 Web 配置页 (bolloon --web)${RESET}`);
+    } catch (e: any) {
+      appendLine(`${C_ERROR}/setup 失败: ${String(e?.message || e).slice(0, 150)}${RESET}`);
+    }
+    return;
+  }
+
+  // /x402 — 微支付信息服务 (发布 / 列表 / 购买 / 验真)
+  if (cmd === '/x402' || cmd.startsWith('/x402 ')) {
+    const sub = trimmed.slice('/x402'.length).trim();
+    try {
+      const { listInfo, buyInfo, getStoredInfo } = await import('./agents/x402/paid-info-store.js');
+      const { verifyEnvelope, summarizeVerify } = await import('./agents/x402/paid-info-protocol.js');
+      const { makeDidResolver } = await import('./agents/x402/paid-info-tools.js');
+      const json = (sub.split(/\s+/).includes('--json'));
+      if (!sub || sub === 'list' || sub === 'status') {
+        const items = await listInfo();
+        if (json) { appendLine(JSON.stringify(items, null, 2)); return; }
+        if (items.length === 0) {
+          appendLine(`${C_DIM}本机没有发布任何付费信息 — 让智能体用 x402_info_publish 发布, 或 POST /api/x402/info${RESET}`);
+          return;
+        }
+        appendLine(`${C_ACCENT}我发布的付费信息 (${items.length}):${RESET}`);
+        for (const i of items) {
+          appendLine(`  ${C_DIM}·${RESET} ${i.title} ${C_DIM}[${i.category}] ${i.price.amount} ${i.price.currency}@${i.price.network}${RESET}`);
+          appendLine(`    ${C_DIM}${i.id} · ${i.contentHash.slice(0, 22)}…${RESET}`);
+        }
+        appendLine(`${C_DIM}买别人的: /x402 buy <url> · 验真: /x402 verify <url|信封JSON>${RESET}`);
+        return;
+      }
+      if (sub.startsWith('buy ')) {
+        const url = sub.slice(4).trim();
+        const r = await buyInfo({
+          url,
+          privateKey: process.env.X402_PRIVATE_KEY || undefined,
+          allowLocalDev: process.env.BOLLOON_X402_LOCAL_VERIFY === '1',
+          resolveDid: makeDidResolver(),
+        });
+        if (!r.ok) { appendLine(`${C_ERROR}购买失败: ${r.error}${RESET}`); return; }
+        appendLine(renderMessageBox({
+          title: `💰 已买下: ${r.envelope?.item?.title || ''}`,
+          body: [
+            `提供方: ${r.envelope?.item?.provider?.name || ''} ${r.envelope?.item?.provider?.did || ''}`,
+            `付款: ${r.envelope?.payment?.amount} ${r.envelope?.payment?.currency} (${r.envelope?.payment?.mode})`,
+            `验真: ${r.verify ? summarizeVerify(r.verify) : '(无签名)'}`,
+            '',
+            String(r.envelope?.content || '').slice(0, 1500),
+          ].join('\n'),
+          color: C_ACCENT, maxLines: 20,
+        }));
+        return;
+      }
+      if (sub.startsWith('verify ')) {
+        const ref = sub.slice(7).trim();
+        let env: any;
+        if (/^https?:\/\//i.test(ref)) {
+          const res = await fetch(ref);
+          const text = await res.text();
+          if (res.status === 402) {
+            const body = JSON.parse(text);
+            appendLine(`${C_WARN}该资源需要付款 (402) — 付款要求:${RESET}`);
+            appendLine(`${C_DIM}${JSON.stringify(body.accepts?.[0] || {}, null, 1)}${RESET}`);
+            return;
+          }
+          env = JSON.parse(text);
+        } else {
+          env = JSON.parse(ref);
+        }
+        const report = await verifyEnvelope(env, { resolveDid: makeDidResolver() });
+        appendLine(renderMessageBox({
+          title: '🔍 验真结果',
+          body: [summarizeVerify(report), '', ...report.checks.map((c) => `${c.ok ? '✅' : '❌'} ${c.name}: ${c.detail}`)].join('\n'),
+          color: report.ok ? C_OK : C_WARN, maxLines: 18,
+        }));
+        return;
+      }
+      if (sub.startsWith('show ')) {
+        const id = sub.slice(5).trim();
+        const stored = await getStoredInfo(id);
+        appendLine(stored
+          ? `${C_ACCENT}${stored.item.title}${RESET}\n${C_DIM}${stored.item.contentHash}${RESET}\n${stored.content.slice(0, 1500)}`
+          : `${C_WARN}没有 id=${id} 的信息${RESET}`);
+        return;
+      }
+      appendLine(`${C_DIM}用法: /x402 list | /x402 show <id> | /x402 buy <url> | /x402 verify <url|信封JSON>${RESET}`);
+    } catch (e: any) {
+      appendLine(`${C_ERROR}/x402 失败: ${String(e?.message || e).slice(0, 150)}${RESET}`);
     }
     return;
   }
@@ -1936,7 +2153,9 @@ async function processInput(input: string, comm: HyperswarmCommunicator | null):
     appendLine(`  ${C_ACCENT}/queue${RESET}  切换队列模式  ${C_DIM}输入排队, 当前结束后自动执行${RESET}`);
     appendLine(`  ${C_ACCENT}/dequeue${RESET} 出队一条`);
     appendLine(`  ${C_ACCENT}/channel [名字|id|序号]${RESET} 切换当前智能体  ${C_DIM}无参列出所有; 支持名字/ID/序号三种解析${RESET}`);
-    appendLine(`  ${C_ACCENT}/model${RESET}    模型供应商选择器  ${C_DIM}↑↓ 选择 · Enter 确认 · Esc 取消${RESET}`);
+    appendLine(`  ${C_ACCENT}/model${RESET}    模型供应商选择器  ${C_DIM}无参=选择器 · /model <名> [模型] 直接切换 · /model test 测连通${RESET}`);
+    appendLine(`  ${C_ACCENT}/setup${RESET}    初始化 / 配置总览  ${C_DIM}身份 + 供应商 + 配置文件路径${RESET}`);
+    appendLine(`  ${C_ACCENT}/questions${RESET} 待回答的问题  ${C_DIM}智能体 clarify 提问时, 直接输入即回答 (或 /answer <文本>)${RESET}`);
     appendLine(`  ${C_ACCENT}/login${RESET}    登录 GitHub/Google 账号 (骨架)  ${C_DIM}暂无真实 OAuth${RESET}`);
     appendLine(`  ${C_ACCENT}/logout${RESET}  查看当前供应商`);
     appendLine(`  ${C_ACCENT}/new agent${RESET}  创建新智能体 channel  ${C_DIM}/new agent <名字>${RESET}`);
@@ -3724,6 +3943,19 @@ async function main() {
     }) as any;
     // 2026-08-07: 交互模式静音 auto-update 后台通知 (stderr), 避免 "🔍 检查更新" 污染 TUI
     void import('./utils/auto-update.js').then(({ setNotifyQuiet }) => setNotifyQuiet(true)).catch(() => {});
+  }
+
+  // 2026-09-13: 首次运行引导 — 没有可用模型供应商 / 还没有用户身份时, 先走初始化向导
+  //   (放在 CLI 启动前: 用户先回答"你是谁 / 用哪个模型", 再进 TUI 面板)
+  if (isCLIInteractive) {
+    try {
+      const { isFirstRun, runSetupWizard } = await import('./cli/setup-wizard.js');
+      if (await isFirstRun()) {
+        await runSetupWizard({ interactive: true });
+      }
+    } catch (e: any) {
+      console.warn('[setup] 初始化向导失败 (不阻塞启动):', String(e?.message || e).slice(0, 200));
+    }
   }
 
   if (isNonInteractive) {
