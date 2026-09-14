@@ -2922,6 +2922,12 @@ ${goalDesc}
         const j = await import('../pi-ecosystem-judgment/index.js');
         out.judgments = await j.getAllJudgments();
       } catch (e: any) { out.judgments = []; out.judgmentsError = e?.message; }
+      // 本机 skills (~/.bolloon/skills/) — 手机端「智能体控制 (MCP / Skills)」页读取
+      try {
+        const { loadSkillsFromPaths, defaultSkillPaths } = await import('../agents/skill-loader.js');
+        const list = await loadSkillsFromPaths(defaultSkillPaths());
+        out.skills = list.map((k: any) => ({ name: String(k.name || ''), description: String(k.description || '').slice(0, 200) }));
+      } catch (e: any) { out.skills = []; out.skillsError = e?.message; }
       // Agent 服务 Registry (发现层)
       try {
         const { getAgentRegistry } = await import('../agents/agent-registry.js');

@@ -79,7 +79,7 @@
     const cs = $('#btn-create-session'); if (cs) cs.hidden = tab !== 'main';
     const ta = $('#topbar-actions'); if (ta) ta.hidden = tab === 'me';   // 我 页不显示 加号/刷新
     if (tab === 'friends') { loadContacts(); loadP2PStatus(); }
-    if (tab === 'network') { loadTouchControl(); loadApprovals(); loadNetMembers(); loadAgentServices(); loadX402Info(); }
+    if (tab === 'network') { loadAgentControl(); loadApprovals(); loadNetMembers(); loadAgentServices(); loadX402Info(); }
     if (tab === 'main') { loadAgentCovers(); }
     window.__mobileTouch?.('tab', tab);
   }
@@ -135,40 +135,135 @@
     } catch (e) { /* 忽略 */ }
   }
 
-  // 触控控制: 收敛成一个按钮 (原来把 MCP 工具摊成列表, 用户要先看懂 MCP 再逐条点,
-  // 而且真正的前提 —— 系统里的无障碍服务 —— 原 UI 完全不提示)。
-  let _touchReady = false;   // 上次查询到的无障碍就绪状态 (按钮行为据此分流)
-  async function loadTouchControl() {
-    const box = $('#touch-control');
+  // 智能体控制 = MCP 控制 + Skills 控制 (不是屏幕触控!)
+  //  - MCP 工具: 真正的工具调用 (gateway_status / join / register …)
+  //  - Skills:   电脑端 ~/.bolloon/skills/ 同步下来的本机技能
+  // 屏幕触控(无障碍) 挪到 设置 → 无障碍服务 (屏幕触控)。
+  function mkOverlayPage(id, title, inner) {
+    const page = document.createElement('div');
+    page.className = 'chat-page';
+    page.id = id;
+    page.style.zIndex = '70';
+    page.innerHTML = `<div class="chat-topbar">
+        <button class="icon-btn" id="${id}-back">←</button>
+        <div style="flex:1;font-weight:600">${escapeHtml(title)}</div>
+      </div>
+      <div id="${id}-body" style="padding:12px;flex:1;min-height:0;overflow:auto">${inner}</div>`;
+    document.body.appendChild(page);
+    page.querySelector(`#${id}-back`).addEventListener('click', () => page.remove());
+    return page;
+  }
+
+  async function loadAgentControl() {
+    const box = $('#agent-control');
     if (!box) return;
-    const cap = window.Capacitor;
-    const bridge = cap && cap.Plugins && cap.Plugins.RokidBridge;
-    const icon = '<svg class="ico" viewBox="0 0 24 24"><path d="M9 3.5v4.5M15 3.5v4.5"/><path d="M6.5 8h11v3.2a5.5 5.5 0 0 1-11 0z"/><path d="M12 16.7V20.5"/></svg>';
-    const paint = (name, sub) => {
-      box.innerHTML = `<div class="list-item" id="item-touch-control"><span class="list-icon">${icon}</span>
-        <span style="flex:1"><span style="display:block">${escapeHtml(name)}</span>
-        <span class="conv-preview" style="display:block">${escapeHtml(sub)}</span></span>
+    const iconMcp = '<svg class="ico" viewBox="0 0 24 24"><path d="M14.5 4.5a3.5 3.5 0 0 0-4.9 4.2L4 14.3V20h5.7l5.6-5.6a3.5 3.5 0 0 0 4.2-4.9l-2.4 2.4-2.1-2.1z"/></svg>';
+    const iconSkill = '<svg class="ico" viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5z"/><path d="M9 12h6M9 16h4M9 8h4"/></svg>';
+    let tools = []; let skills = [];
+    try { tools = (await api.get('/api/mcp/tools')) || []; } catch (e) { tools = []; }
+    try { skills = (await api.get('/api/skills')) || []; } catch (e) { skills = []; }
+    const skillSub = skills.length
+      ? skills.slice(0, 3).map((s) => '/' + String(s.name || '')).join('  ')
+      : '尚无本机技能 —— 点开后从电脑端同步';
+    box.innerHTML = `
+      <div class="list-item" id="item-mcp"><span class="list-icon">${iconMcp}</span>
+        <span style="flex:1"><span style="display:block">MCP 工具 · ${tools.length} 个</span>
+        <span class="conv-preview" style="display:block">点开读工具说明并调用（gateway_status / join / register / call）</span></span>
+        <span class="list-arrow">›</span></div>
+      <div class="list-item" id="item-skills"><span class="list-icon">${iconSkill}</span>
+        <span style="flex:1"><span style="display:block">Skills · ${skills.length} 个</span>
+        <span class="conv-preview" style="display:block">${escapeHtml(skillSub)}</span></span>
         <span class="list-arrow">›</span></div>`;
-      const el = $('#item-touch-control');
-      if (el) el.addEventListener('click', onTap);
-    };
-    async function onTap() {
-      if (_touchReady) {
-        alert('触控已就绪：电脑端可直接发 phone.tap / phone.swipe，或在电脑端让智能体操作这台手机');
+    const mcpEl = $('#item-mcp'); if (mcpEl) mcpEl.addEventListener('click', () => void openMcpPage(tools));
+    const skEl = $('#item-skills'); if (skEl) skEl.addEventListener('click', () => void openSkillsPage());
+  }
+
+  async function openMcpPage(toolsIn) {
+    if ($('#mcp-page')) return;
+    const page = mkOverlayPage('mcp-page', 'MCP 工具', '<div style="font-size:12px;color:var(--text-muted)">读取中…</div>');
+    let tools = toolsIn;
+    if (!Array.isArray(tools) || !tools.length) {
+      try { tools = (await api.get('/api/mcp/tools')) || []; } catch (e) { tools = []; }
+    }
+    const body = page.querySelector('#mcp-page-body');
+    if (!tools.length) { body.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted)">没有可用的 MCP 工具</div>'; return; }
+    body.innerHTML = tools.map((t, i) => `<div class="conv-item" data-ti="${i}">
+        <div class="conv-avatar">${escapeHtml(String(t.name || 'M').charAt(0))}</div>
+        <div class="conv-body"><div class="conv-name">${escapeHtml(String(t.name || ''))}</div>
+        <div class="conv-preview">${escapeHtml(String(t.description || ''))}</div></div></div>`).join('')
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:12px;line-height:1.7">点一下 = 让本机智能体调用该工具（gateway_* 需要先加入 Agent 网络）</div>';
+    body.querySelectorAll('[data-ti]').forEach((el) => el.addEventListener('click', () => void runMcpTool(tools[Number(el.dataset.ti)])));
+  }
+
+  async function runMcpTool(t) {
+    const name = String((t && t.name) || '');
+    if (!name) return;
+    let args = {};
+    try {
+      if (name === 'gateway_join') {
+        const link = prompt('gateway_join 需要网络链接：\norbitdb://… 或 ipns://… 或 https://…/registry', '');
+        if (!link) return;
+        args = { link };
+      } else if (name === 'gateway_register') {
+        const svc = prompt('注册为服务提供者，填一个服务名（例如 手机端助手）：', '');
+        if (!svc) return;
+        let agentId = '';
+        try { const id2 = await api.get('/api/auth/status'); agentId = (id2 && (id2.agentId || id2.did)) || ''; } catch (e) { agentId = ''; }
+        if (!agentId) { alert('还没有身份（我 → 登录），无法注册为服务提供者'); return; }
+        args = { self: { agentId, name: svc, service: { name: svc } } };
+      } else if (name === 'gateway_call') {
+        const svc = prompt('要调用的服务（名称或 agentId）：', '');
+        if (!svc) return;
+        args = { service: svc };
+      }
+      const r = await api.post('/api/mcp/call', { name, args });
+      const ok = r && r.ok !== false;
+      alert(`${name} ${ok ? '✔' : '✘'}\n\n${(r && r.output) || JSON.stringify(r)}`);
+      void loadAgentControl();
+    } catch (e) {
+      alert(`${name} 调用失败：${(e && e.message) || e}`);
+    }
+  }
+
+  async function openSkillsPage() {
+    if ($('#skills-page')) return;
+    const page = mkOverlayPage('skills-page', 'Skills', '<div style="font-size:12px;color:var(--text-muted)">读取中…</div>');
+    const bar = document.createElement('div');
+    bar.style.cssText = 'padding:0 12px 14px';
+    bar.innerHTML = '<button id="skills-sync" style="width:100%;padding:11px;border-radius:10px;border:1px solid var(--border);background:var(--bg-hover);color:var(--accent);font-size:14px">从电脑端同步</button>';
+    page.appendChild(bar);
+    const render = async () => {
+      let skills = []; let err = '';
+      try { skills = (await api.get('/api/skills')) || []; } catch (e) { skills = []; err = (e && e.message) || ''; }
+      const body = page.querySelector('#skills-page-body');
+      if (!body) return;
+      if (!skills.length) {
+        body.innerHTML = `<div style="padding:18px 8px;text-align:center;color:var(--text-muted);line-height:1.8">
+          还没有技能列表<br><span style="font-size:12px">电脑端 ~/.bolloon/skills/ 下的 skills，会在「从电脑端同步」后出现在这里</span>
+          ${err ? `<div style="font-size:11px;margin-top:8px">（读取失败：${escapeHtml(err)}）</div>` : ''}</div>`;
         return;
       }
-      try { await bridge.openAccessibilitySettings(); }
-      catch (e) { alert('请手动开启：设置 → 辅助功能 → 已安装的服务 → Bolloon Agent'); }
-    }
-    if (!bridge) { _touchReady = false; paint('触控控制仅真机可用', '浏览器里没有无障碍能力，请在 Android App 内使用'); return; }
-    let st = {};
-    try { st = (await bridge.touchStatus()) || {}; } catch (e) { st = {}; }
-    _touchReady = !!st.ready;
-    const enabled = !!st.enabled;
-    paint(
-      _touchReady ? '触控控制 已就绪' : (enabled ? '触控控制 未连上' : '开启触控控制'),
-      st.hint || (enabled ? '服务已勾选，点一下重新检查' : '点一下去系统设置打开 Bolloon Agent 无障碍服务')
-    );
+      body.innerHTML = skills.map((s, i) => `<div class="conv-item" data-sk="${i}">
+          <div class="conv-avatar">${escapeHtml(String(s.name || 'S').charAt(0).toUpperCase())}</div>
+          <div class="conv-body"><div class="conv-name">/${escapeHtml(String(s.name || ''))}</div>
+          <div class="conv-preview">${escapeHtml(String(s.description || '（无说明）').slice(0, 60))}</div></div></div>`).join('')
+        + `<div style="font-size:11px;color:var(--text-muted);margin-top:12px">共 ${skills.length} 个 · 来自电脑端 ~/.bolloon/skills/</div>`;
+      body.querySelectorAll('[data-sk]').forEach((el) => el.addEventListener('click', () => {
+        const s = skills[Number(el.dataset.sk)] || {};
+        alert(`/${s.name || ''}\n\n${s.description || '（无说明）'}`);
+      }));
+    };
+    await render();
+    const btn = page.querySelector('#skills-sync');
+    if (btn) btn.addEventListener('click', async () => {
+      btn.disabled = true; const old = btn.textContent; btn.textContent = '同步中…';
+      try {
+        const r = await api.post('/api/desktop/sync');
+        if (r && r.ok === false) { alert('同步失败：' + (r.error || '未知错误')); }
+        else { alert('同步完成' + (r && r.counts ? '：' + JSON.stringify(r.counts) : '')); }
+      } catch (e) { alert('同步失败：' + ((e && e.message) || e)); }
+      finally { btn.disabled = false; btn.textContent = old; await render(); }
+    });
   }
 
   async function loadApprovals() {
@@ -696,6 +791,154 @@
   let chatStepCancel = null;
   let streamingBubble = null;
   let chatLoadPromise = Promise.resolve();   // openChat 的首次历史加载 (供一键入网等自动发消息等它完成, 免被清屏抹掉)
+
+  function fmtAgo(ts) {
+    if (!ts) return '';
+    const d = Date.now() - ts;
+    if (d < 60e3) return '刚刚';
+    if (d < 3600e3) return Math.floor(d / 60e3) + ' 分钟前';
+    if (d < 86400e3) return Math.floor(d / 3600e3) + ' 小时前';
+    if (d < 7 * 86400e3) return Math.floor(d / 86400e3) + ' 天前';
+    return new Date(ts).toLocaleDateString();
+  }
+
+  // 左上角「索引」: 最近历史会话 (本机 IndexedDB 里的 sessions, 按更新时间倒序)
+  async function openIndexPanel() {
+    if ($('#index-page')) return;
+    const page = document.createElement('div');
+    page.className = 'chat-page';
+    page.id = 'index-page';
+    page.style.zIndex = '70';
+    page.innerHTML = `
+      <div class="chat-topbar">
+        <button class="icon-btn" id="index-back">←</button>
+        <div style="flex:1;font-weight:600">索引 · 最近会话</div>
+        <button class="icon-btn" id="index-settings" title="设置">⚙</button>
+      </div>
+      <div id="index-body" style="padding:12px;flex:1;min-height:0;overflow:auto">
+        <div style="font-size:12px;color:var(--text-muted)">读取最近会话…</div>
+      </div>`;
+    document.body.appendChild(page);
+    $('#index-back').addEventListener('click', () => page.remove());
+    $('#index-settings').addEventListener('click', () => { page.remove(); openSettings(); });
+
+    let snap = null;
+    try { snap = await api.get('/api/data/snapshot'); } catch (e) { snap = null; }
+    const channels = (snap && snap.channels) || [];
+    const sessions = (snap && snap.sessions) || [];
+    const byId = new Map();
+    channels.forEach((c) => byId.set(c.id, c));
+    const rows = sessions.map((s) => {
+      const msgs = s.messages || [];
+      const last = msgs[msgs.length - 1];
+      return {
+        ch: byId.get(s.channelId) || { id: s.channelId, name: '（会话已删除）' },
+        updatedAt: s.updatedAt || (last && last.ts) || 0,
+        count: msgs.length,
+        lastText: (last && last.content) || '（无消息）',
+      };
+    }).sort((a, b) => b.updatedAt - a.updatedAt);
+
+    const head = `<div style="font-size:12px;color:var(--text-muted);margin:2px 0 10px">本机智能体 ${channels.length} 个 · 有历史会话 ${rows.length} 个</div>`;
+    const list = rows.length
+      ? rows.map((r, i) => `<div class="conv-item" data-si="${i}">
+          <div class="conv-avatar">${escapeHtml(String(r.ch.name || 'A').charAt(0))}</div>
+          <div class="conv-body">
+            <div class="conv-name">${escapeHtml(String(r.ch.name || r.ch.id))}</div>
+            <div class="conv-preview">${escapeHtml(String(r.lastText).slice(0, 40))}</div>
+          </div>
+          <span style="font-size:11px;color:var(--text-muted);text-align:right;flex:0 0 auto">${escapeHtml(fmtAgo(r.updatedAt))}<br>${r.count} 条</span>
+        </div>`).join('')
+      : '<div style="padding:24px;text-align:center;color:var(--text-muted)">还没有历史会话<br><span style="font-size:12px">从下面的 ＋ 新建一个智能体开始</span></div>';
+    const body = $('#index-body');
+    if (body) {
+      body.innerHTML = head + list;
+      body.querySelectorAll('[data-si]').forEach((el) => el.addEventListener('click', () => {
+        const r = rows[Number(el.dataset.si)];
+        page.remove();
+        openChat(r.ch);
+      }));
+    }
+  }
+
+  // 右上角「搜索」: 本机智能体 + 好友 + 全局智能体 (协议发现) 一起搜
+  async function openSearch() {
+    if ($('#search-page')) return;
+    const page = document.createElement('div');
+    page.className = 'chat-page';
+    page.id = 'search-page';
+    page.style.zIndex = '70';
+    page.innerHTML = `
+      <div class="chat-topbar">
+        <button class="icon-btn" id="search-back">←</button>
+        <div style="flex:1;font-weight:600">搜索</div>
+      </div>
+      <div style="padding:12px;display:flex;flex-direction:column;gap:10px;flex:1;min-height:0">
+        <input id="search-input" type="search" autocomplete="off" placeholder="搜智能体 / 好友：名称、DID、节点 ID"
+          style="padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg-hover);color:var(--text);font-size:14px">
+        <div id="search-hint" style="font-size:12px;color:var(--text-muted)">正在建立索引…</div>
+        <div id="search-results" style="flex:1;overflow:auto;-webkit-overflow-scrolling:touch"></div>
+      </div>`;
+    document.body.appendChild(page);
+    $('#search-back').addEventListener('click', () => page.remove());
+
+    let channels = []; let peers = []; let services = [];
+    try { channels = (await api.get('/channels')) || []; } catch (e) { channels = []; }
+    try { const p = await api.get('/api/peers'); peers = Array.isArray(p) ? p : ((p && p.peers) || []); } catch (e) { peers = []; }
+    try { const d = await api.get('/api/social/discover'); services = (d && d.services) || []; } catch (e) { services = []; }
+
+    const rows = [
+      ...channels.map((c) => ({
+        tag: '本机智能体', name: c.name || c.agentId || c.id, sub: c.id || '',
+        hay: [c.name, c.id, c.agentId, c.did, c.description].filter(Boolean).join(' '),
+        act: () => { page.remove(); openChat(c); },
+      })),
+      ...peers.map((p) => ({
+        tag: '好友', name: p.name || String(p.publicKey || p.id || '好友').slice(0, 12),
+        sub: String(p.publicKey || p.id || p.address || '').slice(0, 28),
+        hay: [p.name, p.publicKey, p.id, p.address, p.did].filter(Boolean).join(' '),
+        act: () => alert(`好友信息\n名称: ${p.name || '(未命名)'}\n节点ID: ${p.publicKey || p.id || '—'}\n地址: ${p.address || '—'}`),
+      })),
+      ...services.map((s) => ({
+        tag: '全局智能体',
+        name: (s.service && s.service.name) || s.name || s.agentId || 'agent',
+        sub: (s.service && s.service.description) || s.description || '',
+        hay: [(s.service && s.service.name), s.serviceName, s.name, s.agentId, s.description, s.did].filter(Boolean).join(' '),
+        act: () => { page.remove(); openTradeCall(s); },
+      })),
+    ];
+    rows.forEach((r) => { r.hay = String(r.hay || '').toLowerCase(); });
+
+    const hint = $('#search-hint');
+    const box = $('#search-results');
+    const render = (q) => {
+      const k = String(q || '').trim().toLowerCase();
+      const hits = rows.filter((r) => !k || r.hay.includes(k) || r.name.toLowerCase().includes(k));
+      if (hint) hint.innerHTML = `本机智能体 ${channels.length} · 好友 ${peers.length} · 全局智能体 ${services.length}` + (k ? ` · 命中 ${hits.length}` : '');
+      if (!box) return;
+      if (!hits.length) {
+        box.innerHTML = `<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px">没有匹配「${escapeHtml(String(q))}」的智能体或好友</div>`;
+        return;
+      }
+      let html = '';
+      let lastTag = '';
+      hits.forEach((r, i) => {
+        if (r.tag !== lastTag) { html += `<div class="section-label">${escapeHtml(r.tag)}</div>`; lastTag = r.tag; }
+        html += `<div class="conv-item" data-ri="${i}">
+          <div class="conv-avatar">${escapeHtml(String(r.name || 'A').charAt(0))}</div>
+          <div class="conv-body">
+            <div class="conv-name">${escapeHtml(String(r.name))}</div>
+            <div class="conv-preview">${escapeHtml(String(r.sub).slice(0, 48))}</div>
+          </div>
+        </div>`;
+      });
+      box.innerHTML = html;
+      box.querySelectorAll('[data-ri]').forEach((el) => el.addEventListener('click', () => hits[Number(el.dataset.ri)].act()));
+    };
+    render('');
+    const input = $('#search-input');
+    if (input) { input.addEventListener('input', () => render(input.value)); input.focus(); }
+  }
 
    function openChat(ch) {
      activeChannel = ch;
@@ -1466,9 +1709,10 @@
       <div style="padding:12px">
         <div class="conv-item" id="api-config-item"><span class="list-icon">${ICONS.chip}</span><span>API 配置</span><span class="list-arrow">›</span></div>
         <div class="conv-item" id="theme-toggle"><span class="list-icon" id="theme-icon">${ICONS.themeAuto}</span><span id="theme-text">跟随系统</span></div>
-        <div class="conv-item" id="settings-network"><span class="list-icon">${ICONS.globe}</span><span>网络与同步</span><span class="list-arrow">›</span></div>
+        <div class="conv-item" id="settings-data"><span class="list-icon">${ICONS.chip}</span><span style="flex:1;min-width:0"><span style="display:block">本机数据</span><span class="conv-preview" style="display:block">读取中…</span></span><span class="list-arrow">›</span></div>
         <div class="conv-item" id="settings-desktop"><span class="list-icon">${ICONS.globe}</span><span>电脑端同步</span><span class="list-arrow">›</span></div>
         <div class="conv-item" id="settings-chain"><span class="list-icon">${ICONS.chip}</span><span>链上配置 (RPC/网络)</span><span class="list-arrow">›</span></div>
+        <div class="conv-item" id="settings-accessibility"><span class="list-icon">${ICONS.globe}</span><span>无障碍服务 (屏幕触控)</span><span class="list-arrow">›</span></div>
         <div class="conv-item" id="settings-ipfs"><span class="list-icon">${ICONS.chip}</span><span>IPFS 存储</span><span class="list-arrow">›</span></div>
         <div class="conv-item" id="settings-helia"><span class="list-icon">${ICONS.globe}</span><span>本机 IPFS 节点</span><span class="list-arrow">›</span></div>
         <div class="conv-item" id="settings-selfcard"><span class="list-icon">${ICONS.chip}</span><span id="selfcard-text">显示本机卡片: 开</span></div>
@@ -1482,7 +1726,36 @@
       const next = currentTheme === 'auto' ? 'light' : (currentTheme === 'light' ? 'dark' : 'auto');
       applyTheme(next, true);
     });
-    $('#settings-network').addEventListener('click', () => switchTab('network'));
+    // 无障碍服务: 屏幕触控 (电脑端 phone.tap / phone.swipe) 的前提 — 与 MCP/Skills 控制无关
+    $('#settings-accessibility').addEventListener('click', async () => {
+      const cap = window.Capacitor;
+      const bridge = cap && cap.Plugins && cap.Plugins.RokidBridge;
+      if (!bridge) { alert('仅真机可用：App 内可把屏幕触控能力授权给电脑端'); return; }
+      let st = {};
+      try { st = (await bridge.touchStatus()) || {}; } catch (e) { st = {}; }
+      if (st.ready) { alert('触控已就绪：电脑端可发 phone.tap / phone.swipe 操作这台手机'); return; }
+      try { await bridge.openAccessibilitySettings(); }
+      catch (e) { alert('请手动开启：设置 → 辅助功能 → 已安装的服务 → Bolloon Agent'); }
+    });
+
+    // 本机数据: 直接读 IndexedDB 快照 (智能体/会话/消息都在本机, 重开 App 不会丢)
+    const dataEl = $('#settings-data');
+    if (dataEl) {
+      const subEl = dataEl.querySelector('.conv-preview');
+      void (async () => {
+        try {
+          const snap = await api.get('/api/data/snapshot');
+          const chs = (snap && snap.channels) || [];
+          const ses = (snap && snap.sessions) || [];
+          const msgs = ses.reduce((n, s) => n + ((s.messages || []).length), 0);
+          if (subEl) subEl.textContent = `已保存 ${chs.length} 个智能体 · ${ses.length} 个会话 · ${msgs} 条消息（本机 IndexedDB）`;
+        } catch (e) { if (subEl) subEl.textContent = '读取失败: ' + ((e && e.message) || e); }
+      })();
+      dataEl.addEventListener('click', () => {
+        const sp = $('#settings-page'); if (sp) sp.remove();
+        void openIndexPanel();
+      });
+    }
     $('#settings-desktop').addEventListener('click', openDesktopSync);
     // 本机卡片显示开关 (移除后从这里恢复)
     const drawSelfCardToggle = () => {
@@ -1921,11 +2194,13 @@
       try { await api.post('/api/auth/logout', {}); await loadMe(); } catch (e) { alert('注销失败: ' + (e.message || e)); }
     });
     $('#btn-add').addEventListener('click', addFriend);
+    const bIdx = $('#btn-index'); if (bIdx) bIdx.addEventListener('click', () => void openIndexPanel());
+    const bSearch = $('#btn-search'); if (bSearch) bSearch.addEventListener('click', () => void openSearch());
     const cs = $('#btn-create-session'); if (cs) cs.addEventListener('click', createSession);
     const csScan = $('#choice-scan'); if (csScan) csScan.addEventListener('click', addFriendScan);
     const csMan = $('#choice-manual'); if (csMan) csMan.addEventListener('click', addFriendManual);
     const csCan = $('#choice-cancel'); if (csCan) csCan.addEventListener('click', () => hideSheet('#addfriend-sheet'));
-    $('#item-p2p').addEventListener('click', () => { switchTab('network'); });
+    $('#item-p2p').addEventListener('click', () => { switchTab('friends'); void loadContacts(); });
     const itTrade = $('#item-trade');
     if (itTrade) itTrade.addEventListener('click', async () => {
       await loadAgentServices();
@@ -2408,7 +2683,7 @@
       if (!msg || msg.type !== 'ui' || !msg.action) return;
       const d = msg.data || {};
       switch (msg.action) {
-        case 'switchTab': if (d.tab && ['main', 'network', 'me'].includes(d.tab)) switchTab(d.tab); break;
+        case 'switchTab': if (d.tab && ['main', 'friends', 'network', 'me'].includes(d.tab)) switchTab(d.tab); break;
         case 'openSettings': openSettings(); break;
         case 'showToast': alert(d.message || ''); break;
         case 'goBack': closeCardDetail(); closeChat(); break;

@@ -154,8 +154,10 @@ export const core = {
   resolve(path: string): (() => Promise<any>) | null {
     const p = path || '';
     if (p === '/channels') return () => core.channels.get();
+    if (p === '/api/data/snapshot') return () => core.data.snapshot();
     if (p === '/api/peers') return () => core.peers.list();
     if (p === '/api/mcp/tools') return () => core.mcp.tools();
+    if (p === '/api/skills') return () => core.skills.list();
     if (p === '/api/auth/status') return () => core.identity.status();
     if (p === '/api/payments/pending') return () => core.payments.pending();
     if (p === '/api/llm-config') return () => core.data.getLlmConfig();
@@ -202,6 +204,10 @@ export const core = {
   /** POST 路径 → 内核函数 */
   resolvePost(path: string, body: any): (() => Promise<any>) | null {
     const p = path || '';
+    if (p === '/api/mcp/call') {
+      const b = body || {};
+      return () => core.mcp.call(String(b.name || ''), b.args || {});
+    }
     if (p === '/message') {
       const b = body || {};
       return () => core.message.send({ text: b.text, channelId: b.channelId });
@@ -752,6 +758,17 @@ export const core = {
         { name: 'gateway_call', description: '通过 Agent Gateway 调用服务 (自动闭环)' },
         { name: 'gateway_join', description: '通过链接加入共享 Agent 网络' },
       ];
+    },
+    async call(name: string, args: any): Promise<{ ok: boolean; output: string }> {
+      const { mobileGatewayTool } = await import('./mobile-gateway.js');
+      return mobileGatewayTool(String(name || ''), args || {});
+    },
+  },
+  skills: {
+    async list(): Promise<any[]> {
+      const s = await import('./mobile-sync.js');
+      const snap: any = s.getLastSnapshot();
+      return snap && Array.isArray(snap.skills) ? snap.skills : [];
     },
   },
 
