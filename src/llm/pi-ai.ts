@@ -14,10 +14,14 @@ export interface ModelConfig {
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
+  /** 2026-09-15: 思考模式 provider (deepseek) 要求 assistant 消息回带 reasoning_content, 见 prepareWireMessages */
+  reasoningContent?: string;
 }
 
 export interface ChatResult {
   reply: string;
+  /** 2026-09-15: 思考模型返回的思维链原文 (deepseek 等). 上层存进 history, 下一轮原样回带. */
+  reasoningContent?: string;
   /** 2026-06-30: OpenAI 协议 native tool_calls 数组 (minimax/M3 返回)
    *  每个 tool_call 包含 id/type/function.name/function.arguments
    *  bolloon 用来给后续 tool result 提供 tool_call_id 引用 */
@@ -368,6 +372,30 @@ export class PiAIModel {
     return modelMap[this.provider];
   }
 
+  /**
+   * 2026-09-15: 出网前把 messages 规整成 wire 形状.
+   *
+   * 背景 (真跑复现 + 逐项对照, 见 wiki log 2026-09-15): DeepSeek 思考模式 (deepseek-v4-*)
+   * 在**请求带 tools** 时, 任何 assistant 消息缺 `reasoning_content` 字段 →
+   * HTTP 400 "The `reasoning_content` in the thinking mode must be passed back to the API".
+   * 复现: 同一个 17 条消息的真实请求体, 不带 tools → 200; 带上 tools → 400;
+   *       给每条 assistant 补 `reasoning_content:""` → 带 tools 也 200。
+   * 表现: 多轮工具循环 (第 2 轮起) 直接断, 用户看到 "AI 服务调用失败"。
+   *
+   * 处置: 只对 deepseek 生效 (唯一实测过的 provider); 有原文用原文, 没有就补空串 —
+   *   空串已被官方接受, 且不改变语义 (思维链不是给模型看的历史内容)。
+   * 其他 provider 原样透传 (OpenAI 系对未知字段更敏感, 不做无证据的改动)。
+   */
+  private prepareWireMessages(messages: ChatMessage[]): any[] {
+    const echoReasoning = this.provider === 'deepseek';
+    if (!echoReasoning) return messages as any[];
+    return messages.map((m) =>
+      m.role === 'assistant'
+        ? { role: 'assistant', content: m.content ?? '', reasoning_content: m.reasoningContent ?? '' }
+        : m,
+    ) as any[];
+  }
+
   private async callOpenAI(messages: ChatMessage[], temperature: number, maxTokens: number, signal?: AbortSignal, tools?: any[]): Promise<ChatResult> {
     const apiKey = this.getApiKey();
     if (!apiKey) {
@@ -376,7 +404,7 @@ export class PiAIModel {
 
     const requestBody: any = {
       model: this.mapModel(),
-      messages,
+      messages: this.prepareWireMessages(messages),
       temperature,
       max_tokens: maxTokens
     };
@@ -435,17 +463,27 @@ export class PiAIModel {
         const errBody = await body.text().catch(() => '(no body)');
         console.log(`[pi-ai DEBUG] OpenAI 错误 ${statusCode}: ${String(errBody).slice(0, 500)}`);
         console.log(`[pi-ai DEBUG] 请求体: model=${requestBody.model}, messages=${requestBody.messages?.length}, max_tokens=${requestBody.max_tokens}, baseUrl=${this.getBaseUrl()}`);
+        if (process.env.BOLLOON_DUMP_BODY === '1') {
+          try {
+            const fsx = await import('fs');
+            const p = `/tmp/bolloon-req-${Date.now()}.json`;
+            fsx.writeFileSync(p, JSON.stringify(requestBody, null, 2));
+            console.log(`[pi-ai DEBUG] 失败请求体已落盘: ${p}`);
+          } catch { /* 调试用, 失败忽略 */ }
+        }
         retryAgent?.destroy().catch(() => {});
         throw new Error(`OpenAI API error: ${statusCode} ${String(errBody).slice(0, 300)}`);
       }
 
       const data = await body.json() as {
-        choices?: { message?: { content?: string; tool_calls?: any[] }; finish_reason?: string; index?: number }[];
+        choices?: { message?: { content?: string; tool_calls?: any[]; reasoning_content?: string }; finish_reason?: string; index?: number }[];
       };
       const _tParse = Date.now();
       const choice = data.choices?.[0];
       const content = choice?.message?.content || '';
       const toolCalls = choice?.message?.tool_calls;
+      // 2026-09-15: 思考模式思维链 — 原样存回 history, 下一轮必须回带 (见 prepareWireMessages)
+      const reasoningContent = choice?.message?.reasoning_content || undefined;
       lastFinishReason = choice?.finish_reason || '';
       // Bug 7: tool_calls 存在时不走重试 — LLM 选工具时 content 空是合法的
       if (content || (toolCalls && toolCalls.length > 0)) {
@@ -456,7 +494,7 @@ export class PiAIModel {
         const promptBytes = JSON.stringify(messages).length;
         console.log(`[pi-ai timing] total=${_tAfter - _t0}ms attempt=${attempt + 1} fetch=${_tResp - _tFetch}ms parse=${_tParse - _tResp}ms reply=${content.length}B toolCalls=${toolCalls?.length ?? 0} model=${this.mapModel()} prompt=${promptBytes}B`);
         retryAgent?.destroy().catch(() => {});
-        return { reply: content, toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined };
+        return { reply: content, toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined, reasoningContent };
       }
       console.warn(`[pi-ai] attempt ${attempt + 1}/3: 空 content (finish_reason=${lastFinishReason}), 退避 1.5s 重试`);
       const _tSleep = Date.now();

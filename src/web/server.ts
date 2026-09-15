@@ -3034,6 +3034,21 @@ ${goalDesc}
     }
   });
 
+  // 2026-09-15: agent-delegate (manifest 协议 + agent_delegate) **启动即挂载**
+  //   文档 bolloon-gateway-join.md 第 3 节要求 POST /api/agent/register 可用;
+  //   之前只在 iroh 懒初始化 (/api/iroh/info 首次访问) 的收尾挂上 → 没触发时恒 404。
+  let agentDelegateMounted = false;
+  try {
+    const delegateTransport = createIrohDelegateTransport({ verbose: true });
+    // 注意: createAgentDelegateApp 内部声明的是绝对路径 (/api/agent/...),
+    // 所以挂载时**不能**再带 '/api/agent' 前缀 (否则变成 /api/agent/api/agent/... 恒 404)
+    app.use(createAgentDelegateApp(delegateTransport));
+    agentDelegateMounted = true;
+    console.log('[agent-delegate] 已挂载到 /api/agent (启动即用: local-manifest / register / pick / delegate)');
+  } catch (e) {
+    console.warn('[agent-delegate] 挂载失败 (非致命):', (e as Error)?.message);
+  }
+
   // 2026-08-14: Agent Gateway — 网络加入 / 分享链接 / 成员 / 状态 (入口要小: 一条链接)
   app.post('/api/gateway/join', async (req: any, res: any) => {
     try {
@@ -3065,6 +3080,36 @@ ${goalDesc}
       res.json({ networks: await listJoinedNetworks() });
     } catch (e: any) {
       res.status(500).json({ error: e?.message });
+    }
+  });
+
+  // 2026-09-15: 文档驱动「加入全球智能体网络」— 人类/手机只给一句 read <doc>, 这里做落地执行.
+  //   GET: 查入网态 (joined/url/did/networkLink); POST: 真执行 (可指定 url/name/capabilities/force).
+  app.get('/api/gateway/join-global', async (_req, res) => {
+    try {
+      const { getGatewayJoinState, DEFAULT_GATEWAY_JOIN_DOC } = await import('../agents/gateway-join.js');
+      const state = await getGatewayJoinState();
+      res.json({ ok: true, joined: !!state, docUrl: DEFAULT_GATEWAY_JOIN_DOC, state });
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: e?.message });
+    }
+  });
+
+  app.post('/api/gateway/join-global', async (req: any, res: any) => {
+    try {
+      const { joinGlobalGateway } = await import('../agents/gateway-join.js');
+      const identity = await loadOrCreateUserIdentity();
+      const caps = String(req.body?.capabilities || '').split(',').map((s: string) => s.trim()).filter(Boolean);
+      const r = await joinGlobalGateway({
+        url: String(req.body?.url || '').trim() || undefined,
+        did: identity?.did || undefined,
+        name: String(req.body?.name || '').trim() || identity?.name || undefined,
+        capabilities: caps.length ? caps : undefined,
+        force: req.body?.force === true,
+      });
+      res.status(r.ok ? 200 : 400).json(r);
+    } catch (e: any) {
+      res.status(500).json({ ok: false, error: e?.message });
     }
   });
 
@@ -6520,14 +6565,17 @@ app.post('/active-channel', async (req, res) => {
       irohInitialized = true;
 
       // 挂载 agent-delegate app (manifest 协议 + agent_delegate)
-      // 必须在 irohInitialized 之后挂, 因为适配器要监听 irohTransport.onMessage
-      try {
-        const delegateTransport = createIrohDelegateTransport({ verbose: true });
-        const delegateApp = createAgentDelegateApp(delegateTransport);
-        app.use('/api/agent', delegateApp);
-        console.log('[iroh API] agent-delegate app 已挂载到 /api/agent');
-      } catch (e) {
-        console.error('[iroh API] 挂载 agent-delegate app 失败:', e);
+      // 2026-09-15: 已改为启动时提前挂载 (见 createWebServer 的 /api/agent 段), 这里不再重复挂.
+      if (!agentDelegateMounted) {
+        try {
+          const delegateTransport = createIrohDelegateTransport({ verbose: true });
+          const delegateApp = createAgentDelegateApp(delegateTransport);
+          app.use(delegateApp);
+          agentDelegateMounted = true;
+          console.log('[iroh API] agent-delegate app 已挂载到 /api/agent (补挂)');
+        } catch (e) {
+          console.error('[iroh API] 挂载 agent-delegate app 失败:', e);
+        }
       }
 
       // 设置消息处理

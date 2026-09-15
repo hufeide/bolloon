@@ -1604,6 +1604,8 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
           role: 'assistant',
           content: reply,
           toolCalls: toolCalls.length > 1 ? toolCalls : [toolCalls[0]],
+          // 2026-09-15: 思考模式思维链原样存回 (下一轮带 tools 的请求必须回带, 否则 deepseek 400)
+          reasoningContent: (response as any)?.reasoningContent,
         });
 
         // 2026-08-09: 并发执行本轮所有工具 (Hermes 式 Agent Runtime: 一轮内多工具并行,
@@ -1840,7 +1842,8 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
         // LLM 返回的不是 tool call 格式
         this.messageHistory.push({
           role: 'assistant',
-          content: reply
+          content: reply,
+          reasoningContent: (response as any)?.reasoningContent,
         });
 
         // 通知前端收到非工具调用回复 (2026-08-09: 完整内容, 不再截断 150)
@@ -2075,7 +2078,7 @@ lastQualityScore = this.estimateResponseQuality(reply);
       //   导致 LLM 实际看到的还是未压缩的历史.
       const source = this.projectedHistory ?? this.messageHistory;
       const WINDOW = 15;
-      const out: Array<{ role: string; content: string }> = [];
+      const out: Array<{ role: string; content: string; reasoningContent?: string }> = [];
 
       // 早期历史压缩: 超过窗口时, 不直接丢弃 — 提取前段用户意图摘要注入 (同步, 无 LLM).
       // 结构对齐 Context OS: System Prompt(persona) + 压缩摘要 + 最近消息.
@@ -2096,7 +2099,7 @@ lastQualityScore = this.estimateResponseQuality(reply);
             out.push({ role: 'user', content: `[工具结果]\n${(m.content || '').slice(0, 2000)}` });
             continue;
           }
-          if (r === 'assistant') { out.push({ role: 'assistant', content: (m.content || '').slice(0, 4000) }); continue; }
+          if (r === 'assistant') { out.push({ role: 'assistant', content: (m.content || '').slice(0, 4000), reasoningContent: (m as any).reasoningContent }); continue; }
           if (r === 'user') { out.push({ role: 'user', content: (m.content || '').slice(0, 2000) }); continue; }
           if (r === 'system') { out.push({ role: 'system', content: (m.content || '').slice(0, 2000) }); }
         }
@@ -2112,7 +2115,7 @@ lastQualityScore = this.estimateResponseQuality(reply);
           continue;
         }
         if (r === 'assistant') {
-          out.push({ role: 'assistant', content: m.content || '' });
+          out.push({ role: 'assistant', content: m.content || '', reasoningContent: (m as any).reasoningContent });
           continue;
         }
         if (r === 'user') { out.push({ role: 'user', content: m.content || '' }); }

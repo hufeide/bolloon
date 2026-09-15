@@ -53,6 +53,12 @@ export interface AddressBroadcast {
   multiaddrs: string[];
   relayAddr?: string;
   canRelay?: boolean;
+  /**
+   * 2026-09-15: 发送方 Ed25519 公钥 (hex) —— 首次接触自证用。
+   * 全球网络里收方此前不认识发方的 DID, registry 里没有公钥 → 无法验签 → 广播被丢。
+   * 带上公钥后收方可以验签 (did:key 还会做 DID↔公钥 派生一致性检查)。该字段在签名覆盖范围内。
+   */
+  publicKey?: string;
   timestamp: number;
   signature: string;
 }
@@ -71,6 +77,29 @@ const RELAY_RETRY_INTERVAL = 30000;
 const MAX_RELAY_HOPS = 3;
 const MESSAGE_TIMESTAMP_TOLERANCE = 24 * 60 * 60 * 1000;
 const SIGNED_MESSAGE_TYPES = ['task', 'response', 'discovery', 'address_broadcast'] as const;
+
+/**
+ * 2026-09-15: did:key:z6Mk… 与 Ed25519 公钥字节是否一致。
+ *
+ * DID 由公钥派生 (did:key 规范: multibase base58btc of 0xed01 || rawKey), 所以首次接触时
+ * 自携公钥**无法伪造**: 冒充者换了公钥就解码不出同一个 DID。
+ * 返回: true 一致 / false 不一致 (疑似冒充) / null 非 did:key 形态 (无法判定, 不阻断, 交给签名验证)。
+ */
+export async function didKeyMatchesPublicKey(did: string, publicKeyHex: string): Promise<boolean | null> {
+  if (!/^did:key:z/.test(did)) return null;
+  try {
+    const { base58btc } = await import('multiformats/bases/base58');
+    const decoded = base58btc.decode(did.slice('did:key:'.length));
+    // 34 字节 = 2 字节 multicodec 前缀 (0xed01 = ed25519-pub) + 32 字节公钥
+    if (decoded.length !== 34) return false;
+    if (decoded[0] !== 0xed || decoded[1] !== 0x01) return false;
+    const claimed = Buffer.from(publicKeyHex, 'hex');
+    if (claimed.length !== 32) return false;
+    return Buffer.compare(Buffer.from(decoded.slice(2)), claimed) === 0;
+  } catch {
+    return null;   // 解码失败 → 不判定 (不当成冒充, 也不放行: 签名仍要过)
+  }
+}
 
 export class AgentRegistry {
   private agents: Map<string, AgentRegistryEntry> = new Map();
@@ -275,6 +304,7 @@ export class AgentRegistry {
     }
 
     const relayAddr = (p2pNetwork as any).getRelayAddress?.() || null;
+    const ownPublicKeyHex = Buffer.from(this.keyPair.publicKey).toString('hex');
 
     const broadcastData = JSON.stringify({
       type: 'address_broadcast',
@@ -284,6 +314,7 @@ export class AgentRegistry {
       multiaddrs: this.ownEndpoint.multiaddrs,
       relayAddr: relayAddr || undefined,
       canRelay: relayAddr ? true : false,
+      publicKey: ownPublicKeyHex,
       timestamp: now
     });
 
@@ -298,6 +329,7 @@ export class AgentRegistry {
       multiaddrs: this.ownEndpoint.multiaddrs,
       relayAddr: relayAddr || undefined,
       canRelay: relayAddr ? true : false,
+      publicKey: ownPublicKeyHex,
       timestamp: now,
       signature: Buffer.from(signature).toString('hex')
     };
@@ -327,11 +359,37 @@ export class AgentRegistry {
       multiaddrs: broadcast.multiaddrs,
       relayAddr: broadcast.relayAddr,
       canRelay: broadcast.canRelay,
+      publicKey: broadcast.publicKey,
       timestamp: broadcast.timestamp
     });
 
     const signature = Buffer.from(broadcast.signature, 'hex');
-    const isValid = await this.verifySignature(broadcast.from, broadcastData, signature);
+    const known = this.agents.get(broadcast.from);
+
+    // 2026-09-15: 首次接触 (全球化去中心网络里全是陌生人) —— 原来只认「registry 里已有的公钥」,
+    //   陌生人第一次广播必然验签失败 → 广播被丢弃 → 陌生人永远发现不了彼此 (入网文档 §7 的链路实际不通).
+    //   现在: 未知 DID 时用广播自带 publicKey 自证 (TOFU: 首次接触信任自携公钥);
+    //   did:key 额外做 DID↔公钥 派生一致性检查 (DID 本身就是公钥, 自携公钥无法伪造).
+    let verifyKeyHex: string | undefined = known?.publicKey || undefined;
+    if (!verifyKeyHex) {
+      const claimed = String(broadcast.publicKey || '');
+      if (!claimed) {
+        console.warn(`[Registry] Unknown agent ${broadcast.from.substring(0, 20)}… 且广播未携带 publicKey → 无法验证, 拒收`);
+        return false;
+      }
+      const binding = await didKeyMatchesPublicKey(broadcast.from, claimed);
+      if (binding === false) {
+        console.warn(`[Registry] did:key 与自带公钥不匹配 (疑似冒充) from=${broadcast.from.substring(0, 24)}… → 拒收`);
+        return false;
+      }
+      verifyKeyHex = claimed;
+    } else if (broadcast.publicKey && broadcast.publicKey !== verifyKeyHex) {
+      // 已认识这个 DID, 却报出另一把公钥 → 身份接管尝试, 拒收 (不覆盖已存公钥)
+      console.warn(`[Registry] ${broadcast.from.substring(0, 20)}… 广播的公钥与已知公钥不一致 → 拒收 (不覆盖)`);
+      return false;
+    }
+
+    const isValid = await this.verifySignatureWithKey(broadcast.from, verifyKeyHex, broadcastData, signature);
     if (!isValid) {
       console.warn(`[Registry] Invalid broadcast signature from ${broadcast.from.substring(0, 20)}`);
       return false;
@@ -345,7 +403,9 @@ export class AgentRegistry {
       registeredAt: Date.now(),
       lastSeen: broadcast.timestamp,
       lastBroadcast: 0,
-      publicKey: Buffer.from(this.keyPair.publicKey).toString('hex'),
+      // 2026-09-15 修复: 原来写的是**自己**的公钥 (this.keyPair.publicKey) →
+      //   对端后续任何签名消息都验不过 (拿我方公钥去验对方签名), 属于把对端身份写坏.
+      publicKey: verifyKeyHex,
       relayAddr: broadcast.relayAddr,
       canRelay: broadcast.canRelay
     };
@@ -354,16 +414,30 @@ export class AgentRegistry {
     if (existing) {
       entry.registeredAt = existing.registeredAt;
       entry.lastBroadcast = existing.lastBroadcast;
-      if (!existing.publicKey) {
-        existing.publicKey = entry.publicKey;
-      }
+      if (existing.publicKey) entry.publicKey = existing.publicKey;   // 已有公钥永不覆盖
     }
 
     this.agents.set(broadcast.from, entry);
     this.saveRegistry();
 
-    console.log(`[Registry] Verified broadcast from: ${broadcast.name} (${broadcast.from.substring(0, 20)}...) ${broadcast.canRelay ? '[Relay Capable]' : ''}`);
+    console.log(`[Registry] Verified broadcast from: ${broadcast.name} (${broadcast.from.substring(0, 20)}...) ${broadcast.canRelay ? '[Relay Capable]' : ''}${known ? '' : ' [首次接触 TOFU]'}`);
     return true;
+  }
+
+  /** 用给定公钥 (hex) 验签 — 首次接触路径用 (未知 DID 时 registry 里没公钥) */
+  async verifySignatureWithKey(did: string, publicKeyHex: string, data: string, signature: Uint8Array): Promise<boolean> {
+    try {
+      const publicKey = Buffer.from(publicKeyHex, 'hex');
+      if (publicKey.length !== 32) {
+        console.warn(`[Registry] publicKey 长度非法 (${publicKey.length} 字节, 期望 32): ${did.substring(0, 20)}…`);
+        return false;
+      }
+      const keyPair = { privateKey: new Uint8Array(32), publicKey, did };
+      return await KeyManager.verify(keyPair, new TextEncoder().encode(data), signature);
+    } catch (e) {
+      console.warn(`[Registry] Verification with provided key failed:`, e);
+      return false;
+    }
   }
 
   async createSignedMessage(type: string, payload: string): Promise<SignedMessage | null> {

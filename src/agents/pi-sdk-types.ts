@@ -80,6 +80,13 @@ export interface ToolResult {
 export interface Message {
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
+  /**
+   * 2026-09-15: 思考模式 (deepseek-v4 等) 的 reasoning_content 原文 —— 必须原样回带给 API。
+   * DeepSeek 文档 + 实测: 请求里带 tools 时, 任何 assistant 消息缺 reasoning_content
+   * 会被直接 400 拒绝 ("The `reasoning_content` in the thinking mode must be passed back to the API"),
+   * 表现为多轮工具循环第 2 轮起就断 (用户看到 "AI 服务调用失败")。
+   */
+  reasoningContent?: string;
   toolCall?: {
     name: string;
     args: Record<string, string>;

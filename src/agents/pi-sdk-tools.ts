@@ -1059,11 +1059,21 @@ export function registerBuiltinTools(ctx: ToolRegistryContext): void {
   // 通用文件读取 (M4)
   ctx.tools.set('read_file', {
     name: 'read_file',
-    description: '读取任意文件内容 (相对 cwd). 只读操作, 无白名单限制.',
-    parameters: { path: '相对路径 (必填)', startLine: '起始行号 (可选, 默认 0)', maxLines: '最大行数 (可选, 默认 500)' },
+    description: '读取任意文件内容 (相对 cwd); 也支持 http(s) URL (如 "read https://…/doc.md" 这种口令 → 直接给 URL 即可). 只读操作, 无白名单限制.',
+    parameters: { path: '相对路径或 http(s) URL (必填)', startLine: '起始行号 (可选, 默认 0)', maxLines: '最大行数 (可选, 默认 500)' },
     execute: async (args) => {
       const relPath = String(args.path || '').trim();
       if (!relPath) return { success: false, error: 'path 必填' };
+      // 2026-09-15: URL 直读 — 人类口令 "read <url>" 落到的就是本工具, 之前会 ENOENT (当成相对路径)
+      if (/^https?:\/\//i.test(relPath)) {
+        const r = await readUrlAsText(relPath);
+        if (!r.ok) return { success: false, error: `读取 URL 失败: ${r.error}` };
+        const start = Math.max(0, parseInt(String(args.startLine || '0')) || 0);
+        const max = parseInt(String(args.maxLines || '500')) || 500;
+        const lines = String(r.text || '').split('\n');
+        const slice = lines.slice(start, start + max);
+        return { success: true, output: `🌐 ${relPath} (第 ${start + 1}-${start + slice.length} 行, 共 ${lines.length} 行):\n${slice.map((l, i) => `${String(start + i + 1).padStart(4)} | ${l}`).join('\n')}` };
+      }
       try {
         const absPath = path.resolve(ctx.cwd, relPath);
         const content = fsSync.readFileSync(absPath, 'utf-8');
@@ -1190,6 +1200,24 @@ export function registerBuiltinTools(ctx: ToolRegistryContext): void {
   // Web 上网工具 (2026-08-04) — fetch_url + web_search
   // 用 undici request (独立连接池, 与 pi-ai 一致, 避开全局 fetch 僵尸连接问题)
   // ============================================================
+
+  /** 读一个 http(s) URL 的正文 (curl, 兼容 TLS 指纹风控). read_file 的 URL 分支复用. 函数声明提升, 上面可调用. */
+  async function readUrlAsText(url: string, maxChars = 60_000): Promise<{ ok: boolean; text?: string; error?: string }> {
+    try {
+      const { execFile } = await import('child_process');
+      const { promisify } = await import('util');
+      const pExecFile = promisify(execFile);
+      const { stdout, stderr } = await pExecFile('curl', [
+        '-sL', '--max-time', '25',
+        '-A', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        url,
+      ], { maxBuffer: 4 * 1024 * 1024, timeout: 30_000 });
+      if (!stdout) return { ok: false, error: String(stderr || '空响应').slice(0, 200) };
+      return { ok: true, text: String(stdout).slice(0, maxChars) };
+    } catch (e: any) {
+      return { ok: false, error: String(e?.message || e).slice(0, 200) };
+    }
+  }
   ctx.tools.set('fetch_url', {
     name: 'fetch_url',
     description: '抓取一个 URL 的网页内容并转成纯文本. 适合查文档/新闻/API 页面. 返回前 4000 字符. HTML 自动去标签, JSON/文本原样返回. (走 curl, 兼容 TLS 指纹风控)',
@@ -2727,6 +2755,10 @@ export function registerBuiltinTools(ctx: ToolRegistryContext): void {
     execute: async (args) => {
       const link = String(args.link || '').trim();
       if (!link) return { success: false, error: 'link 必填 (ipns:// / orbitdb:// / https://)' };
+      // 2026-09-15: 入网说明文档 (.md) 不是 registry 链接 — 别静默当 registry 拉, 指到正确工具
+      if (/^https?:\/\//i.test(link) && (/\.md(\?|#|$)/i.test(link) || /gateway-join/i.test(link))) {
+        return { success: false, error: `这是一个「入网说明文档」而不是网络链接。请改用 join_global_gateway (url=${link}) 走文档驱动入网。` };
+      }
       try {
         const { joinNetwork } = await import('./gateway-network.js');
         const r = await joinNetwork(link);
@@ -2734,6 +2766,44 @@ export function registerBuiltinTools(ctx: ToolRegistryContext): void {
         return { success: true, output: `✅ 已加入 Agent 网络: 拉取 ${r.total} 个服务, 新增 ${r.joined} 个 (${r.linkKind})` };
       } catch (e: any) {
         return { success: false, error: `gateway_join 失败: ${String(e?.message || e).slice(0, 200)}` };
+      }
+    },
+  });
+
+  // ============================================================
+  // join_global_gateway (2026-09-15) — 文档驱动的「加入全球智能体网络」
+  // 人类口令只有一句: `read https://bolloon.cn/bolloon-gateway-join.md`
+  // 文档写的是 SDK 伪码, agent 手里只有工具 → 本工具把整条链路串成闭环:
+  // 读说明 → DID → P2P 节点 → 注册 manifest → 建成可分享网络 → 服务登记 → 落盘(幂等)
+  // ============================================================
+  ctx.tools.set('join_global_gateway', {
+    name: 'join_global_gateway',
+    description: '按「入网说明文档」加入全球智能体网络 (完整闭环: 读文档 → DID 身份 → P2P 节点 → 注册本地 manifest → 建成可分享的网络 → 服务登记 → 落盘). 默认文档即 https://bolloon.cn/bolloon-gateway-join.md (人类口令 "read <该文档>" 时用本工具)。幂等: 重复入网返回 already。文档不可达或不是入网说明 → 如实失败, 不假装入网。',
+    parameters: {
+      url: '入网说明文档 URL (可选, 默认 https://bolloon.cn/bolloon-gateway-join.md)',
+      name: '本智能体名字 (可选, 默认取当前身份名)',
+      capabilities: '声明能力, 逗号分隔 (可选, 默认 chat,gateway-join)',
+      force: 'true = 忽略幂等重新入网 (可选)',
+    },
+    execute: async (args) => {
+      try {
+        const { joinGlobalGateway } = await import('./gateway-join.js');
+        const caps = String(args.capabilities || '').split(',').map((s) => s.trim()).filter(Boolean);
+        const r = await joinGlobalGateway({
+          url: String(args.url || '').trim() || undefined,
+          did: (ctx as any).identity?.did || undefined,
+          name: String(args.name || '').trim() || (ctx as any).identity?.name || undefined,
+          capabilities: caps.length ? caps : undefined,
+          force: String(args.force || '') === 'true',
+        });
+        const lines = r.steps.map((s) => `${s.ok ? '✓' : '✗'} ${s.step}: ${s.note}`);
+        if (!r.ok) return { success: false, error: `${r.error}\n${lines.join('\n')}` };
+        return {
+          success: true,
+          output: `🌐 已加入全球智能体网络${r.already ? ' (已在网, 幂等)' : ''}\nDID: ${r.did}\npeerId: ${r.peerId || '(节点后台启动中)'}${r.networkLink ? `\n可分享网络链接: ${r.networkLink}` : ''}\n${lines.join('\n')}`,
+        };
+      } catch (e: any) {
+        return { success: false, error: `join_global_gateway 失败: ${String(e?.message || e).slice(0, 200)}` };
       }
     },
   });
