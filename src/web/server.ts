@@ -3037,14 +3037,58 @@ ${goalDesc}
   // 2026-09-15: agent-delegate (manifest 协议 + agent_delegate) **启动即挂载**
   //   文档 bolloon-gateway-join.md 第 3 节要求 POST /api/agent/register 可用;
   //   之前只在 iroh 懒初始化 (/api/iroh/info 首次访问) 的收尾挂上 → 没触发时恒 404。
+  //
+  //   2026-09-15 (二修): 同时注入**真执行器** —— 被委派的一方不再是
+  //   `resultCid: mock-<ts>` 的假签收: 真的跑本地 agent session 出结果,
+  //   并把结果存进 OrbitDB 得到真实内容寻址 CID; 无活跃 channel / 无 LLM 时如实报错。
+  const delegateExecutor = async (req: {
+    capability: string; instruction: string; docPath?: string; docContent?: string;
+    fromAgentId?: string; targetAgentId: string; targetAgentName: string;
+  }): Promise<{ ok: boolean; summary: string; resultCid?: string; error?: string }> => {
+    try {
+      const channels = await loadChannels();
+      const active = (() => {
+        try {
+          const raw = fsSync.existsSync(path.join(process.env.HOME || '/tmp', '.bolloon', 'active-channel.json'))
+            ? fsSync.readFileSync(path.join(process.env.HOME || '/tmp', '.bolloon', 'active-channel.json'), 'utf-8') : '';
+          return raw ? (JSON.parse(raw) as any) : null;
+        } catch { return null; }
+      })();
+      const ch = channels.find((c: any) => c.id === active?.channelId) || channels.find((c: any) => c.id === active?.id) || channels[0];
+      if (!ch) return { ok: false, summary: 'no local channel to execute with', error: 'no-channel' };
+      const agent = await getAgentForChannel(ch.id, ch.publicKey, ch.name, (ch as any).didDocument);
+      const task = [
+        `【被委派任务 · 能力 ${req.capability}】`,
+        req.instruction,
+        req.docPath ? `\n资料路径: ${req.docPath}` : '',
+        req.docContent ? `\n资料内容:\n${req.docContent}` : '',
+        `\n(来自 agent ${req.fromAgentId || 'unknown'})，请直接给出可交付结果。`,
+      ].join('');
+      const out = await agent.prompt(task);
+      const text = String(out || '').trim();
+      if (!text || text.startsWith('❌') || text.startsWith('[AI 服务调用失败]')) {
+        return { ok: false, summary: text.slice(0, 800) || '(空结果)', error: 'execution-failed' };
+      }
+      // 真结果 → 内容寻址存储 (CID), 失败不编造 CID, 只回摘要
+      let cid: string | undefined;
+      try {
+        const { getCIDDatabase } = await import('../orbitdb/cid-database.js');
+        const rec = await getCIDDatabase().save({ agentId: req.targetAgentId, type: 'context', content: text, metadata: { capability: req.capability, fromAgentId: req.fromAgentId, kind: 'delegate-result' } });
+        cid = rec?.id;
+      } catch { /* 存不上就不给 CID */ }
+      return { ok: true, summary: text.slice(0, 4000), resultCid: cid };
+    } catch (e: any) {
+      return { ok: false, summary: `delegate executor failed: ${String(e?.message || e).slice(0, 300)}`, error: 'executor-error' };
+    }
+  };
   let agentDelegateMounted = false;
   try {
     const delegateTransport = createIrohDelegateTransport({ verbose: true });
     // 注意: createAgentDelegateApp 内部声明的是绝对路径 (/api/agent/...),
     // 所以挂载时**不能**再带 '/api/agent' 前缀 (否则变成 /api/agent/api/agent/... 恒 404)
-    app.use(createAgentDelegateApp(delegateTransport));
+    app.use(createAgentDelegateApp(delegateTransport, { execute: delegateExecutor }));
     agentDelegateMounted = true;
-    console.log('[agent-delegate] 已挂载到 /api/agent (启动即用: local-manifest / register / pick / delegate)');
+    console.log('[agent-delegate] 已挂载到 /api/agent (启动即用: local-manifest / register / pick / delegate, 真执行器已注入)');
   } catch (e) {
     console.warn('[agent-delegate] 挂载失败 (非致命):', (e as Error)?.message);
   }
@@ -6569,10 +6613,10 @@ app.post('/active-channel', async (req, res) => {
       if (!agentDelegateMounted) {
         try {
           const delegateTransport = createIrohDelegateTransport({ verbose: true });
-          const delegateApp = createAgentDelegateApp(delegateTransport);
+          const delegateApp = createAgentDelegateApp(delegateTransport, { execute: delegateExecutor });
           app.use(delegateApp);
           agentDelegateMounted = true;
-          console.log('[iroh API] agent-delegate app 已挂载到 /api/agent (补挂)');
+          console.log('[iroh API] agent-delegate app 已挂载到 /api/agent (补挂, 真执行器已注入)');
         } catch (e) {
           console.error('[iroh API] 挂载 agent-delegate app 失败:', e);
         }

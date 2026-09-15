@@ -30,9 +30,48 @@ export interface DelegateTransport {
   onIncomingFrame(handler: (fromPublicKey: string, frame: string) => Promise<string | null>): void;
 }
 
-export function createAgentDelegateApp(transport: DelegateTransport): express.Express {
+/**
+ * 2026-09-15: 被委派的**真执行器**。
+ *
+ * 背景: 此前 agent_delegate 的处理是占位 —— 挑到 agent 就回 `resultCid: mock-<ts>` +
+ * `summary:'已处理任务: <指令前 30 字>'`, **什么也没干**, 收到委派的一方等于假签收。
+ * 现在由宿主注入真执行器 (通常 = 跑本地 agent session + 把结果存进 OrbitDB 拿真 CID);
+ * 宿主没注入 → 如实回 ok:false / error:'no-executor', 绝不假装执行。
+ */
+export interface DelegateExecutionRequest {
+  /** 请求的能力 (必须与本地 agent 的 capabilities 匹配) */
+  capability: string;
+  instruction: string;
+  docPath?: string;
+  docContent?: string;
+  fromAgentId?: string;
+  /** 发起方节点公钥 (transport 视角, 通常是 iroh nodeId 或 Hyperswarm peer key) */
+  fromPublicKey: string;
+  /** 本机被选中的 agent */
+  targetAgentId: string;
+  targetAgentName: string;
+}
+
+export interface DelegateExecutionResult {
+  ok: boolean;
+  /** 给委派方看的结果摘要 */
+  summary: string;
+  /** 真实内容寻址 CID (执行器真存了才有; 不填就是不填, 不再编 mock-) */
+  resultCid?: string;
+  error?: string;
+}
+
+export interface AgentDelegateAppOptions {
+  /** 真执行器 (缺失 = 本节点只能匹配不能干活, 会如实报 no-executor) */
+  execute?: (req: DelegateExecutionRequest) => Promise<DelegateExecutionResult>;
+  /** 单次执行超时 (毫秒, 默认 60000) — 超时如实报错, 不返回半截结果 */
+  executeTimeoutMs?: number;
+}
+
+export function createAgentDelegateApp(transport: DelegateTransport, options: AgentDelegateAppOptions = {}): express.Express {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
+  const executeTimeoutMs = options.executeTimeoutMs ?? 60_000;
 
   // ---- 本地 manifest ----
   app.get('/api/agent/local-manifest', (_req, res) => {
@@ -107,7 +146,10 @@ export function createAgentDelegateApp(transport: DelegateTransport): express.Ex
       }
       res.json({
         ok: true,
-        targetAgent: targetAgent || { id: f.payload.delegatedTo, capabilities: [capability], status: 'active', name: f.payload.delegatedTo },
+        // 2026-09-15: 没缓存到对端 manifest 就如实给 null —— 旧版会编一个
+        // 「capabilities:[capability], name:<id>」的假目标, 让人以为已经知道对端是谁。
+        targetAgent: targetAgent || null,
+        targetAgentKnown: !!targetAgent,
         response: f.payload,
       });
     } catch (e: any) {
@@ -129,17 +171,60 @@ export function createAgentDelegateApp(transport: DelegateTransport): express.Ex
       return null;  // 不需要回包
     }
     if (f.type === 'agent_delegate') {
-      // 路由到本地匹配 agent
       const req = f.payload as any;
+      const capability = String(req?.capability || '');
+      // 2026-09-15: 严格按文档 §6 / §9 —— 只认 capabilities 含该能力且 active 的 agent。
+      //   旧实现 `|| local.agents[0]` 会把不匹配的指令塞给任意一个本地 agent,
+      //   与「pick 404 = 没有匹配能力」的语义自相矛盾。
       const local = getLocalManifest();
-      const target = local.agents.find((a) => a.capabilities.includes(req.capability) && a.status === 'active') || local.agents[0];
-      if (!target) return buildAgentResponse({ ok: false, delegatedTo: 'none', summary: 'no local agent available' });
-      return buildAgentResponse({
-        ok: true,
-        delegatedTo: target.id,
-        resultCid: `mock-${Date.now()}`,
-        summary: `[${target.name}] 已处理任务: ${req.instruction?.substring(0, 30)}`,
-      });
+      const target = local.agents.find((a) => a.capabilities.includes(capability) && a.status === 'active');
+      if (!target) {
+        return buildAgentResponse({
+          ok: false,
+          delegatedTo: 'none',
+          summary: `no local agent available for capability '${capability}'`,
+          error: 'no-capability-match',
+        });
+      }
+      // 匹配到了, 但本节点没接执行器 → 如实说"干不了", 不假签收
+      if (!options.execute) {
+        return buildAgentResponse({
+          ok: false,
+          delegatedTo: target.id,
+          summary: `matched agent '${target.name}' but this node has no executor wired`,
+          error: 'no-executor',
+        });
+      }
+      try {
+        const raced = await Promise.race([
+          options.execute({
+            capability,
+            instruction: String(req?.instruction || ''),
+            docPath: req?.docPath ? String(req.docPath) : undefined,
+            docContent: req?.docContent ? String(req.docContent) : undefined,
+            fromAgentId: req?.fromAgentId ? String(req.fromAgentId) : undefined,
+            fromPublicKey,
+            targetAgentId: target.id,
+            targetAgentName: target.name,
+          }),
+          new Promise<DelegateExecutionResult>((resolve) =>
+            setTimeout(() => resolve({ ok: false, summary: `executor timed out after ${executeTimeoutMs}ms`, error: 'executor-timeout' }), executeTimeoutMs)),
+        ]);
+        return buildAgentResponse({
+          ok: !!raced.ok,
+          delegatedTo: target.id,
+          resultCid: raced.resultCid,
+          summary: String(raced.summary || '').slice(0, 4000),
+          error: raced.error,
+        });
+      } catch (e: any) {
+        return buildAgentResponse({
+          ok: false,
+          delegatedTo: target.id,
+          summary: `executor threw: ${String(e?.message || e).slice(0, 300)}`,
+          error: 'executor-error',
+        });
+      }
     }
     return null;
   });

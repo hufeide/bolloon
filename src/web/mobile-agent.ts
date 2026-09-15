@@ -163,12 +163,207 @@ async function applyLlmConfigToBridge(): Promise<void> {
   } catch { /* 注入失败不阻塞本地执行 */ }
 }
 
-// ============ 本地执行 (Kotlin AgentRuntime / 内置规则) ============
+// ============ 手机端「读入网说明 → 入网」(2026-09-15) ============
+//
+// 背景: 手机端「一键入网」发出的口令是 `read https://bolloon.cn/bolloon-gateway-join.md`
+// (mobile.js DEFAULT_JOIN_PROMPT), 但手机侧此前只会走到「已收到: "…"」的兜底回复 ——
+// 也就是说这句话在手机上是**空转**的: 既不读文档, 也不入网。
+// 现在手机自己就能走完: 读说明(校验 frontmatter) → 本机 DID → 服务登记
+// (桌面可达则登记进桌面的网络 registry, 否则本机登记并如实说明) → P2P 公告(尽力) → 落盘入网态。
+// 桌面不可达不是失败: 手机是自治节点; 但每一步都如实报 ok/note, 不假装入网。
+
+/** 入网口令识别 (与 mobile.js 的默认 prompt 同源) */
+export const MOBILE_JOIN_DOC_RE = /read\s+(https?:\/\/\S*bolloon-gateway-join\.md)/i;
+const MOBILE_JOIN_STATE_KEY = 'bolloon_gateway_join';
+
+export function detectJoinDocUrl(text: string): string | null {
+  const m = MOBILE_JOIN_DOC_RE.exec(String(text || ''));
+  return m ? m[1] : null;
+}
+
+export interface MobileJoinStep { step: string; ok: boolean; note: string }
+export interface MobileJoinResult {
+  ok: boolean;
+  docUrl: string;
+  docVersion?: string;
+  did?: string;
+  steps: MobileJoinStep[];
+  error?: string;
+}
+
+/** 极简 SKILL.md frontmatter 解析 (只认 name/version) */
+function parseFm(text: string): { name?: string; version?: string } {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(text || ''));
+  if (!m) return {};
+  const out: { name?: string; version?: string } = {};
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(line.trim());
+    if (!kv) continue;
+    const k = kv[1].toLowerCase();
+    if (k === 'name') out.name = kv[2].trim().replace(/^["']|["']$/g, '');
+    if (k === 'version') out.version = kv[2].trim().replace(/^["']|["']$/g, '');
+  }
+  return out;
+}
+
+export async function getMobileJoinState(): Promise<any | null> {
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(MOBILE_JOIN_STATE_KEY) : null;
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function saveMobileJoinState(s: any): void {
+  try { if (typeof localStorage !== 'undefined') localStorage.setItem(MOBILE_JOIN_STATE_KEY, JSON.stringify(s)); } catch { /* 忽略 */ }
+}
+
+/**
+ * 按入网说明文档入网 (手机端自足执行)。
+ * opts.desktopBaseUrl 可注入 (测试用); 默认读 mobile-gateway 持久化的桌面基址。
+ */
+export async function joinGatewayFromDoc(docUrl: string, opts: { fetchImpl?: typeof fetch; desktopBaseUrl?: string; name?: string; timeoutMs?: number; did?: string } = {}): Promise<MobileJoinResult> {
+  const f = opts.fetchImpl || fetch;
+  const steps: MobileJoinStep[] = [];
+  const url = String(docUrl || '').trim();
+  if (!/^https?:\/\//i.test(url)) {
+    return { ok: false, docUrl: url, steps, error: `入网说明地址必须是 http(s) URL (收到: ${url.slice(0, 60)})` };
+  }
+
+  // ① 读入网说明 + 校验
+  let docVersion: string | undefined;
+  try {
+    const r = await f(url, { signal: AbortSignal.timeout(opts.timeoutMs ?? 15000) } as any);
+    if (!r.ok) {
+      steps.push({ step: '读入网说明', ok: false, note: `文档不可达 (HTTP ${r.status})` });
+      return { ok: false, docUrl: url, steps, error: `入网说明不可达 (HTTP ${r.status})` };
+    }
+    const text = await r.text();
+    const fm = parseFm(text);
+    if (fm.name !== 'bolloon-gateway-join' && !/加入网关|bolloon-gateway-join/.test(text)) {
+      steps.push({ step: '读入网说明', ok: false, note: `不是 Bolloon 入网说明 (name=${fm.name || '无'})` });
+      return { ok: false, docUrl: url, steps, error: '该文档不是 Bolloon 网关入网说明, 拒绝据此入网' };
+    }
+    docVersion = fm.version;
+    steps.push({ step: '读入网说明', ok: true, note: `${fm.name || 'bolloon-gateway-join'} v${fm.version || '?'} (${text.length} 字符)` });
+  } catch (e: any) {
+    steps.push({ step: '读入网说明', ok: false, note: `读取失败: ${String(e?.message || e).slice(0, 120)}` });
+    return { ok: false, docUrl: url, steps, error: `入网说明读取失败: ${String(e?.message || e).slice(0, 120)}` };
+  }
+
+  // ② 本机 DID (手机端身份层; 可注入, 便于测试/无 IndexedDB 环境)
+  let did = String(opts.did || '');
+  if (did) {
+    steps.push({ step: 'DID 身份', ok: true, note: `${did} (注入身份)` });
+  } else {
+    try {
+      const id = await ensureIdentity();
+      did = id.did;
+      steps.push({ step: 'DID 身份', ok: true, note: `${did} (手机端本机生成)` });
+    } catch (e: any) {
+      steps.push({ step: 'DID 身份', ok: false, note: String(e?.message || e).slice(0, 120) });
+      return { ok: false, docUrl: url, docVersion, steps, error: '手机端 DID 生成失败' };
+    }
+  }
+
+  const name = String(opts.name || 'phone-agent');
+  const capabilities = ['chat', 'gateway-join'];
+
+  // ③ 服务登记: 桌面可达 → 登记进桌面(网络) registry; 否则本机登记并如实说明
+  let desktopBase = String(opts.desktopBaseUrl ?? '');
+  if (opts.desktopBaseUrl === undefined) {
+    try {
+      const g: any = await import('./mobile-gateway.js');
+      desktopBase = String(g.getDesktopBaseUrl() || '');
+    } catch { desktopBase = ''; }
+  }
+  desktopBase = desktopBase.replace(/\/+$/, '');
+  let registeredOn: 'desktop' | 'local' = 'local';
+  if (desktopBase) {
+    try {
+      const r = await f(`${desktopBase}/api/registry/register`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          agentId: did, name, wallet: '',
+          service: { name: 'chat', description: '手机端智能体 (自足节点)', price: { amount: '0', currency: 'USDC', per: 'task' }, endpoint: '' },
+          capabilities,
+        }),
+        signal: AbortSignal.timeout(opts.timeoutMs ?? 15000),
+      } as any);
+      if (r.ok) {
+        registeredOn = 'desktop';
+        steps.push({ step: '服务登记', ok: true, note: `已登记进电脑端网络 registry (${desktopBase}) —— 网络内其他智能体可按能力发现我` });
+      } else {
+        steps.push({ step: '服务登记', ok: false, note: `电脑端 registry 拒绝 (HTTP ${r.status}); 已改为本机登记` });
+      }
+    } catch (e: any) {
+      steps.push({ step: '服务登记', ok: false, note: `电脑端不可达 (${String(e?.message || e).slice(0, 80)}); 已改为本机登记` });
+    }
+  } else {
+    steps.push({ step: '服务登记', ok: true, note: '未配置电脑端基址 → 只在本机登记 (手机是自治节点; 设置里填电脑端地址可登记进网络 registry)' });
+  }
+
+  // ④ P2P 公告 (尽力): 让已连接的对端知道本机服务; 没连上不是入网失败
+  try {
+    const p2p: any = await import('./mobile-p2p.js');
+    let peers = 0;
+    try { peers = (p2p.getConnectedPeers?.() || []).length; } catch { peers = 0; }
+    if (peers > 0 && typeof p2p.sendMobileP2PMessage === 'function') {
+      const okAnnounce = await p2p.sendMobileP2PMessage('*', 'registry.register', JSON.stringify({ agent_id: did, name, capabilities }), did);
+      steps.push({ step: 'P2P 公告', ok: !!okAnnounce, note: okAnnounce ? `已向 ${peers} 个对端广播本机声明` : `广播失败 (对端 ${peers} 个)` });
+    } else {
+      steps.push({ step: 'P2P 公告', ok: false, note: '当前无已连接对端 (浏览器/未连电脑端时正常) — 本机声明已就绪, 连上即生效' });
+    }
+  } catch (e: any) {
+    steps.push({ step: 'P2P 公告', ok: false, note: `P2P 层不可用: ${String(e?.message || e).slice(0, 80)}` });
+  }
+
+  // ⑤ 落盘入网态 (幂等: 同 url 再次入网覆盖时间戳)
+  saveMobileJoinState({ url, did, name, capabilities, docVersion, registeredOn, desktopBaseUrl: desktopBase || undefined, joinedAt: new Date().toISOString() });
+  const state = await getMobileJoinState();
+  steps.push({ step: '落盘入网态', ok: !!state?.did, note: `localStorage:${MOBILE_JOIN_STATE_KEY}` });
+
+  return { ok: true, docUrl: url, docVersion, did, steps };
+}
+
+/** 把入网结果渲染成给用户看的回复 (与桌面工具的 steps 汇报风格一致) */
+export function formatMobileJoinResult(r: MobileJoinResult): string {
+  if (!r.ok) {
+    return `❌ 入网失败: ${r.error || '未知原因'}\n\n${r.steps.map((s) => `${s.ok ? '✓' : '✗'} ${s.step}: ${s.note}`).join('\n')}`;
+  }
+  const s = r.steps.find((x) => x.step === '服务登记');
+  return [
+    '✅ 已加入全球智能体网络 (手机端自足执行)',
+    '',
+    `DID: ${r.did}`,
+    `入网说明: v${r.docVersion || '?'} (${r.docUrl})`,
+    s ? `登记: ${s.note}` : '',
+    '',
+    ...r.steps.map((x) => `${x.ok ? '✓' : '✗'} ${x.step}: ${x.note}`),
+    '',
+    '用「网络 → Agent 网络」可查看成员; 设置里填电脑端地址可把本机登记进网络 registry。',
+  ].filter((l) => l !== '').join('\n');
+}
+
+// ============ 本地执行 (Kotlin AgentRuntime / 离线兜底) ============
+
 
 /** 手机端本地 agent 执行 (优先 Kotlin, 离线内置规则) */
 export async function runLocalAgent(goal: string): Promise<string> {
   const win = typeof window !== 'undefined' ? (window as any) : null;
   const cap = win?.Capacitor;
+
+  // 2026-09-15: 「读入网说明 → 入网」在手机端本地自足执行 (先于 Kotlin 桥: 原生工具集里没有入网能力,
+  //   交给它只会得到空转回复)。这样浏览器 / WebView / 真机三种环境行为一致。
+  const joinDocUrl = detectJoinDocUrl(goal);
+  if (joinDocUrl) {
+    _lastWorklog = [`🧩 识别为入网口令: ${joinDocUrl}`];
+    const r = await joinGatewayFromDoc(joinDocUrl).catch((e: any) => ({
+      ok: false, docUrl: joinDocUrl, steps: [{ step: '入网', ok: false, note: String(e?.message || e).slice(0, 120) }], error: String(e?.message || e),
+    } as MobileJoinResult));
+    _lastWorklog = [..._lastWorklog, ...r.steps.map((s) => `${s.ok ? '✓' : '✗'} ${s.step}: ${s.note}`)];
+    return formatMobileJoinResult(r);
+  }
+
   const bridge = cap && cap.Plugins && cap.Plugins.RokidBridge;
   if (bridge && cap.isNativePlatform?.()) {
     try {
