@@ -1310,6 +1310,109 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     return;
   }
 
+  // 2026-09-16 (M2/M5): /resume <runId> · /pause <runId> · /approve <runId> · /goals
+  //   恢复走的是同一条 run (从 checkpoint 继续), 不是"重发原 prompt"; 非幂等动作由重放守卫挡住。
+  if (cmd === '/resume' || cmd.startsWith('/resume ')) {
+    const runId = trimmed.slice('/resume'.length).trim();
+    if (!runId) {
+      const { listRuns, formatRunLine, RESUMABLE_STATUSES } = await import('./agents/run-store.js');
+      const runs = await listRuns({ limit: 30 });
+      const ok = runs.filter((r) => RESUMABLE_STATUSES.includes(r.status as any));
+      if (!ok.length) { appendLine(`${C_DIM}没有可恢复的运行 (可恢复状态: ${RESUMABLE_STATUSES.join('/')})${RESET}`); return; }
+      appendLine(`${C_DIM}可恢复的运行 (用 /resume <runId> 继续):${RESET}`);
+      for (const r of ok) appendLine(`  ${formatRunLine(r)}`);
+      return;
+    }
+    try {
+      const { readRun, prepareResume, buildResumeInstruction } = await import('./agents/run-store.js');
+      const rec = await readRun(runId);
+      if (!rec) { appendLine(`${C_ERROR}没有这个运行: ${runId}${RESET}`); return; }
+      const agent: any = await getAgent();
+      const active = String(agent?.currentChannelId || '');
+      if (rec.channelId && active && rec.channelId !== active) {
+        appendLine(`${C_ERROR}该运行属于 channel ${rec.channelId} (当前 ${active}) — 先 /channel 切过去再 /resume${RESET}`);
+        return;
+      }
+      const prep = await prepareResume(runId);
+      if (!prep.ok || !prep.plan) { appendLine(`${C_ERROR}无法恢复: ${prep.reason}${RESET}`); return; }
+      appendLine(`${C_ACCENT}♻️ 从 checkpoint 恢复 ${runId} (已完成 ${prep.plan.completedSteps.length} 步, 非幂等守卫 ${prep.plan.replayGuards.length} 条)${RESET}`);
+      appendLine(`${C_DIM}${buildResumeInstruction(prep.plan).split('\n').slice(0, 6).join('\n')}${RESET}`);
+      if (!agent?.resumeRun) { appendLine(`${C_ERROR}当前 agent 不支持 resumeRun${RESET}`); return; }
+      const r = await agent.resumeRun(runId);
+      appendLine(r.ok ? `${C_ACCENT}✅ 恢复执行完成${RESET}` : `${C_ERROR}恢复失败: ${r.reason}${RESET}`);
+    } catch (e: any) {
+      appendLine(`${C_ERROR}/resume 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`);
+    }
+    return;
+  }
+
+  if (cmd === '/pause' || cmd.startsWith('/pause ')) {
+    const runId = trimmed.slice('/pause'.length).trim();
+    if (!runId) {
+      const { listRuns, formatRunLine } = await import('./agents/run-store.js');
+      const runs = (await listRuns({ status: 'running', limit: 10 }));
+      if (!runs.length) { appendLine(`${C_DIM}没有正在运行的 run${RESET}`); return; }
+      appendLine(`${C_DIM}正在运行 (用 /pause <runId> 暂停):${RESET}`);
+      for (const r of runs) appendLine(`  ${formatRunLine(r)}`);
+      return;
+    }
+    try {
+      const { setRunStatus } = await import('./agents/run-store.js');
+      const r = await setRunStatus(runId, 'paused', { error: '外部请求 (pause)' });
+      appendLine(r.ok ? `${C_ACCENT}⏸️ 已请求暂停 ${runId} (运行中的 agent 会在下一轮循环停下)${RESET}` : `${C_ERROR}暂停被拒: ${r.reason}${RESET}`);
+    } catch (e: any) { appendLine(`${C_ERROR}/pause 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`); }
+    return;
+  }
+
+  if (cmd === '/approve' || cmd.startsWith('/approve ')) {
+    const runId = trimmed.slice('/approve'.length).trim();
+    if (!runId) {
+      const { listRuns, formatRunLine } = await import('./agents/run-store.js');
+      const runs = (await listRuns({ status: 'needs_human', limit: 10 }));
+      if (!runs.length) { appendLine(`${C_DIM}没有等待人工处置的 run${RESET}`); return; }
+      appendLine(`${C_DIM}等待人工处置 (用 /approve <runId> 批准继续):${RESET}`);
+      for (const r of runs) appendLine(`  ${formatRunLine(r)}`);
+      return;
+    }
+    try {
+      const { readRun, recordRecovery } = await import('./agents/run-store.js');
+      const rec = await readRun(runId);
+      if (!rec) { appendLine(`${C_ERROR}没有这个运行: ${runId}${RESET}`); return; }
+      if (rec.status !== 'needs_human') { appendLine(`${C_ERROR}只有 needs_human 的运行需要批准 (当前 ${rec.status})${RESET}`); return; }
+      await recordRecovery(runId, { errorClass: (rec.errorClass as any) || 'unknown', message: '人工批准后继续', action: 'resume' });
+      const agent: any = await getAgent();
+      if (!agent?.resumeRun) { appendLine(`${C_ERROR}当前 agent 不支持 resumeRun${RESET}`); return; }
+      const r = await agent.resumeRun(runId);
+      appendLine(r.ok ? `${C_ACCENT}✅ 已批准并继续执行${RESET}` : `${C_ERROR}批准后恢复失败: ${r.reason}${RESET}`);
+    } catch (e: any) { appendLine(`${C_ERROR}/approve 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`); }
+    return;
+  }
+
+  if (cmd === '/goals' || cmd.startsWith('/goals ')) {
+    const arg = trimmed.slice('/goals'.length).trim();
+    try {
+      const { listGoals, readGoal, formatGoalLine, evaluateGoalCompletion } = await import('./agents/goal-store.js');
+      if (arg) {
+        const g = await readGoal(arg);
+        if (!g) { appendLine(`${C_ERROR}没有这个目标: ${arg}${RESET}`); return; }
+        appendLine(`${C_DIM}goal ${g.goalId} [${g.status}] 创建 ${g.createdAt}${RESET}`);
+        appendLine(`  目标: ${g.objective}`);
+        g.successCriteria.forEach((c, i) => appendLine(`  ${g.completedCriteria.includes(i) ? '✓' : '·'} [${i}] ${c}`));
+        appendLine(`  runs: ${g.runs.join(', ') || '(无)'}  当前: ${g.currentRunId || '-'}`);
+        if (g.evidence.length) appendLine(`  证据: ${g.evidence.slice(-3).join(' | ')}`);
+        const v = evaluateGoalCompletion(g);
+        appendLine(`  完成门: ${v.complete ? '✅ 可判完成' : `❌ ${v.reason}`}`);
+        return;
+      }
+      const goals = await listGoals({ limit: 15 });
+      if (!goals.length) { appendLine(`${C_DIM}还没有目标记录 (每次 prompt 都会建/续一个 Goal, 落盘 ~/.bolloon/goals/)${RESET}`); return; }
+      appendLine(`${C_DIM}最近 ${goals.length} 个目标:${RESET}`);
+      for (const g of goals) appendLine(`  ${formatGoalLine(g)}`);
+      appendLine(`${C_DIM}/goals <goalId> 看判据与证据${RESET}`);
+    } catch (e: any) { appendLine(`${C_ERROR}/goals 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`); }
+    return;
+  }
+
   // /model — 无参: 交互选择器 (ink 渲染, 复用 MentionPopup); 有参: 直接切换/测连通/看状态
   if (cmd === '/model' || cmd.startsWith('/model ')) {
     const modelArg = trimmed.slice('/model'.length).trim();
@@ -2185,6 +2288,10 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     appendLine(`  ${C_ACCENT}/channel [名字|id|序号]${RESET} 切换当前智能体  ${C_DIM}无参列出所有; 支持名字/ID/序号三种解析${RESET}`);
     appendLine(`  ${C_ACCENT}/model${RESET}    模型供应商选择器  ${C_DIM}无参=选择器 · /model <名> [模型] 直接切换 · /model test 测连通${RESET}`);
     appendLine(`  ${C_ACCENT}/runs${RESET}     运行记录 (落盘, 跨重载可读)  ${C_DIM}/runs · /runs <runId> 看逐步明细${RESET}`);
+    appendLine(`  ${C_ACCENT}/resume${RESET}   从 checkpoint 继续一次运行  ${C_DIM}/resume · /resume <runId> (不是重发原 prompt)${RESET}`);
+    appendLine(`  ${C_ACCENT}/pause${RESET}    暂停一次运行  ${C_DIM}/pause · /pause <runId>${RESET}`);
+    appendLine(`  ${C_ACCENT}/approve${RESET}  批准等待人工处置的运行  ${C_DIM}/approve · /approve <runId>${RESET}`);
+    appendLine(`  ${C_ACCENT}/goals${RESET}    目标 (判据/证据/完成门)  ${C_DIM}/goals · /goals <goalId>${RESET}`);
     appendLine(`  ${C_ACCENT}/setup${RESET}    初始化 / 配置总览  ${C_DIM}身份 + 供应商 + 配置文件路径${RESET}`);
     appendLine(`  ${C_ACCENT}/questions${RESET} 待回答的问题  ${C_DIM}智能体 clarify 提问时, 直接输入即回答 (或 /answer <文本>)${RESET}`);
     appendLine(`  ${C_ACCENT}/login${RESET}    登录 GitHub/Google 账号 (骨架)  ${C_DIM}暂无真实 OAuth${RESET}`);

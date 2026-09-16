@@ -55,7 +55,7 @@ const path = require('path');
 `;
 
 async function main() {
-  const { reconcileOrphans, budgetVerdict, superviseRuns, listRuns, readRun, finishRun, recordStep, startRun } =
+  const { reconcileOrphans, budgetVerdict, superviseRuns, listRuns, readRun, finishRun, recordStep, startRun, listDegradations } =
     await import('../src/agents/run-store.js');
 
   console.log(`\n隔离 HOME: ${HOME}`);
@@ -182,6 +182,33 @@ async function main() {
   const rec6 = await readRun(r6b.runId);
   check('recovery 留痕 (分类/策略/是否恢复)', rec6?.recovery?.[0]?.errorClass === 'transient' && rec6?.recovery?.[0]?.recovered === true, JSON.stringify(rec6?.recovery));
   check('errorClass 写进记录 (auth 落 needs_human 的依据)', (await finishRun(r6b.runId, { status: 'needs_human', error: '401 invalid api key' }))?.errorClass === 'auth');
+
+  // ---------- ⑦ 持久化失败 → agent 必须停 (Milestone 1 硬约束) ----------
+  console.log('\n[7] 持久化失败: agent 必须停在 needs_human, 不许无记录继续执行');
+  try {
+    const runsDir = path.join(HOME, '.bolloon', 'runs');
+    await fsp.mkdir(runsDir, { recursive: true });
+    await fsp.chmod(runsDir, 0o500);   // 只读: 运行记录必然写不进去
+    const { createAgentSession } = await import('../src/agents/pi-sdk.js');
+    const goal = `持久化失败停止测试 ${Date.now()}`;
+    const agent: any = await createAgentSession({ cwd: process.cwd(), peerId: `persist-fail:${Date.now()}` }, true);
+    agent.setRunSurface?.('cli');
+    const before = (await listRuns()).length;
+    let reply = '';
+    try {
+      reply = await agent.prompt(goal, {});
+    } finally {
+      await fsp.chmod(runsDir, 0o700);
+    }
+    check('返回的是"已停止"而不是正常回复', /运行已停止|无法创建运行记录/.test(String(reply)), String(reply).slice(0, 140));
+    const after = await listRuns();
+    check('没有为这次运行留下"假装在跑"的记录 (盘上没有该目标)', !after.some((r) => String(r.goal).includes('持久化失败停止测试')), JSON.stringify(after.map((r) => [r.goal.slice(0, 20), r.status])));
+    check('其它记录没被牵连 (数量不倒退)', after.length >= before, `before=${before} after=${after.length}`);
+    const degs = await listDegradations(5);
+    check('核心写失败在降级日志里留痕', degs.some((d) => d.op === 'startRun' || d.op === 'acquireFileLock' || d.op === 'withRunLock'), JSON.stringify(degs.slice(0, 2)));
+  } catch (e: any) {
+    check('持久化失败时 agent 停止 (真 agent 在环)', false, String(e?.message || e).slice(0, 220));
+  }
 
   // ---------- 收尾 ----------
   const all = await listRuns();

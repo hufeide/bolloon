@@ -31,6 +31,9 @@ export interface ReviewState {
    * 而不是凭记忆猜 (旧版只有工具名, LLM 容易潦草自查通过).
    */
   actionLog?: { tool: string; argsPreview: string; resultPreview: string; success: boolean }[];
+  /** 2026-09-16 (Milestone 1-B): 运行身份 — 审查事件写进 Run 时要知道属于哪次运行 */
+  runId?: string;
+  goalId?: string;
 }
 
 /** review 决策结果 */

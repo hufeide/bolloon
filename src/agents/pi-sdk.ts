@@ -28,7 +28,9 @@ import { DeepThinkingEngine, AgentCoordinator, type ThinkResult, type AgentResul
 import { WorkflowPivotLoop, createDefaultPivotConfig, type PivotLoopConfig, type LoopResult } from './workflow-pivot-loop.js';
 import { p2pDocumentTools, initDocumentReceiver } from './p2p-document-tools.js';
 import { shellExec } from './shell-tool.js';
-import { startRun, recordStep, finishRun, readRun, budgetVerdict, type RunSurface } from './run-store.js';
+import { startRun, recordStep, finishRun, readRun, budgetVerdict, recordDegradation, recordHarnessEvent, recordRecovery, setRunStatus, prepareResume, markRunRunning, buildResumeInstruction, argsDigestOf, repeatedFailureCount, classifyError as classifyRunError, type RunSurface, type RunStatus, type ResumePlan } from './run-store.js';
+import { createGoal, readGoal, attachRun, findActiveGoal, completeGoalIfEligible, setUnresolved, addEvidence, evaluateGoalCompletion } from './goal-store.js';
+import { PiAgentHarness, type HarnessRunContext, type ToolDecision } from './pi-harness.js';
 import { getBranchPrefix, getCooldownMs, checkWritePath } from './shell-guard.js';
 import {
   DiscoveredAgentsManager,
@@ -116,11 +118,17 @@ import { buildObservation, buildReflection, formatObservationWithReflection, cla
 import { sessionStore as defaultSessionStore, type SessionStore, type PersistedMessage } from './session-store.js';
 import { ToolRegistry } from './tool-registry.js';
 import { decideMaxIterations, decideContextOverflow, shouldCompactBeforeIteration } from './react-loop.js';
-import { decideAfterReview, DEFAULT_MAX_REVIEWS } from './loop-review.js';
+import { DEFAULT_MAX_REVIEWS } from './loop-review.js';
 
 // PiSessionManager 已抽到 ./pi-sdk-session-manager.ts (2026-07-06)
 // Tool / ToolResult / Message / StreamCallback / StreamEvent / HeartbeatConfig / AgentSession / TOOL_DEFINITIONS
 //   已抽到 ./pi-sdk-types.ts (2026-07-06)
+
+/**
+ * 同一工具 + 同一组参数连续失败上限 (2026-07-01 起) —— 触发两条互不替代的动作:
+ *   循环内: 注入 system 提示强制 LLM 收尾; 运行层 (M3): 熔断 → needs_human (交人)。
+ */
+const MAX_SAME_TOOL_FAILURES = 3;
 
 export class PiAgentSession implements AgentSession {
   private cwd: string;
@@ -295,6 +303,12 @@ export class PiAgentSession implements AgentSession {
    */
   private currentRunId: string = '';
   private runSurface: RunSurface = 'cli';
+  /**
+   * 2026-09-16 (Milestone 1): 本次运行因**持久化失败**被硬停。
+   * 标记出来是为了让外层 loop 重试逻辑别重试 —— 盘写不进去, 重试 3 次也只是再失败 3 次
+   * (协议: 同一个错误不许无限重复; 该交人时交人)。
+   */
+  private runPersistenceBlocked = false;
 
   /** 由 server / CLI / cron 注入运行表面 (影响落盘记录里的 surface 字段) */
   setRunSurface(surface: RunSurface): void {
@@ -1043,6 +1057,8 @@ export class PiAgentSession implements AgentSession {
       try {
         const loopResult = await this.runReActLoop(onStream, signal);
         result = loopResult.reply;
+        // 持久化失败不重试 (写不进去就是写不进去): 直接按本次结果收尾
+        if (this.runPersistenceBlocked) break;
         if (!loopResult.aiFailed) break; // 正常完成, 退出 retry 循环
         lastAiFailureReason = loopResult.aiFailureReason || 'AI 调用失败';
       } catch (err: any) {
@@ -1253,6 +1269,142 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
     return result;
   }
 
+  /**
+   * 2026-09-16 (Milestone 1-B): 唯一 Harness 门面 — 约束层的**唯一**入口。
+   * pi-sdk 从此刻起不再分别调用 deny-pipeline / validator / react-harness / hooks / loop-review,
+   * 只调 harness.*; 由 Harness 决定约束顺序与失败处置 (见 pi-harness.ts)。
+   */
+  private _harness: PiAgentHarness | null = null;
+  /** M2 绑定 GoalStore 后填真值; 在此之前为空 (事件里 goalId 字段已就位) */
+  private currentGoalId = '';
+  /** 2026-09-16 (M2): 本次执行是"从 checkpoint 恢复"的 runId (非空 = 恢复模式, 不再新建 run) */
+  private resumeRunId = '';
+  private resumePlan: ResumePlan | null = null;
+  /** 2026-09-16 (M3): 外部等待中 (awaiting_external) —— 收到成功步骤后回 running */
+  private awaitingExternal = false;
+  /** 2026-09-16 (M3): 熔断原因 (同一工具连续失败达上限 → needs_human) */
+  private breakerReason = '';
+  /** 2026-09-16 (M3): 运行中核心写失败 (状态迁移等) —— 交给循环顶部硬闸, 不吞 */
+  private persistenceFailure = '';
+
+  /** CLI / Web 注入"当前目标" (有 goalId 就在该 Goal 下执行) */
+  setGoalId(goalId: string): void {
+    this.currentGoalId = String(goalId || '');
+  }
+
+  /** 核心状态迁移的兜底: 失败 → 记降级 + 交给循环顶部的持久化硬闸 (不吞错) */
+  private async safeSetRunStatus(runId: string, to: RunStatus): Promise<boolean> {
+    try {
+      const r = await setRunStatus(runId, to);
+      return !!r.ok;
+    } catch (err) {
+      this.persistenceFailure = `状态迁移失败 (${to}): ${String((err as Error)?.message || err).slice(0, 180)}`;
+      await recordDegradation({ kind: 'core', op: 'pi-sdk.setRunStatus', runId, message: this.persistenceFailure }).catch(() => {});
+      return false;
+    }
+  }
+
+  /**
+   * 2026-09-16 (M3): 工具失败接线 —— 分类 → recovery 留痕 → 熔断 / 外部等待。
+   * 这是"错误恢复闭环"的运行时接线点 (此前 recordRecovery / repeatedFailureCount 只是数据结构)。
+   */
+  private async wireToolFailure(tool: string, errorText: string, args: unknown): Promise<void> {
+    if (!this.currentRunId) return;
+    const cls = classifyRunError(errorText);
+    const digest = argsDigestOf(args);
+    let repeats = 1;
+    try {
+      const rec = await readRun(this.currentRunId);
+      // recordStep 已经把**这次**失败记进去了, 所以"连续失败次数"直接就是当前值 (不再 +1)
+      const seen = rec ? repeatedFailureCount(rec, tool, digest) : 0;
+      repeats = Math.max(seen, 1);
+    } catch { /* 读不到就按首次记 */ }
+
+    const action = cls === 'transient' ? 'backoff'
+      : cls === 'auth' ? 'escalate'
+        : cls === 'external_no_reply' ? 'pause'
+          : 'retry';
+    try {
+      await recordRecovery(this.currentRunId, {
+        errorClass: cls,
+        message: `${tool}: ${errorText}`.slice(0, 200),
+        action,
+        attempt: repeats,
+        recovered: false,
+      });
+    } catch (err) {
+      await recordDegradation({ kind: 'core', op: 'pi-sdk.recordRecovery', runId: this.currentRunId, message: String((err as Error)?.message || err) }).catch(() => {});
+    }
+
+    // 外部无响应 → awaiting_external (不算失败; 等回话后回到 running)
+    if (cls === 'external_no_reply') {
+      this.awaitingExternal = true;
+      await this.safeSetRunStatus(this.currentRunId, 'awaiting_external');
+      return;
+    }
+    // 鉴权类: 不重试, 直接交人
+    if (cls === 'auth') {
+      this.breakerReason = `鉴权类错误不重试 (${tool}): ${errorText.slice(0, 120)}`;
+      await this.safeSetRunStatus(this.currentRunId, 'needs_human');
+      return;
+    }
+    // 重复失败熔断: 同一工具 + 同一组参数连续失败达 3 次
+    if (repeats >= MAX_SAME_TOOL_FAILURES) {
+      this.breakerReason = `同一工具 ${tool} 连续失败 ${repeats} 次 (${cls}) → 熔断, 不再重试`;
+      await this.safeSetRunStatus(this.currentRunId, 'needs_human');
+    }
+  }
+
+  getRunId(): string {
+    return this.currentRunId;
+  }
+
+  /**
+   * 2026-09-16 (M2): 从 checkpoint 恢复一次运行 —— **不是**重发原 prompt。
+   * 语义: prepareResume (校验状态 + 读 checkpoint + 记 recovery + 落 recovering) → 用恢复指令
+   * 驱动同一个 runId 继续 (历史保留), 非幂等动作由重放守卫挡住。
+   */
+  async resumeRun(runId: string): Promise<{ ok: boolean; reason?: string; reply?: string }> {
+    const prep = await prepareResume(runId);
+    if (!prep.ok || !prep.plan) return { ok: false, reason: prep.reason };
+    this.resumeRunId = runId;
+    this.resumePlan = prep.plan;
+    this.currentGoalId = prep.plan.goalId || this.currentGoalId;
+    try {
+      const reply = await this.prompt(buildResumeInstruction(prep.plan), {});
+      return { ok: true, reply };
+    } finally {
+      this.resumeRunId = '';
+      this.resumePlan = null;
+    }
+  }
+
+  private piHarness(): PiAgentHarness {
+    if (!this._harness) {
+      this._harness = new PiAgentHarness({
+        reactHarness: this.reactHarness,
+        denyPipeline: this._denyPipeline,
+        hooks: this._hooks,
+        // pre-tool-validator 4 步链 (modeGate/blacklist/shell-guard/schema), 经 human-value-pipeline 包装
+        preToolUse: async (o) => onPreToolUse({ tool: o.tool, args: o.args, permissionMode: o.permissionMode as any }),
+        // 事件写 Run: 观测级 (记账失败不改变已做出的决策)
+        events: (e) => { if (this.currentRunId) void recordHarnessEvent(this.currentRunId, e); },
+      });
+    }
+    return this._harness;
+  }
+
+  /** 每个生命周期事件都带上的运行身份 (runId / goalId / agentId / channelId / surface) */
+  private harnessCtx(): HarnessRunContext {
+    return {
+      runId: this.currentRunId || undefined,
+      goalId: this.currentGoalId || undefined,
+      agentId: this.currentAgentId || undefined,
+      channelId: this.currentChannelId || undefined,
+      surface: this.runSurface,
+    };
+  }
+
   private async runReActLoop(onStream?: StreamCallback, signal?: AbortSignal): Promise<{ reply: string; aiFailed: boolean; aiFailureReason?: string }> {
     const llm = getMinimax();
     let iteration = 0;
@@ -1269,7 +1421,7 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
     let aiFailed = false;
     let aiFailureReason = '';
     const MAX_CONSECUTIVE_ERRORS = 3;
-    const MAX_SAME_TOOL_FAILURES = 3; // 同一工具连续失败 3 次, 强制让 LLM 给出最终答案
+    // 同一工具连续失败 3 次, 强制让 LLM 给出最终答案 (模块级常量 MAX_SAME_TOOL_FAILURES 也用它做熔断)
     // 2026-07-29: Hermes 风格硬限制 — 防死循环 (不再靠 soft hint)
     const MAX_IDEMPOTENT_TOOL = 5;  // 同工具成功调 5 次 → 注入 hint 强制 final gen
     const MAX_TOOL_CALLS_PER_LOOP = 25; // 单轮循环总工具调用上限 → 注入 hint
@@ -1298,41 +1450,125 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
 
     // React Harness: 循环开始 (重置 turn 计数 + 触发 harness sessionStart)
     // 失败静默 (fail-open), 不阻塞主循环
-    try {
-      await this.reactHarness.onSessionStart(this.currentChannelId || undefined);
-    } catch (err) {
-      console.warn('[PiAgent] reactHarness.onSessionStart failed (non-fatal):', err);
-    }
-
-    // 2026-07-29: Hook onLoopStart
-    try {
-      await this._hooks.fire('onLoopStart', { event: 'onLoopStart', channelId: this.currentChannelId, agentId: this.currentAgentId });
-    } catch { /* hook 失败静默 */ }
+    // 2026-09-16 (Milestone 1-B): 会话开启走唯一门面 (react-harness 8-gate 复位 + hooks onLoopStart)
+    await this.piHarness().sessionStart(this.harnessCtx());
 
     // 2026-09-16: 持久化 run harness — 本次运行立即落盘 (~/.bolloon/runs/<id>.json)。
     //   之后每步工具调用都追加一条, 所以刷新页面/进程重载/崩溃都能看到"做到哪一步"。
     let runStopReason = '';
-    try {
-      const rec = await startRun({
-        surface: this.runSurface,
-        goal: this.currentUserInput || '(未记录目标)',
-        channelId: this.currentChannelId || undefined,
-        agentId: this.currentAgentId || undefined,
-      });
-      this.currentRunId = rec.runId;
-      onStream?.({ type: 'status', content: `🧷 运行已登记 (run=${rec.runId}, 预算 ${rec.budget.maxSteps} 步 / ${Math.round(rec.budget.deadlineMs / 60000)} 分钟)`, tool: 'harness' });
-    } catch (err) {
-      console.warn('[PiAgent] run-store startRun failed (non-fatal):', err);
+    // 2026-09-16 (Milestone 1): 持久化硬约束 —— 核心 run 状态写不进去时, 运行必须停。
+    //   理由: "agent 实际跑了但没记录" 比 "agent 没跑" 更危险 (UI 显示旧状态/重启后无从知晓/结果可能被错标 done)。
+    let runPersistenceFailure = '';
+    /** 2026-09-16 (M3): 熔断/需要人处置 → 收尾落 needs_human (不是 done, 也不是普通 failed) */
+    let runNeedsHuman = '';
+    /** 2026-09-16 (M5): 外部 (CLI/Web) 把 run 改成 paused/aborted → 如实停, 不再覆盖它的状态 */
+    let runExternallyPaused = false;
+    let runExternallyAborted = false;
+    this.runPersistenceBlocked = false;
+    this.breakerReason = '';
+    this.awaitingExternal = false;
+
+    if (this.resumeRunId) {
+      // ── 恢复模式: 复用原来的 runId, 不新建 run (历史保留) ──
+      this.currentRunId = this.resumeRunId;
+      try {
+        await markRunRunning(this.currentRunId);
+      } catch (err) {
+        runPersistenceFailure = `恢复时状态迁移失败 (recovering → running): ${String((err as Error)?.message || err).slice(0, 180)}`;
+      }
+      const doneN = this.resumePlan?.completedSteps.length ?? 0;
+      const guards = this.resumePlan?.replayGuards.length ?? 0;
+      onStream?.({ type: 'status', content: `♻️ 从 checkpoint 恢复运行 ${this.currentRunId} (已完成 ${doneN} 步, 非幂等重放守卫 ${guards} 条)`, tool: 'harness' });
+    } else {
+      // 2026-09-16 (M2): 目标绑定 —— 有 goalId 就在该 Goal 下执行; 没有就建 Goal 再建 Run。
+      //   延续规则 (确定性, 不靠猜): 该 channel/agent 上已有 open/active Goal, 且它的上一次执行**没收尾**
+      //   (interrupted/stalled/needs_human/paused/awaiting_external/recovering) → 继续该 Goal; 否则新建。
+      let boundGoalId = this.currentGoalId;
+      if (!boundGoalId) {
+        try {
+          const active = await findActiveGoal({ channelId: this.currentChannelId || undefined, agentId: this.currentAgentId || undefined });
+          if (active?.currentRunId) {
+            const prev = await readRun(active.currentRunId);
+            const unfinished = prev && ['interrupted', 'stalled', 'needs_human', 'paused', 'awaiting_external', 'recovering'].includes(prev.status);
+            if (unfinished) boundGoalId = active.goalId;
+          }
+        } catch (err) { console.warn('[PiAgent] 查找进行中 Goal 失败 (按新建处理):', (err as Error)?.message); }
+        if (!boundGoalId) {
+          try {
+            const g = await createGoal({
+              objective: this.currentUserInput || '(未记录目标)',
+              channelId: this.currentChannelId || undefined,
+              agentId: this.currentAgentId || undefined,
+              createdBy: this.runSurface,
+            });
+            boundGoalId = g.goalId;
+          } catch (err) { console.warn('[PiAgent] 创建 Goal 失败 (无目标也要有运行记录):', (err as Error)?.message); }
+        }
+        this.currentGoalId = boundGoalId;
+      }
+
+      try {
+        const rec = await startRun({
+          surface: this.runSurface,
+          goal: this.currentUserInput || '(未记录目标)',
+          goalId: boundGoalId || undefined,
+          channelId: this.currentChannelId || undefined,
+          agentId: this.currentAgentId || undefined,
+        });
+        this.currentRunId = rec.runId;
+        this.currentGoalId = rec.goalId || this.currentGoalId;
+        if (this.currentGoalId) {
+          // Run → Goal 反查链: runId → goalId → objective / success criteria
+          await attachRun(this.currentGoalId, rec.runId).catch((err) => console.warn('[PiAgent] attachRun 失败:', (err as Error)?.message));
+        }
+        onStream?.({ type: 'status', content: `🧷 运行已登记 (run=${rec.runId}${this.currentGoalId ? `, goal=${this.currentGoalId}` : ''}, 预算 ${rec.budget.maxSteps} 步 / ${Math.round(rec.budget.deadlineMs / 60000)} 分钟)`, tool: 'harness' });
+      } catch (err) {
+        // 核心写失败: 不再 warn 后继续 —— 没有运行记录就不执行 (strict 模式默认如此)
+        runPersistenceFailure = `无法创建运行记录: ${String((err as Error)?.message || err).slice(0, 200)}`;
+        this.runPersistenceBlocked = true;
+        console.error('[PiAgent] run-store startRun 失败 (核心持久化) → 拒绝无记录执行:', runPersistenceFailure);
+        onStream?.({ type: 'error', content: `⛔ ${runPersistenceFailure} — 已停止 (不在没有记录的情况下执行)`, tool: 'harness' });
+      }
     }
 
     while (iteration < this.MAX_REACT_ITERATIONS) {
       iteration++;
 
+      // 2026-09-16 (Milestone 1): 持久化失败硬闸 —— 到这一层说明记录已经不可信, 继续跑就是"无约束执行"
+      if (runPersistenceFailure || this.persistenceFailure) {
+        runPersistenceFailure = runPersistenceFailure || this.persistenceFailure;
+        this.runPersistenceBlocked = true;
+        aiFailed = true;
+        aiFailureReason = aiFailureReason || runPersistenceFailure;
+        finalResponse = finalResponse || `❌ 运行已停止: ${runPersistenceFailure}\n\n(运行记录无法写入/校验, 按协议停在 needs_human, 不假装完成)`;
+        break;
+      }
+
+      // 2026-09-16 (M3): 熔断硬闸 —— 同一工具连续失败达上限后, 不许再"自动重试成功"式地把运行放活
+      if (this.breakerReason) {
+        runNeedsHuman = this.breakerReason;
+        aiFailed = true;
+        aiFailureReason = aiFailureReason || this.breakerReason;
+        finalResponse = finalResponse || `❌ 已熔断: ${this.breakerReason}\n\n(重复失败不再重试, 按协议停在 needs_human 交人处置)`;
+        break;
+      }
+
       // 2026-09-16: 预算闸门 (持久化 harness 的约束面) —— 到点必须**如实**终止, 不许静默算完成
       if (this.currentRunId) {
         try {
           const rec = await readRun(this.currentRunId);
-          const verdict = rec ? budgetVerdict(rec) : { exceeded: false as const };
+          if (!rec) throw new Error(`运行记录读不到: ${this.currentRunId}`);
+          // 2026-09-16 (M5): 外部控制面 (CLI /pause /abort, Web API) 改过状态 → 如实停在那儿。
+          //   不覆盖成 done/failed: 人按下暂停就是暂停, 人按下中止就是中止。
+          if (rec.status === 'paused' || rec.status === 'aborted') {
+            runExternallyPaused = rec.status === 'paused';
+            runExternallyAborted = rec.status === 'aborted';
+            runStopReason = `外部请求: ${rec.status}`;
+            onStream?.({ type: 'error', content: `⏹️ 运行被外部${rec.status === 'paused' ? '暂停' : '中止'} (run=${this.currentRunId})`, tool: 'harness' });
+            finalResponse = finalResponse || `(运行已${rec.status === 'paused' ? '暂停' : '中止'})`;
+            break;
+          }
+          const verdict = budgetVerdict(rec);
           if (verdict.exceeded) {
             runStopReason = verdict.reason || '运行预算用尽';
             onStream?.({ type: 'error', content: `⛔ 运行预算用尽: ${runStopReason} (已如实终止, 不假装完成)`, tool: 'harness' });
@@ -1340,7 +1576,12 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
             break;
           }
         } catch (err) {
-          console.warn('[PiAgent] run-store budget check failed (non-fatal):', err);
+          // 预算闸门读不到状态 = 约束失效, 不能"当作没超预算"继续跑
+          runPersistenceFailure = `预算闸门无法校验运行状态: ${String((err as Error)?.message || err).slice(0, 200)}`;
+          this.runPersistenceBlocked = true;
+          console.error('[PiAgent] run-store 预算检查失败 (核心持久化):', runPersistenceFailure);
+          onStream?.({ type: 'error', content: `⛔ ${runPersistenceFailure} — 已停止`, tool: 'harness' });
+          break;
         }
       }
 
@@ -1523,7 +1764,11 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
           },
         });
       }
+      // 2026-09-16 (Milestone 1-B): 模型调用前后走唯一门面 (扩展点 + 计数留痕; 默认不加新 hook 事件, 避免改变现有触发次数)
+      this.piHarness().beforeModelCall(this.harnessCtx());
+      const _modelCallT0 = Date.now();
       const response = await this.callLlmWithRecovery(llm, messages, systemPrompt, signal, onStream, openaiFormattedTools);
+      this.piHarness().afterModelCall(this.harnessCtx(), { ms: Date.now() - _modelCallT0 });
       const reply = (response.reply || '').trim();
       // 2026-06-30: OpenAI 协议 native tool_calls (LLM 真产了 tool_call 时, minimax/M3 会返回 id)
       const nativeToolCalls = response.toolCalls;
@@ -1673,29 +1918,6 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
           });
         }
 
-        // 2026-07-29: Unified Deny-First Pipeline — 统合所有拒绝检查
-        let denyResult: Awaited<ReturnType<DenyPipeline['check']>> = { denied: false, reason: '', source: '' };
-        try {
-          denyResult = await this._denyPipeline.check({
-            toolName: toolCall.name,
-            toolArgs: toolCall.args || {},
-            permissionMode: this.currentPermissionMode,
-            channelId: this.currentChannelId,
-            agentId: this.currentAgentId,
-          } as DenyContext);
-        } catch { /* pipeline 失败不阻塞工具调用 */ }
-        if (denyResult.denied) {
-          consecutiveErrors++;
-          totalErrors++;
-          const denyResultMsg: ToolResult = { success: false, error: `拒绝: [${denyResult.source}] ${denyResult.reason}` };
-          this.messageHistory.push({ role: 'tool', content: JSON.stringify(denyResultMsg), toolResult: denyResultMsg });
-          this.logToHarness(toolCall.name, toolCall.args, denyResultMsg);
-          return;
-        }
-        if (denyResult.systemAddition) {
-          this.contextHintAddition += '\n' + denyResult.systemAddition;
-        }
-
         const tool = this.tools.get(toolCall.name);
         if (!tool) {
           consecutiveErrors++;
@@ -1712,79 +1934,112 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
           return;
         }
 
-        // Bootstrap PreToolUse hook: 调工具前校验 (危险命令拦截)
-        // 失败静默 — hook 自身挂掉 = 放行
-        // P2: 透传 permissionMode (从 BootstrapOptions / env BOLLOON_PERM_MODE 解析)
-        let toolToExecute = tool;
+        // 2026-09-16 (Milestone 1-B): 工具调用前的**唯一**约束入口。
+        //   顺序由 PiAgentHarness 决定: deny-pipeline → pre-tool-validator(4 步链) → react-harness(8-gate)。
+        //   旧实现是这三处在不同位置各自调用 (且有两条路径 fail-open); 现在 pi-sdk 不再散调任何 gate。
+        let toolDecision: ToolDecision;
         try {
-          const pre = await onPreToolUse({
+          toolDecision = await this.piHarness().beforeToolCall({
             tool: toolCall.name,
             args: toolCall.args || {},
+            ctx: this.harnessCtx(),
             permissionMode: this.currentPermissionMode,
           });
-          if (!pre.allowed) {
-            const deniedResult: ToolResult = {
-              success: false,
-              error: `PreToolUse 拒绝: ${pre.reason || '未通过安全校验'}`,
-            };
-            this.messageHistory.push({ role: 'tool', content: JSON.stringify(deniedResult), toolResult: deniedResult });
-            this.logToHarness(toolCall.name, toolCall.args, deniedResult);
-            if (onStream) {
-              onStream({ type: 'error', content: `🛡️ PreToolUse 拒绝 ${toolCall.name}: ${pre.reason || '安全校验失败'}`, tool: toolCall.name });
-              onStream({ type: 'step_error', content: `PreToolUse 拒绝 ${toolCall.name}`, tool: toolCall.name, error: pre.reason || '安全校验失败' });
-            }
-            console.warn(`[PiAgent] PreToolUse denied ${toolCall.name}: ${pre.reason}`);
-            // 拒绝也算错误, 让错误恢复机制触发
-            consecutiveErrors++;
-            totalErrors++;
-            if (toolCall.name === lastFailedTool) { lastFailedToolCount++; }
-            else { lastFailedTool = toolCall.name; lastFailedToolCount = 1; }
-            if (lastFailedToolCount >= MAX_SAME_TOOL_FAILURES) {
-              this.messageHistory.push({ role: 'system', content: `[注意] 工具 ${toolCall.name} 被系统拒绝 (连续 ${MAX_SAME_TOOL_FAILURES} 次). 请不要再次尝试, 直接用已有信息回答用户, 末尾加 <final gen>.` });
-              lastFailedTool = ''; lastFailedToolCount = 0; consecutiveErrors = 0;
-            } else if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-              this.messageHistory.push({ role: 'system', content: `[注意] 连续 ${consecutiveErrors} 次工具调用被系统拒绝. 请换其他工具或直接回答用户, 末尾加 <final gen>.` });
-              consecutiveErrors = 0;
-            }
-            return;
-          }
         } catch (err) {
-          console.warn('[PiAgent] onPreToolUse failed (non-fatal, allowing):', err);
+          // 门面自身抛错 = 核心约束失效 → fail-closed (不执行工具, 也不静默放行)
+          toolDecision = {
+            allow: false,
+            source: 'harness-error',
+            kind: 'core_constraint',
+            reason: `Harness 门面异常: ${String((err as Error)?.message || err).slice(0, 150)}`,
+          };
         }
 
-        // React Harness: 8-gate + builtin-guards 校验 (串接双层)
-        try {
-          const pre = await this.reactHarness.preToolCall(toolCall.name, toolCall.args || {}, this.currentChannelId || undefined);
-          if (!pre.allowed) {
-            const deniedResult: ToolResult = { success: false, error: `Harness gate 拒绝 (${pre.details.rejectedBy}): ${pre.reason || '未通过安全校验'}` };
-            this.messageHistory.push({ role: 'tool', content: JSON.stringify(deniedResult), toolResult: deniedResult });
-            this.logToHarness(toolCall.name, toolCall.args, deniedResult);
-            if (onStream) {
-              onStream({ type: 'error', content: `🛡️ Harness ${pre.details.rejectedBy} 拒绝 ${toolCall.name}: ${pre.reason || '安全校验失败'}`, tool: toolCall.name });
-              onStream({ type: 'step_error', content: `Harness 拒绝 ${toolCall.name}`, tool: toolCall.name, error: pre.reason || '安全校验失败' });
-            }
-            console.warn(`[PiAgent] Harness denied ${toolCall.name} (${pre.details.rejectedBy}): ${pre.reason}`);
-            consecutiveErrors++; totalErrors++;
-            if (toolCall.name === lastFailedTool) { lastFailedToolCount++; }
-            else { lastFailedTool = toolCall.name; lastFailedToolCount = 1; }
-            if (lastFailedToolCount >= MAX_SAME_TOOL_FAILURES) {
-              this.messageHistory.push({ role: 'system', content: `[注意] 工具 ${toolCall.name} 被 Harness 拒绝 (连续 ${MAX_SAME_TOOL_FAILURES} 次). 请不要再次尝试, 末尾加 <final gen>.` });
-              lastFailedTool = ''; lastFailedToolCount = 0; consecutiveErrors = 0;
-            } else if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-              this.messageHistory.push({ role: 'system', content: `[注意] 连续 ${consecutiveErrors} 次工具调用被 Harness 拒绝. 请换其他工具或直接回答.` });
-              consecutiveErrors = 0;
-            }
+        if (!toolDecision.allow) {
+          const src = toolDecision.source || 'unknown';
+          if (src === 'deny-pipeline') {
+            // 旧 deny-pipeline 分支: 不计连续失败计数, 文案 "拒绝: [source] reason"
+            consecutiveErrors++;
+            totalErrors++;
+            const denyResultMsg: ToolResult = { success: false, error: `拒绝: [${toolDecision.rejectedBy || 'deny-pipeline'}] ${toolDecision.reason}` };
+            this.messageHistory.push({ role: 'tool', content: JSON.stringify(denyResultMsg), toolResult: denyResultMsg });
+            this.logToHarness(toolCall.name, toolCall.args, denyResultMsg);
             return;
           }
-        } catch (err) {
-          console.warn('[PiAgent] reactHarness.preToolCall failed (non-fatal, allowing):', err);
+
+          const isGateDeny = src === 'react-harness';
+          const isHarnessError = src === 'harness-error';
+          const deniedResult: ToolResult = {
+            success: false,
+            error: isGateDeny
+              ? `Harness gate 拒绝 (${toolDecision.rejectedBy}): ${toolDecision.reason || '未通过安全校验'}`
+              : `PreToolUse 拒绝: ${toolDecision.reason || '未通过安全校验'}`,
+          };
+          this.messageHistory.push({ role: 'tool', content: JSON.stringify(deniedResult), toolResult: deniedResult });
+          this.logToHarness(toolCall.name, toolCall.args, deniedResult);
+          if (onStream) {
+            const gateName = isGateDeny ? `Harness ${toolDecision.rejectedBy}` : (isHarnessError ? '核心约束层' : 'PreToolUse');
+            onStream({ type: 'error', content: `🛡️ ${gateName} 拒绝 ${toolCall.name}: ${toolDecision.reason || '安全校验失败'}`, tool: toolCall.name });
+            onStream({ type: 'step_error', content: `${gateName} 拒绝 ${toolCall.name}`, tool: toolCall.name, error: toolDecision.reason || '安全校验失败' });
+          }
+          console.warn(`[PiAgent] 工具被拒 ${toolCall.name} (${src}${toolDecision.rejectedBy ? ':' + toolDecision.rejectedBy : ''}): ${toolDecision.reason}`);
+          consecutiveErrors++;
+          totalErrors++;
+          if (toolCall.name === lastFailedTool) { lastFailedToolCount++; }
+          else { lastFailedTool = toolCall.name; lastFailedToolCount = 1; }
+          // 达到同一工具连续失败上限 / 连续错误上限时的引导语 (按拒绝来源保持原有文案)
+          const systemMaxMsg = isGateDeny
+            ? `[注意] 工具 ${toolCall.name} 被 Harness 拒绝 (连续 ${MAX_SAME_TOOL_FAILURES} 次). 请不要再次尝试, 末尾加 <final gen>.`
+            : isHarnessError
+              ? `[注意] 工具 ${toolCall.name} 的约束校验层失效, 已按 fail-closed 阻止 (连续 ${MAX_SAME_TOOL_FAILURES} 次). 请换其他工具或直接回答用户, 末尾加 <final gen>.`
+              : `[注意] 工具 ${toolCall.name} 被系统拒绝 (连续 ${MAX_SAME_TOOL_FAILURES} 次). 请不要再次尝试, 直接用已有信息回答用户, 末尾加 <final gen>.`;
+          const systemConsecMsg = isGateDeny
+            ? `[注意] 连续 ${consecutiveErrors} 次工具调用被 Harness 拒绝. 请换其他工具或直接回答.`
+            : isHarnessError
+              ? `[注意] 连续 ${consecutiveErrors} 次工具调用因约束层失效被阻止. 请换其他工具或直接回答用户, 末尾加 <final gen>.`
+              : `[注意] 连续 ${consecutiveErrors} 次工具调用被系统拒绝. 请换其他工具或直接回答用户, 末尾加 <final gen>.`;
+          if (lastFailedToolCount >= MAX_SAME_TOOL_FAILURES) {
+            this.messageHistory.push({ role: 'system', content: systemMaxMsg });
+            lastFailedTool = ''; lastFailedToolCount = 0; consecutiveErrors = 0;
+          } else if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+            this.messageHistory.push({ role: 'system', content: systemConsecMsg });
+            consecutiveErrors = 0;
+          }
+          return;
+        }
+
+        if (toolDecision.systemAddition) {
+          this.contextHintAddition += '\n' + toolDecision.systemAddition;
         }
 
         try {
           const toolStart = Date.now();
-          let result = await tool.execute(toolCall.args);
+          // 2026-09-16 (M2): 恢复重放守卫 —— 中断前**已成功执行过的非幂等动作**恢复后不再重做,
+          //   直接复用当时的结果 (避免重复副作用: 重复写文件/重复提交/重复付款)。
+          let replaySkip: string | null = null;
+          if (this.resumeRunId && this.resumePlan) {
+            const d = argsDigestOf(toolCall.args);
+            const hit = this.resumePlan.replayGuards.find((g) => g.tool === toolCall.name && (!g.argsDigest || !d || g.argsDigest === d));
+            if (hit) replaySkip = hit.summary;
+          }
+          let result = replaySkip
+            ? { success: true, output: `[恢复保护] ${toolCall.name} 在中断前已成功执行过, 本次不重复执行 (避免重复副作用)。当时结果: ${replaySkip}`, _replaySkipped: true } as ToolResult
+            : await tool.execute(toolCall.args);
           const toolDurationMs = Date.now() - toolStart;
+          if (replaySkip) {
+            console.log(`[PiAgent] 恢复重放守卫: 跳过已完成的非幂等工具 ${toolCall.name}`);
+            onStream?.({ type: 'status', content: `🛡️ 恢复保护: ${toolCall.name} 此前已成功执行, 本次不重复执行`, tool: toolCall.name });
+          }
           console.log(`[PiAgent] 工具 ${toolCall.name} 执行完成: success=${result.success} (${toolDurationMs}ms)`);
+
+          // 2026-09-16 (M3): 失败接线 —— 分类 + recovery 留痕 + 熔断 / 外部等待
+          if (!result.success && this.currentRunId && !replaySkip) {
+            await this.wireToolFailure(toolCall.name, String(result.error || ''), toolCall.args);
+          } else if (result.success && this.currentRunId && this.awaitingExternal) {
+            // 外部回话了: awaiting_external → running (不是"恢复完成", 只是等待结束)
+            this.awaitingExternal = false;
+            await this.safeSetRunStatus(this.currentRunId, 'running');
+          }
 
           // 2026-09-16: 持久化 run harness — 每步工具调用立即落盘 (崩在这里也能看到做到哪步)
           if (this.currentRunId) {
@@ -1798,27 +2053,32 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
                 error: result.error ? String(result.error) : undefined,
               });
             } catch (err) {
-              console.warn('[PiAgent] run-store recordStep failed (non-fatal):', err);
+              // 核心写失败 → 本轮工具批跑完即停 (循环顶部硬闸), 不再 warn 后继续
+              runPersistenceFailure = `工具步骤写盘失败 (${toolCall.name}): ${String((err as Error)?.message || err).slice(0, 200)}`;
+              this.runPersistenceBlocked = true;
+              console.error('[PiAgent] run-store recordStep 失败 (核心持久化):', runPersistenceFailure);
+              onStream?.({ type: 'error', content: `⛔ ${runPersistenceFailure} — 本轮结束后停止`, tool: 'harness' });
             }
           }
 
           try { await onPostToolUse({ tool: toolCall.name, args: toolCall.args || {}, result: { success: result.success, output: result.output?.substring(0, 500), error: result.error }, durationMs: toolDurationMs }); }
           catch (postErr) { console.warn('[PiAgent] onPostToolUse failed (non-fatal):', postErr); }
 
-          const routeHint = this.reactHarness.getLastRouteHint();
-          if (routeHint && routeHint.systemAddition) {
-            this.messageHistory.push({ role: 'system', content: `[Harness Router Hint: ${routeHint.reason}]\n${routeHint.systemAddition}` });
-            this.reactHarness.clearRouteHint();
+          // 2026-09-16 (Milestone 1-B): 工具调用后的唯一入口 (router hint + 输出 gate 一起判定)
+          const after = await this.piHarness().afterToolCall({
+            tool: toolCall.name,
+            output: String(result.output || ''),
+            ctx: this.harnessCtx(),
+            ok: !!result.success,
+          });
+          if (after.routeHint?.systemAddition) {
+            this.messageHistory.push({ role: 'system', content: `[Harness Router Hint: ${after.routeHint.reason}]\n${after.routeHint.systemAddition}` });
           }
-
-          try {
-            const post = await this.reactHarness.postToolCall(toolCall.name, String(result.output || ''), this.currentChannelId || undefined);
-            if (!post.allowed) {
-              if (onStream) { onStream({ type: 'error', content: `🛡️ Harness output 拒绝 ${toolCall.name}: ${post.reason || '输出含敏感信息'}`, tool: toolCall.name }); }
-              console.warn(`[PiAgent] Harness output denied ${toolCall.name}: ${post.reason}`);
-              result = { ...result, output: `[harness output gate: 输出含敏感内容, 已屏蔽. 原因: ${post.reason || 'unknown'}]`, _harnessDenied: true } as typeof result;
-            }
-          } catch (err) { console.warn('[PiAgent] reactHarness.postToolCall failed (non-fatal, allowing):', err); }
+          if (after.outputBlocked) {
+            if (onStream) { onStream({ type: 'error', content: `🛡️ Harness output 拒绝 ${toolCall.name}: ${after.outputBlocked.reason}`, tool: toolCall.name }); }
+            console.warn(`[PiAgent] Harness output denied ${toolCall.name}: ${after.outputBlocked.reason}`);
+            result = { ...result, output: `[harness output gate: 输出含敏感内容, 已屏蔽. 原因: ${after.outputBlocked.reason}]`, _harnessDenied: true } as typeof result;
+          }
 
           this.messageHistory.push({ role: 'tool', content: JSON.stringify(result), toolResult: result, toolCallId: (toolCall as any).id || `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}` });
           this.logToHarness(toolCall.name, toolCall.args, result);
@@ -1969,13 +2229,16 @@ lastQualityScore = this.estimateResponseQuality(reply);
           // 2026-08-08: final 前目标对齐 review — 不潦草收尾 (见 loop-review.ts)
           //   LLM 想 <final gen> 时, 先跑 1-2 次「目标对齐 + 需求深挖」review;
           //   达成用户需求才放行真正结束. 达上限或无需深挖则以用户需求为准结束.
-          const reviewDecision = decideAfterReview({
+          // 2026-09-16 (Milestone 1-B): 目标审查走唯一门面 (loop-review 是 Harness 的一个环节)
+          const reviewDecision = this.piHarness().reviewFinal({
             reviewsDone: loopReviewCount,
             // 2026-08-10: 传用户原始输入 (不是派生 intentHint) — LLM 对照原文自查完成度,
             //   未完成 → 自动继续调工具 (自动触发后续步骤)
             userIntent: this.currentUserInput,
             completedTools: Array.from(loopReviewCompletedTools),
             actionLog: loopActionLog,
+            runId: this.currentRunId || undefined,
+            goalId: this.currentGoalId || undefined,
           }, DEFAULT_MAX_REVIEWS);
           if (reviewDecision.kind === 'continue-review') {
             loopReviewCount++;
@@ -2043,30 +2306,79 @@ lastQualityScore = this.estimateResponseQuality(reply);
     this.messageHistory.push({ role: 'assistant', content: finalResponse });
 
     // React Harness: 循环结束
-    try {
-      await this.reactHarness.onSessionEnd();
-    } catch (err) {
-      console.warn('[PiAgent] reactHarness.onSessionEnd failed (non-fatal):', err);
-    }
+    // 2026-09-16 (Milestone 1-B): 会话收尾走唯一门面
+    await this.piHarness().sessionEnd(this.harnessCtx());
 
     // 2026-09-16: 收尾落盘 — done / failed / aborted / needs_human 如实写回 (不留幽灵 running)
-    if (this.currentRunId) {
+    if (this.currentRunId && !runExternallyPaused && !runExternallyAborted) {
       try {
-        // 协议里的错误分类: 鉴权类 (401/403) 不重试, 直接交人 (needs_human), 不算"失败重试"
-        const { classifyError } = await import('./run-store.js');
-        const errText = runStopReason || aiFailureReason || '';
-        const cls = errText ? classifyError(errText) : 'unknown';
-        const status: 'done' | 'failed' | 'aborted' | 'needs_human' = runStopReason
-          ? 'aborted'
-          : (aiFailed ? (cls === 'auth' ? 'needs_human' : 'failed') : 'done');
+        // 2026-09-16 (M4): 完成门 —— "模型说完成"不等于"系统确认完成"。
+        //   证据 = 成功步骤的事实摘要; 末尾还有失败步骤没被后续成功覆盖 → 不许 done。
+        const recBefore = await readRun(this.currentRunId).catch(() => null);
+        const steps = recBefore?.steps || [];
+        const evidence = steps.filter((s) => s.ok).map((s) => `${s.tool}: ${(s.summary || '').slice(0, 120)}`).slice(-10);
+        const lastStep = steps[steps.length - 1];
+        const trailingFailure = !!lastStep && !lastStep.ok;
+        /** 有工具步骤却一条成功证据都没有 → 不算完成 (证据门槛, 不是文案) */
+        const noEvidence = steps.length > 0 && evidence.length === 0;
+
+        const errText = runPersistenceFailure || this.breakerReason || runNeedsHuman || runStopReason || aiFailureReason || '';
+        const cls = errText ? classifyRunError(errText) : 'unknown';
+        // 持久化失败 / 熔断 / 鉴权 → needs_human; 预算/中止 → aborted; 末尾仍失败或无证据 → failed (不许 done)
+        const status: 'done' | 'failed' | 'aborted' | 'needs_human' = runPersistenceFailure
+          ? 'needs_human'
+          : (this.breakerReason || runNeedsHuman)
+            ? 'needs_human'
+            : runStopReason
+              ? 'aborted'
+              : aiFailed
+                ? (cls === 'auth' ? 'needs_human' : 'failed')
+                : (trailingFailure || noEvidence)
+                  ? 'failed'
+                  : 'done';
         await finishRun(this.currentRunId, {
           status,
           summary: finalResponse ? String(finalResponse).slice(0, 400) : undefined,
-          error: errText || undefined,
+          error: errText
+            || (trailingFailure ? `末尾步骤失败 (${lastStep.tool}): ${(lastStep.error || '').slice(0, 150)}` : undefined)
+            || (noEvidence ? '有工具步骤但没有任何成功证据: 不许判 done' : undefined),
+          evidence,
         });
       } catch (err) {
-        console.warn('[PiAgent] run-store finishRun failed (non-fatal):', err);
+        // 终态也写不下去: 这是最坏情况 —— 除了留痕, 没有别的自愈手段, 所以必须显眼
+        const message = `收尾落盘失败 (状态无法写回, 记录会停在 running): ${String((err as Error)?.message || err).slice(0, 200)}`;
+        console.error('[PiAgent] run-store finishRun 失败 (核心持久化):', message);
+        await recordDegradation({ kind: 'core', op: 'pi-sdk.finishRun', runId: this.currentRunId, message }).catch(() => {});
+        onStream?.({ type: 'error', content: `⚠️ ${message}`, tool: 'harness' });
       }
+
+      // 2026-09-16 (M4): Goal 侧完成门 —— Run 结束 ≠ Goal 完成; 只有判据全满足 + 有证据 + 无未解决项才算
+      if (this.currentGoalId) {
+        try {
+          const full = await readRun(this.currentRunId).catch(() => null);
+          const ev = (full?.evidence || []).slice(-10);
+          if (ev.length) await addEvidence(this.currentGoalId, ev);
+          const goal = await readGoal(this.currentGoalId);
+          if (goal) {
+            const verdict = evaluateGoalCompletion(goal);
+            if (verdict.complete) {
+              const done = await completeGoalIfEligible(this.currentGoalId);
+              onStream?.({ type: 'status', content: `🎯 目标已达成: ${done.reason} (goal=${this.currentGoalId})`, tool: 'harness' });
+            } else {
+              // 不静默: 未达成的目标留在 active, 未解决项写清楚 (下次 prompt 会继续这个 Goal)
+              const items = verdict.missing.length ? verdict.missing : [`run=${this.currentRunId} 结束但目标未达成: ${verdict.reason}`];
+              await setUnresolved(this.currentGoalId, items);
+              onStream?.({ type: 'status', content: `🎯 目标仍在进行 (未判完成): ${verdict.reason}`, tool: 'harness' });
+            }
+          }
+        } catch (err) {
+          await recordDegradation({ kind: 'observational', op: 'pi-sdk.goalCompletion', runId: this.currentRunId, message: String((err as Error)?.message || err).slice(0, 160) }).catch(() => {});
+        }
+      }
+      this.currentRunId = '';
+    } else if (this.currentRunId) {
+      // 外部暂停/中止: 状态是人定的, 不覆盖 (paused 等 /resume; aborted 是终态)
+      onStream?.({ type: 'status', content: `⏹️ 运行状态保持为 ${runExternallyPaused ? 'paused' : 'aborted'} (由外部控制面决定)`, tool: 'harness' });
       this.currentRunId = '';
     }
 

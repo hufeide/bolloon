@@ -39,12 +39,15 @@
   }
 
   var clicked = false;
+  var gateClicked = false;
   var t0 = Date.now();
   var iv = setInterval(function () {
     try {
       if (!window.BolloonCore) { if (Date.now() - t0 > 60000) { overlay('timeout-core', '内核没就绪'); clearInterval(iv); } return; }
       var gate = document.getElementById('privacy-agree');
-      if (gate) { gate.click(); overlay('phase=consent', '已过首启同意门…'); return; }
+      // 只在第一次处理同意门: 点过之后元素可能仍留在 DOM (只是隐藏), 不认这一点会死循环在 consent
+      var gateVisible = !!gate && !gateClicked && (gate.offsetParent !== null || !gate.hidden);
+      if (gateVisible) { gate.click(); gateClicked = true; overlay('phase=consent', '已过首启同意门…'); return; }
       if (!clicked) {
         if (joinItemVisible()) {
           localStorage.setItem('bolloon_desktop_base_url', DESKTOP);

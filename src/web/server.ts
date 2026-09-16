@@ -2926,6 +2926,102 @@ ${goalDesc}
     }
   });
 
+  // 2026-09-16 (M5): 单个 run + 停止原因/checkpoint/最近步骤/recovery/harness 事件 (两端同一份事实)
+  app.get('/api/runs/:runId', async (req, res) => {
+    try {
+      const { readRun } = await import('../agents/run-store.js');
+      const run = await readRun(String(req.params.runId));
+      if (!run) { res.status(404).json({ error: `run 不存在: ${req.params.runId}` }); return; }
+      const goal = run.goalId ? await (await import('../agents/goal-store.js')).readGoal(run.goalId) : null;
+      res.json({ run, goal, checkpoint: run.checkpoint, steps: run.steps, recovery: run.recovery, harness: run.harness || [] });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  // 2026-09-16 (M5): 继续 interrupted/stalled/paused/needs_human/awaiting_external 的运行 —— 真从 checkpoint 继续
+  app.post('/api/runs/:runId/resume', async (req, res) => {
+    const runId = String(req.params.runId);
+    try {
+      const { readRun, RESUMABLE_STATUSES } = await import('../agents/run-store.js');
+      const run = await readRun(runId);
+      if (!run) { res.status(404).json({ error: `run 不存在: ${runId}` }); return; }
+      // 先做只读校验: 不可恢复的状态明确拒绝 (不假装"已开始"), 避免前端以为在跑
+      if (!RESUMABLE_STATUSES.includes(run.status)) {
+        res.status(409).json({ error: `状态 ${run.status} 不可恢复 (可恢复: ${RESUMABLE_STATUSES.join('/')})` });
+        return;
+      }
+      if (!run.channelId) { res.status(400).json({ error: '该 run 没有 channelId, 无法在 web 端恢复 (请在 CLI 用 /resume)' }); return; }
+      const agent: any = await getAgentForChannel(run.channelId);
+      if (!agent?.resumeRun) { res.status(409).json({ error: '该 channel 的 agent 不支持 resumeRun' }); return; }
+      // 异步执行: resume 可能跑几分钟; 状态从 /api/runs/:runId 读 (recovering → running → done/failed)
+      void agent.resumeRun(runId).then((r: any) => {
+        if (!r?.ok) console.warn(`[runs] resume ${runId} 失败:`, r?.reason);
+      }).catch((err: any) => console.warn(`[runs] resume ${runId} 异常:`, (err as Error)?.message));
+      res.json({ ok: true, accepted: true, runId, note: '已开始恢复; 状态请读 GET /api/runs/:runId' });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  // 2026-09-16 (M5): 人工批准 —— needs_human 的运行经人确认后继续 (= 带批准的 resume)
+  app.post('/api/runs/:runId/approve', async (req, res) => {
+    const runId = String(req.params.runId);
+    try {
+      const { readRun, recordRecovery } = await import('../agents/run-store.js');
+      const run = await readRun(runId);
+      if (!run) { res.status(404).json({ error: `run 不存在: ${runId}` }); return; }
+      if (run.status !== 'needs_human') { res.status(409).json({ error: `只有 needs_human 的运行需要批准 (当前 ${run.status})` }); return; }
+      await recordRecovery(runId, { errorClass: (run.errorClass as any) || 'unknown', message: '人工批准后继续', action: 'resume' });
+      if (!run.channelId) { res.status(400).json({ error: '该 run 没有 channelId, 请在 CLI 用 /approve' }); return; }
+      const agent: any = await getAgentForChannel(run.channelId, run.channelId, run.agentId, {});
+      if (!agent?.resumeRun) { res.status(409).json({ error: '该 channel 的 agent 不支持 resumeRun' }); return; }
+      void agent.resumeRun(runId).catch((err: any) => console.warn(`[runs] approve ${runId} 异常:`, (err as Error)?.message));
+      res.json({ ok: true, accepted: true, runId, approved: true });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  // 2026-09-16 (M5): 暂停 / 中止 —— 只改 run 状态; 运行中的 agent 会在下一次循环检查时如实停下
+  //   (Express 5 的 path-to-regexp 不再支持 `:action(a|b)` 内联正则, 所以两条写开)
+  for (const [suffix, to] of [['pause', 'paused'], ['abort', 'aborted']] as const) {
+    app.post(`/api/runs/:runId/${suffix}`, async (req, res) => {
+      const runId = String(req.params.runId);
+      try {
+        const { setRunStatus } = await import('../agents/run-store.js');
+        const r = await setRunStatus(runId, to as any, { error: `外部请求 (${suffix})` });
+        if (!r.ok) { res.status(409).json({ error: r.reason || '状态迁移被拒绝' }); return; }
+        res.json({ ok: true, runId, status: to, note: '运行中的 agent 会在下一轮循环检查时停下 (轮内不打断)' });
+      } catch (err) {
+        res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+      }
+    });
+  }
+
+  // 2026-09-16 (M2): 目标 (Goal) —— 目标事实来源; runId → goalId → objective/successCriteria 反查链
+  app.get('/api/goals', async (req, res) => {
+    try {
+      const { listGoals, formatGoalLine } = await import('../agents/goal-store.js');
+      const status = String((req.query as any)?.status || '').trim();
+      const goals = await listGoals({ status: status ? (status as any) : undefined, limit: Number((req.query as any)?.limit || 30) });
+      res.json({ count: goals.length, goals, lines: goals.map(formatGoalLine) });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  app.get('/api/goals/:goalId', async (req, res) => {
+    try {
+      const { readGoal, evaluateGoalCompletion } = await import('../agents/goal-store.js');
+      const goal = await readGoal(String(req.params.goalId));
+      if (!goal) { res.status(404).json({ error: `goal 不存在: ${req.params.goalId}` }); return; }
+      res.json({ goal, completion: evaluateGoalCompletion(goal) });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
   // 2026-08-13 (Phase E1): Agent 服务 Registry — 发现层 (OrbitDB 去中心化 + 本地 fallback)
   app.get('/api/registry', async (_req, res) => {
     try {
