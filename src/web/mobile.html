@@ -43,7 +43,7 @@
   </header>
 
   <!-- 主页面: 双频滑动卡片 -->
-  <main class="page-container" id="page-main" data-tab="main">
+  <main class="page-container" id="page-main" data-tab="main" hidden>
     <!-- 水平滑动卡片轨道 -->
     <div class="card-carousel" id="card-carousel">
       <div class="card-track" id="card-track">
@@ -139,6 +139,26 @@
 <button class="create-session-btn" id="btn-create-session" hidden>＋ 创建新会话</button>
 
 <!-- 创建智能体: 底部滑入加载 sheet -->
+<!-- 2026-09-16: 首启隐私同意门 — 上架要求: 用户同意前不读取本机数据 / 不连网 / 不申请任何权限 -->
+<div class="sheet" id="privacy-gate" hidden>
+  <div class="sheet-inner">
+    <div class="sheet-title" id="privacy-gate-title">隐私政策与权限说明</div>
+    <div class="sheet-text" id="privacy-gate-body"></div>
+    <a class="privacy-link" href="#" id="privacy-gate-link">阅读完整隐私政策 ›</a>
+    <button class="sheet-choice" id="privacy-agree">同意并继续</button>
+    <button class="sheet-choice sheet-cancel" id="privacy-decline">不同意</button>
+  </div>
+</div>
+
+<!-- 2026-09-16: 应用内隐私政策 (全屏, 离线可用; 权威版 = bolloon.cn/privacy.html) -->
+<div class="chat-page" id="policy-page" hidden>
+  <div class="chat-topbar">
+    <button class="icon-btn" id="policy-back">←</button>
+    <div style="flex:1;font-weight:600">隐私政策</div>
+  </div>
+  <div class="policy-body" id="policy-body"></div>
+</div>
+
 <div class="sheet" id="create-sheet" hidden>
   <div class="sheet-inner">
     <div class="spinner"></div>

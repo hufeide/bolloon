@@ -12,6 +12,21 @@
  * 不在这里混数据与智能: 落库走 data 层, 执行走 agent 层.
  */
 
+// 2026-09-16: 隐私合规 (首启同意门 / 应用内政策摘要 / 注销清除本机数据) — 纯逻辑模块, 可单测
+import {
+  PRIVACY_CONSENT_KEY,
+  PRIVACY_CONSENT_VERSION,
+  PRIVACY_POLICY_URL,
+  PRIVACY_CONTACT,
+  PRIVACY_SUMMARY,
+  CONSENT_TEXT,
+  WIPE_NOTICE,
+  needsPrivacyConsent,
+  consentRecord,
+  filingDisplay,
+  wipeLocalData,
+} from './mobile-privacy.js';
+
 // ============ 事件总线 (替代 SSE) ============
 
 type BusHandler = (msg: any) => void;
@@ -875,6 +890,31 @@ export const core = {
   },
   // 深链解析 (bolloon://) — iOS 系统入口 (Siri / 快捷指令 / Spotlight) 走这条 (2026-09-11)
   handleDeepLink,
+
+  // 隐私合规 (2026-09-16): 首启同意门 · 应用内政策摘要 · 注销(清除本机数据)
+  //   为什么放在内核: UI 层(mobile.js)只管渲染, "是否还需要同意 / 注销删掉什么"必须能被单测锁住。
+  privacy: {
+    policyUrl: PRIVACY_POLICY_URL,
+    contact: PRIVACY_CONTACT,
+    consentKey: PRIVACY_CONSENT_KEY,
+    consentVersion: PRIVACY_CONSENT_VERSION,
+    summary: PRIVACY_SUMMARY,
+    consentText: CONSENT_TEXT,
+    wipeNotice: WIPE_NOTICE,
+    filingText: (): string => filingDisplay(),
+    /** 是否还需要征求同意 (读取失败按"需要"处理: 宁可多问一次, 也不在未同意时收集) */
+    needsConsent: (): boolean => {
+      let stored: string | null = null;
+      try { stored = localStorage.getItem(PRIVACY_CONSENT_KEY); } catch { stored = null; }
+      return needsPrivacyConsent(stored);
+    },
+    /** 记录用户已同意当前版本 (写失败不抛: 下次启动会再问一次) */
+    grant: (): boolean => {
+      try { localStorage.setItem(PRIVACY_CONSENT_KEY, consentRecord()); return true; } catch { return false; }
+    },
+    /** 注销: 删除本机全部数据 (身份 DID / 智能体 / 会话消息 / 支付 / 钱包 + localStorage 本机键) */
+    wipe: () => wipeLocalData(),
+  },
 };
 
 // 全局暴露给 mobile.js

@@ -1717,6 +1717,9 @@
         <div class="conv-item" id="settings-helia"><span class="list-icon">${ICONS.globe}</span><span>本机 IPFS 节点</span><span class="list-arrow">›</span></div>
         <div class="conv-item" id="settings-selfcard"><span class="list-icon">${ICONS.chip}</span><span id="selfcard-text">显示本机卡片: 开</span></div>
         <div class="conv-item" id="settings-did"><span class="list-icon">${ICONS.idcard}</span><span>DID</span></div>
+        <div class="conv-item" id="settings-privacy"><span class="list-icon">${ICONS.chip}</span><span>隐私政策与个人信息</span><span class="list-arrow">›</span></div>
+        <div class="conv-item" id="settings-wipe"><span class="list-icon">${ICONS.trash}</span><span style="flex:1;min-width:0"><span style="display:block">清除本机数据（注销）</span><span class="conv-preview" style="display:block">删除本机身份、智能体、会话与钱包</span></span><span class="list-arrow">›</span></div>
+        <div class="conv-item" id="settings-filing"><span class="list-icon">${ICONS.idcard}</span><span id="filing-text">APP 备案号：备案办理中</span></div>
       </div>`;
     document.body.appendChild(page);
     applyTheme(resolveThemePref(), false);
@@ -1757,6 +1760,20 @@
       });
     }
     $('#settings-desktop').addEventListener('click', openDesktopSync);
+    // 隐私政策 (双入口之一: 设置页; 另一个是首启同意门)
+    const privacyRow = $('#settings-privacy');
+    if (privacyRow) privacyRow.addEventListener('click', openPrivacyPolicy);
+    // 注销: 清除本机数据
+    const wipeRow = $('#settings-wipe');
+    if (wipeRow) wipeRow.addEventListener('click', () => { void wipeLocalDataFlow(); });
+    // 备案号展示 (未备案时如实显示"备案办理中", 不伪造编号)
+    const filingRow = $('#settings-filing');
+    if (filingRow) {
+      const ft = $('#filing-text');
+      const ptxt = privacyCore() && privacyCore().filingText ? privacyCore().filingText() : '';
+      if (ft && ptxt) ft.textContent = ptxt;
+      filingRow.addEventListener('click', () => { const pp = privacyCore(); alert((pp && pp.filingText ? pp.filingText() : 'APP 备案号：备案办理中') + '\n\n备案信息以工信部备案系统公示为准。'); });
+    }
     // 本机卡片显示开关 (移除后从这里恢复)
     const drawSelfCardToggle = () => {
       const on = (() => { try { return localStorage.getItem(SELF_CARD_HIDDEN_KEY) !== '1'; } catch { return true; } })();
@@ -2842,7 +2859,133 @@
     });
   }
 
+  // ============ 隐私合规 (2026-09-16): 同意门 / 政策页 / 注销 ============
+  //  上架要求: 首次启动必须先展示隐私政策; 用户同意前不得读取本机数据、不得连网、不得申请任何权限。
+  //  所以 init() 只做一件事 —— 决定"先弹门"还是"进应用"; 真正的初始化在 initApp()。
+
+  function privacyCore() {
+    return (window.BolloonCore && window.BolloonCore.privacy) || null;
+  }
+
+  function privacyNeedsConsent() {
+    const p = privacyCore();
+    if (!p || typeof p.needsConsent !== 'function') return true;   // 内核未就绪 → 按"需要同意"处理
+    try { return !!p.needsConsent(); } catch (e) { return true; }
+  }
+
+  function escHtml(v) {
+    return String(v == null ? '' : v)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  /** 政策摘要 HTML (要素来自内核常量, 单测锁了必填项) */
+  function privacySummaryHtml() {
+    const p = privacyCore();
+    const items = (p && p.summary) || [];
+    return items.map((it) => `<h3>${escHtml(it.title)}</h3><p>${escHtml(it.body)}</p>`).join('');
+  }
+
+  function showPrivacyGate() {
+    const p = privacyCore();
+    const t = (p && p.consentText) || {};
+    const gate = $('#privacy-gate');
+    if (!gate) return;
+    const titleEl = $('#privacy-gate-title'), bodyEl = $('#privacy-gate-body');
+    if (titleEl && t.title) titleEl.textContent = t.title;
+    if (bodyEl) bodyEl.textContent = t.intro || '使用前请先阅读并同意隐私政策。';
+    const linkEl = $('#privacy-gate-link');
+    if (linkEl && t.policyLink) linkEl.textContent = t.policyLink + ' ›';
+    const agreeEl = $('#privacy-agree'), declineEl = $('#privacy-decline');
+    if (agreeEl && t.agree) agreeEl.textContent = t.agree;
+    if (declineEl && t.decline) declineEl.textContent = t.decline;
+    if (linkEl) linkEl.onclick = (e) => { e.preventDefault(); openPrivacyPolicy(); };
+    if (agreeEl) agreeEl.onclick = () => {
+      const ok = p && typeof p.grant === 'function' ? p.grant() : false;
+      if (!ok) { /* 本机写不进去(隐私模式/满盘): 不假装同意, 下次启动会再问 */ }
+      hideSheet('#privacy-gate');
+      initApp();
+    };
+    if (declineEl) declineEl.onclick = () => showPrivacyDeclined();
+    gate.hidden = false;
+  }
+
+  /** 不同意 → 停在说明页: 不初始化功能、不收集任何东西, 但也不强制退出应用 */
+  function showPrivacyDeclined() {
+    const p = privacyCore();
+    const t = (p && p.consentText) || {};
+    const gate = $('#privacy-gate');
+    if (!gate) return;
+    const titleEl = $('#privacy-gate-title'), bodyEl = $('#privacy-gate-body');
+    if (titleEl) titleEl.textContent = t.declinedTitle || '未同意';
+    if (bodyEl) bodyEl.textContent = t.declinedBody || '未同意隐私政策时应用不会收集任何信息。';
+    const linkEl = $('#privacy-gate-link');
+    if (linkEl) { linkEl.textContent = (t.declinedReread || '重新阅读') + ' ›'; linkEl.onclick = (e) => { e.preventDefault(); showPrivacyGate(); }; }
+    const agreeEl = $('#privacy-agree'), declineEl = $('#privacy-decline');
+    if (agreeEl) { agreeEl.textContent = t.agree || '同意并继续'; agreeEl.onclick = () => { const ok = p && p.grant ? p.grant() : false; if (!ok) {} hideSheet('#privacy-gate'); initApp(); }; }
+    if (declineEl) {
+      declineEl.textContent = t.declinedExit || '退出应用';
+      declineEl.onclick = () => {
+        const cap = window.Capacitor;
+        if (cap && cap.Plugins && cap.Plugins.App && cap.Plugins.App.exitApp) { try { cap.Plugins.App.exitApp(); return; } catch (e) {} }
+        alert('请手动退出应用（返回键 / 上滑关闭）。未同意隐私政策期间应用不会收集任何信息。');
+      };
+    }
+    gate.hidden = false;
+  }
+
+  /** 应用内完整政策 (全屏, 离线可用)。权威版永远是 bolloon.cn/privacy.html (商店表单填的就是它) */
+  function openPrivacyPolicy() {
+    const p = privacyCore();
+    const page = $('#policy-page');
+    const bodyEl = $('#policy-body');
+    if (!page || !bodyEl) return;
+    const t = (p && p.consentText) || {};
+    const url = (p && p.policyUrl) || 'https://bolloon.cn/privacy.html';
+    const contact = (p && p.contact) || '';
+    const filing = p && typeof p.filingText === 'function' ? p.filingText() : '';
+    bodyEl.innerHTML = `
+      <p class="policy-meta">${escHtml(t.intro || '')}</p>
+      ${privacySummaryHtml()}
+      <h3>完整政策与备案信息</h3>
+      <p>在线完整版：<a href="${escHtml(url)}" target="_blank" rel="noopener">${escHtml(url)}</a></p>
+      <p>${escHtml(filing)}</p>
+      <p class="policy-meta">联系方式：${escHtml(contact)}（承诺 7 个工作日内答复）</p>
+      <p class="policy-meta">本页内容与在线版本一致；如两者不一致，以在线版本为准。</p>`;
+    const back = $('#policy-back');
+    if (back) back.onclick = () => { page.hidden = true; };
+    page.hidden = false;
+  }
+
+  /** 注销: 清除本机全部数据 (身份 DID / 智能体 / 会话消息 / 支付 / 钱包) */
+  async function wipeLocalDataFlow() {
+    if (!confirm('确定清除本机数据（注销）？\n\n将删除本机上的：身份标识（DID）、智能体、会话与消息、钱包账本。\n已写入公开区块链的交易记录无法删除。\n\n此操作不可撤销。')) return;
+    const p = privacyCore();
+    if (!p || typeof p.wipe !== 'function') { alert('清除失败：本机内核未就绪，请重启应用后重试。'); return; }
+    showToast('正在清除本机数据…');
+    try {
+      const r = await p.wipe();
+      const failed = (r && r.failed) || [];
+      const deleted = (r && r.deletedDatabases) || [];
+      const cleared = (r && r.clearedStorageKeys) || [];
+      if (failed.length) {
+        alert(`部分数据未能清除（可重试）：\n${failed.join('\n')}\n\n已清除 ${deleted.length} 个数据库 / ${cleared.length} 个本机键。`);
+      } else {
+        alert(`${p.wipeNotice || '已清除本机数据。'}\n\n（本次删除 ${deleted.length} 个数据库、${cleared.length} 个本机键）`);
+      }
+      location.reload();   // 回到首启状态 (同意记录保留, 不再重复弹门)
+    } catch (e) {
+      alert('清除失败：' + ((e && e.message) || e));
+    }
+  }
+
   function init() {
+    // 首启/政策版本变更 → 先弹同意门, 不做任何初始化 (不读本机数据 / 不连网 / 不申请权限)
+    if (privacyNeedsConsent()) { showPrivacyGate(); return; }
+    initApp();
+  }
+
+  function initApp() {
     bindMenu();
     applyTheme(resolveThemePref(), false);
     switchTab('main');

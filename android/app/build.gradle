@@ -30,6 +30,16 @@ android {
         versionName '0.4.24'
     }
 
+    // 2026-09-16: 渠道分化 —— 应用商店版必须摘掉「无障碍服务」与「Shizuku 提权通道」(商店审核红线),
+    //   官网直装版保持功能完整。两者 applicationId 相同 (com.hibs.bolloon), 商店版清单覆盖在
+    //   src/store/AndroidManifest.xml (用 tools:node="remove" 精确摘除, 不复制整份清单)。
+    //   出包: ./gradlew :app:assembleFullRelease (官网) / :app:assembleStoreRelease (商店)
+    flavorDimensions 'channel'
+    productFlavors {
+        full { dimension 'channel' }
+        store { dimension 'channel' }
+    }
+
     signingConfigs {
         release {
             if (hasReleaseSigning) {

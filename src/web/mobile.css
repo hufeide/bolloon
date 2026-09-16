@@ -688,3 +688,18 @@ body {
   color: var(--bg);
   font-weight: 600;
 }
+
+/* —— 隐私政策 (2026-09-16) —— */
+.privacy-link {
+  display: block; margin: 6px 0 2px; text-align: center;
+  color: var(--accent); font-size: 13px; text-decoration: none;
+}
+.privacy-link:active { opacity: .7; }
+.policy-body {
+  flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: 14px 16px calc(40px + env(safe-area-inset-bottom));
+}
+.policy-body h3 { font-size: 14px; font-weight: 600; color: var(--text); margin: 18px 0 6px; }
+.policy-body p { font-size: 13px; line-height: 1.75; color: var(--text-secondary); margin: 0 0 10px; }
+.policy-body a { color: var(--accent); word-break: break-all; }
+.policy-meta { font-size: 12px; color: var(--text-muted); }
