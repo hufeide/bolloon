@@ -540,3 +540,72 @@ npx vitest run src/test/supervisor-lease.test.ts   # 24/24
 - **外部事件的真实来源** (peer/delegate 回调) 未接: `notifyExternal` + API + CLI 已通, 但真 P2P 事件端到端未验。
 - **判据生成**: 新建 Goal 的 `successCriteria` 可能为空 → 完成门永远拒绝自动完成 (安全但不自动); 判据生成/更新属 2-F。
 - **Web 前端 Run/Goal 面板**仍缺 (API 已就绪)。
+
+## 15. 批次 2-C.1: Supervisor 宿主分离与重启自恢复 — 2026-09-16
+
+> 这一批解决的是"**长期执行依附于 web 进程**"这个断点: 执行器与启动宿主彻底分开。
+
+### 15.1 冻结的两个接口
+
+```
+Supervisor { scheduler · lease · reducer · wake }   ← 逻辑, 与宿主无关
+runnerResolver(req) → { ok, runner, kind, reason }  ← 每次执行**前**解析"谁来执行"
+                        ├── web     : 按 goal.channelId 找 web channel agent
+                        ├── standalone: 独立宿主按 channelId 建专用 agent session
+                        ├── injected/fake: 简单宿主/测试
+                        └── none    : 解析不出来 → 只诊断
+```
+
+**解析不出来时: 不执行、不建 Run、不写任何 Goal 状态** (返回 `status: 'unresolved'` + skipped 原因)。
+"没人能执行"既不是失败也不是完成 —— 这是宿主分离的安全底线。
+
+### 15.2 宿主 (`src/agents/supervisor-host.ts`)
+
+- **跨进程单 tick 互斥**: 复用 cron 的 tick 锁语义 (`~/.bolloon/supervisor/.tick.lock`, 不共用 cron 的文件),
+  拿不到锁 → 本轮**让路**(不阻塞不排队)并把原因写进宿主状态。
+- **宿主身份与心跳落盘** `~/.bolloon/supervisor.json`: owner / workerId / pid / host / startedAt /
+  lastTickAt / ticks / runnerKind / dryRun / lastSummary。**SIGKILL 后没有 `stoppedAt`** —— "上次没好好停"
+  本身就是可查的证据; 优雅停止才写 `stoppedAt` + `stopReason`。
+- **优雅停止**: 停 interval → 等当前 tick 收尾 (≤30s) → 落盘。web server 与 CLI 宿主都挂了 SIGINT/SIGTERM。
+- **启动即跑一轮** (不等一个 tick 间隔), 重启/接管时立刻推进。
+- **启动失败可观测**: web 启动 Supervisor 失败改为 `console.error` + SSE `supervisor.startup_failed` (不再静默降级)。
+
+### 15.3 宿主入口 (四种宿主共用同一 Supervisor)
+
+| 宿主 | 入口 |
+|---|---|
+| Web server | `createWebServer` 内 `runSupervisorHost({ supervisor, resolver: web })` |
+| 独立进程 | `bolloon --supervise` (常驻) / `--supervise-once` (跑一轮) / `--supervise-dry-run` (只诊断) |
+| CLI 会话 | `/supervise` (诊断) · `/supervise tick` (用当前会话 agent 跑一轮) |
+| 测试进程 | `runStandaloneSupervisorHost({ once: true })` |
+
+env: `BOLLOON_SUPERVISOR=0` 关闭 · `BOLLOON_SUPERVISOR_TICK_MS` · `BOLLOON_SUPERVISOR_LEASE_MS` ·
+`BOLLOON_SUPERVISE_AGENT=0` (独立宿主只诊断不执行) · `BOLLOON_SUPERVISE_CREATE_TIMEOUT_MS` (建 agent session 超时, 默认 20s)。
+
+### 15.4 验证 (真跑, `scripts/verify-supervisor-restart.ts`)
+
+真进程级, 不是同一个进程里自演:
+① 宿主身份/心跳落盘 + SIGKILL 后无 `stoppedAt` ② tick 锁被占 → 本轮让路且不执行任何 Goal
+③ **真 web server 子进程起 → 杀 → 再起 → Supervisor 自动重新启动 (workerId 换新)** ④ **真 SIGKILL → 真重启 → 新宿主自动恢复**
+(没人调 `/resume`、没页面、没用户输入; 同一 runId; 非幂等动作不重做; lease 归新宿主并归还) ⑤ 真 deepseek agent 跑到一半被 SIGKILL →
+新宿主自动恢复同一 runId ⑥ 解析不到执行器 → 只诊断, Goal 状态一个字节不改。
+
+单测: `src/test/supervisor-host.test.ts` (解析失败/抛错/成功三态 · tick 互斥 · 状态落盘 · 优雅停止 · once 模式 · 独立解析器的两种拒绝)。
+
+### 15.5 这一批**没有**做到的 (下一批的起点)
+
+- **重启自动恢复**这一条是 2-C.1 的核心验收, 已用确定性 runner 真跑通过; **真 LLM 版**的同一条链路
+  (真 agent 被杀 → 新宿主自动 resume 同一 runId) 仍在收敛: 独立宿主建 agent session 会因环境 (无真 channel 上下文/P2P 初始化)
+  超时 → 解析器现在**超时即 ok:false 只诊断**(不再挂死 tick), 但"真 LLM 重启续跑"还没拿到全绿证据 → 归 2-C.2。
+- `retry_wait` 到点唤醒的端到端验收 (与重启恢复同属 2-C.2)。
+- 真 P2P/delegate 事件唤醒 (`notifyExternal` + API + CLI 已通, 真事件源未接)。
+- Goal 级 skill 依赖 (2-G) 与 Web 长期执行面板。
+
+## 16. 技能从"prompt 临时加载的文本"升级为"可管理的执行依赖" (2-G, 起点)
+
+见 `src/agents/skills-manager.ts` (批次 2-G.1)。要点: `SKILL.md` 仍是内容真值, 管理元数据落
+`~/.bolloon/skills-registry.json`; **统一门面** `SkillsManager` (discover/inspect/install/import/enable/disable/
+validate/resolve/snapshot/health/export) 成为 CLI/Web/agent/Supervisor 的唯一入口; 每个技能一条记录:
+`skillId/name/version/contentHash/source/sourceRef/status/trust/compatibility/installedAt/updatedAt`。
+2-G.1 刻意**不改执行行为** —— enable/disable 只被记录与展示, 真正用它拦执行 (readiness gate) 与 Goal 级
+skill snapshot 属 2-G.2/2-G.4。

@@ -185,14 +185,34 @@ export interface GoalExecutionResult {
 /** 执行器由调用方注入 (Web 用 channel agent, CLI 用当前 agent, 测试用假的) —— 不提供默认实现, 避免暗中复制 agent loop */
 export type GoalRunner = (req: GoalExecutionRequest) => Promise<GoalExecutionResult>;
 
+// ── 宿主分离 (2-C.1): 执行器不再写死, 每次执行前由 resolver 解析 ──
+export type RunnerKind = 'web' | 'cli' | 'standalone' | 'injected' | 'fake' | 'none';
+
+export interface RunnerResolution {
+  ok: boolean;
+  runner?: GoalRunner;
+  kind: RunnerKind;
+  /** ok=false 时的人类可读原因 (进 skipped/诊断, 不静默) */
+  reason?: string;
+}
+
+/**
+ * 解析"这个 Goal 谁来执行"。可以是 web 的 channel agent / CLI 的会话 agent / 独立 agent / 测试假的;
+ * 解析不出来必须是 `{ok:false}` —— Supervisor 会**只诊断不执行, 且不写任何 Goal 状态**
+ * (绝不把"没人能执行"当成"执行失败"或"执行完成")。
+ */
+export type RunnerResolver = (req: GoalExecutionRequest) => Promise<RunnerResolution> | RunnerResolution;
+
 export interface SupervisorOptions {
   owner?: string;
   tickIntervalMs?: number;
   leaseTtlMs?: number;
   /** 每个 tick 最多推进几个 Goal (默认 1, 长期执行要克制) */
   maxPerTick?: number;
-  /** 缺省 undefined = 只诊断不执行 (dry-run), 绝不假装跑过 */
+  /** 固定执行器 (简单宿主/测试用) */
   runner?: GoalRunner;
+  /** 动态执行器解析 (生产宿主用: web / CLI / 独立进程 各自解析) */
+  resolver?: RunnerResolver;
   onEvent?: (e: { kind: string; goalId?: string; runId?: string; message: string }) => void;
   log?: (msg: string) => void;
 }
@@ -223,6 +243,7 @@ export class ExecutionSupervisor {
   private readonly leaseTtlMs: number;
   private readonly maxPerTick: number;
   private readonly runner?: GoalRunner;
+  private readonly resolver?: RunnerResolver;
   private readonly onEvent?: SupervisorOptions['onEvent'];
   private readonly logFn?: (msg: string) => void;
   private timer: NodeJS.Timeout | null = null;
@@ -237,9 +258,13 @@ export class ExecutionSupervisor {
     this.leaseTtlMs = opts.leaseTtlMs ?? 90_000;
     this.maxPerTick = opts.maxPerTick ?? 1;
     this.runner = opts.runner;
+    this.resolver = opts.resolver;
     this.onEvent = opts.onEvent;
     this.logFn = opts.log;
   }
+
+  /** 有固定执行器或解析器 → 可以真执行; 都没有 → 只诊断 (dry-run) */
+  get canExecute(): boolean { return !!(this.runner || this.resolver); }
 
   private log(msg: string): void {
     this.logFn?.(msg);
@@ -259,14 +284,15 @@ export class ExecutionSupervisor {
       leaseTtlMs: this.leaseTtlMs,
       maxPerTick: this.maxPerTick,
       ticks: this.tickCount,
-      dryRun: !this.runner,
+      dryRun: !this.canExecute,
+      hasResolver: !!this.resolver,
       lastReport: this.lastReport,
     };
   }
 
   start(): void {
     if (this.timer) return;
-    if (!this.runner) this.log('[supervisor] 未注入 runner → 只诊断不执行 (dry-run)');
+    if (!this.canExecute) this.log('[supervisor] 未注入 runner/resolver → 只诊断不执行 (dry-run)');
     this.timer = setInterval(() => { void this.tickOnce().catch((err) => this.log(`[supervisor] tick 失败: ${(err as Error)?.message}`)); }, this.tickIntervalMs);
     this.timer.unref?.();
     this.log(`[supervisor] 启动 owner=${this.owner} tick=${this.tickIntervalMs}ms leaseTtl=${this.leaseTtlMs}ms`);
@@ -358,9 +384,32 @@ export class ExecutionSupervisor {
         : RESUMABLE_STATUSES.includes(prevRun.status) ? 'resume'
           : 'continue_new_run';
 
-    if (!this.runner) {
+    if (!this.canExecute) {
       this.log(`[supervisor] (dry-run) 会执行 goal=${goal.goalId} kind=${kind} prevRun=${prevRunId || '-'}`);
       return { goalId: goal.goalId, runId: prevRunId, status: 'dry_run' };
+    }
+
+    // 执行器解析 (2-C.1): 解析不出来 → **只诊断, 不执行, 不写任何 Goal 状态**
+    let runner = this.runner;
+    if (!runner && this.resolver) {
+      let res: RunnerResolution;
+      try {
+        res = await this.resolver({ goal, kind, prevRunId, instruction, guards });
+      } catch (err) {
+        res = { ok: false, kind: 'none', reason: `resolver 抛错: ${String((err as Error)?.message || err).slice(0, 140)}` };
+      }
+      if (!res.ok || !res.runner) {
+        const why = res.reason || '解析不到执行器';
+        report.skipped.push({ goalId: goal.goalId, reason: `无执行器: ${why} (Goal 状态未改动)` });
+        this.emit({ kind: 'no_runner', goalId: goal.goalId, message: why });
+        this.log(`[supervisor] goal=${goal.goalId} 无执行器 → 只诊断, 不执行也不改状态: ${why}`);
+        return { goalId: goal.goalId, runId: prevRunId, status: 'unresolved', error: why };
+      }
+      runner = res.runner;
+    }
+    if (!runner) {
+      report.skipped.push({ goalId: goal.goalId, reason: '无执行器 (Goal 状态未改动)' });
+      return { goalId: goal.goalId, status: 'unresolved' };
     }
 
     // 执行期间持续续租: 续租失败 = 已被别人接管 → 记录 (不掩盖)
@@ -374,7 +423,7 @@ export class ExecutionSupervisor {
     let result: GoalExecutionResult;
     const t0 = Date.now();
     try {
-      result = await this.runner({ goal, kind, prevRunId, instruction, guards });
+      result = await runner({ goal, kind, prevRunId, instruction, guards });
     } catch (err) {
       result = { error: (err as Error)?.message || String(err) };
     } finally {

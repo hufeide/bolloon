@@ -1726,37 +1726,59 @@ export async function createWebServer(port: number = 3000, options: CreateWebSer
   if (process.env.BOLLOON_SUPERVISOR !== '0') {
     try {
       const { getSupervisor } = await import('../agents/execution-supervisor.js');
-      const sup = getSupervisor({
-        tickIntervalMs: Number(process.env.BOLLOON_SUPERVISOR_TICK_MS) || 30_000,
-        leaseTtlMs: Number(process.env.BOLLOON_SUPERVISOR_LEASE_MS) || 90_000,
-        maxPerTick: Number(process.env.BOLLOON_SUPERVISOR_MAX_PER_TICK) || 1,
-        log: (m: string) => console.log(m),
-        onEvent: (e: any) => { try { broadcast({ type: 'supervisor', ...e }); } catch { /* UI 广播失败不影响调度 */ } },
-        runner: async (req: any) => {
-          const goal = req.goal;
-          if (!goal?.channelId) {
-            return { status: 'blocked', error: 'Goal 没有 channelId: 无法在 web 进程内执行 (请在会话里继续, 或用 CLI /supervise)' };
-          }
-          const agent: any = await getAgentForChannel(goal.channelId, goal.agentId || '', undefined, undefined);
-          if (!agent) return { status: 'failed', error: 'agent 不可用' };
-          if (req.kind === 'resume' && req.prevRunId && typeof agent.resumeRun === 'function') {
-            const r = await agent.resumeRun(req.prevRunId);
-            return { runId: req.prevRunId, status: r?.ok ? 'done' : 'failed', error: r?.ok ? undefined : r?.reason };
+      const { runSupervisorHost } = await import('../agents/supervisor-host.js');
+      const tickMs = Number(process.env.BOLLOON_SUPERVISOR_TICK_MS) || 30_000;
+      const leaseMs = Number(process.env.BOLLOON_SUPERVISOR_LEASE_MS) || 90_000;
+      // 执行器**在每次执行前解析** (不写死): web 宿主按 Goal 的 channelId 找 channel agent。
+      // 解析不出来 → 只诊断不执行, 且不写任何 Goal 状态。
+      const resolver = async (req: any) => {
+        const goal = req.goal;
+        if (!goal?.channelId) {
+          return { ok: false, kind: 'none' as const, reason: 'Goal 没有 channelId: 无法在 web 进程内解析执行器' };
+        }
+        const agent: any = await getAgentForChannel(goal.channelId, goal.agentId || '', undefined, undefined);
+        if (!agent) return { ok: false, kind: 'none' as const, reason: 'channel agent 不可用' };
+        const runner = async (r: any) => {
+          if (r.kind === 'resume' && r.prevRunId && typeof agent.resumeRun === 'function') {
+            const res = await agent.resumeRun(r.prevRunId);
+            return { runId: r.prevRunId, status: res?.ok ? 'done' : 'failed', error: res?.ok ? undefined : res?.reason };
           }
           // 跨预算继续: 新 Run 必须挂在同一个 Goal 下 (setGoalId), 并带上上一个 Run 的非幂等守卫
           agent.setGoalId?.(goal.goalId);
-          agent.setContinuationGuards?.(req.guards || []);
-          const reply = await agent.prompt(req.instruction);
+          agent.setContinuationGuards?.(r.guards || []);
+          const reply = await agent.prompt(r.instruction);
           // 注意: prompt 收尾会清空 currentRunId → 必须读 lastRunId (否则会拿上一条 run 做决策)
           const runId = agent.getLastRunId?.() || agent.getRunId?.();
           return { runId, status: 'done', reply: typeof reply === 'string' ? reply.slice(0, 500) : undefined };
-        },
+        };
+        return { ok: true, runner, kind: 'web' as const };
+      };
+      const sup = getSupervisor({
+        tickIntervalMs: tickMs,
+        leaseTtlMs: leaseMs,
+        maxPerTick: Number(process.env.BOLLOON_SUPERVISOR_MAX_PER_TICK) || 1,
+        log: (m: string) => console.log(m),
+        onEvent: (e: any) => { try { broadcast({ type: 'supervisor', ...e }); } catch { /* UI 广播失败不影响调度 */ } },
+        resolver: resolver as any,
       });
-      sup.start();
-      const st = sup.status();
-      console.log(`[supervisor] 长期执行层已启动 (owner=${st.owner}, tick=${st.tickIntervalMs}ms, lease=${st.leaseTtlMs}ms${st.dryRun ? ', DRY-RUN' : ''})`);
+      // 宿主层: 跨进程单 tick 互斥 + 宿主身份/心跳落盘 + 优雅停止
+      const host = await runSupervisorHost({
+        supervisor: sup as any,
+        tickIntervalMs: tickMs,
+        leaseTtlMs: leaseMs,
+        runnerKind: 'web',
+        log: (m: string) => console.log(m),
+      });
+      (global as any).__bolloonSupervisorHost = host;
+      console.log(`[supervisor] 长期执行层已启动 (owner=${host.state.owner}, worker=${host.state.workerId}, tick=${tickMs}ms, lease=${leaseMs}ms)`);
+      const stopHost = (sig: string) => { void host.stop(`signal:${sig}`).finally(() => process.exit(0)); };
+      process.once('SIGINT', () => stopHost('SIGINT'));
+      process.once('SIGTERM', () => stopHost('SIGTERM'));
     } catch (err) {
-      console.warn('[supervisor] 启动失败 (非致命):', (err as Error)?.message);
+      // 启动失败必须可观测 (不许静默降级成长时间不执行)
+      const msg = `[supervisor] 启动失败: ${(err as Error)?.message || err}`;
+      console.error(msg);
+      try { broadcast({ type: 'supervisor', kind: 'startup_failed', message: msg }); } catch { /* ignore */ }
     }
   } else {
     console.log('[supervisor] 长期执行层已关闭 (BOLLOON_SUPERVISOR=0)');
@@ -2952,14 +2974,83 @@ ${goalDesc}
   });
 
   // 2026-09-16: 运行记录 (持久化 harness) — 当前 + 历史 agent 运行。跨重载可读。
+  // 2026-09-16 (2-G.1): Skills Manager —— 与 CLI `/skills` `/skill` 读同一份事实 (skills-registry.json + 技能目录)
+  app.get('/api/skills', async (_req, res) => {
+    try {
+      const { getSkillsManager } = await import('../agents/skills-manager.js');
+      const sm = getSkillsManager();
+      const skills = await sm.view();
+      res.json({ count: skills.length, registryPath: (await import('../agents/skills-manager.js')).registryPath(), skills, health: await sm.health() });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  app.get('/api/skills/health', async (_req, res) => {
+    try {
+      const { getSkillsManager } = await import('../agents/skills-manager.js');
+      res.json(await getSkillsManager().health());
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  app.get('/api/skills/:name', async (req, res) => {
+    try {
+      const { getSkillsManager } = await import('../agents/skills-manager.js');
+      const s = await getSkillsManager().inspect(String(req.params.name));
+      if (!s) { res.status(404).json({ error: `没有这个技能: ${req.params.name}` }); return; }
+      res.json({ skill: s });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  app.post('/api/skills/import', async (req, res) => {
+    try {
+      const ref = String(req.body?.ref || '').trim();
+      if (!ref) { res.status(400).json({ error: '要 body {ref: "bolloon://skill/<cid>" | "ipfs://<cid>" | "<cid>"}' }); return; }
+      const { getSkillsManager } = await import('../agents/skills-manager.js');
+      const r = await getSkillsManager().import(ref, { force: !!req.body?.force });
+      if (!r.ok) { res.status(409).json({ error: r.error }); return; }
+      res.json({ ok: true, name: r.name, version: r.version, skill: r.skill });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  // enable / disable / approve / validate / quarantine (Express 5 不支持内联正则, 显式写开)
+  for (const action of ['enable', 'disable', 'approve', 'validate', 'quarantine'] as const) {
+    app.post(`/api/skills/:name/${action}`, async (req, res) => {
+      try {
+        const { getSkillsManager } = await import('../agents/skills-manager.js');
+        const sm = getSkillsManager();
+        const name = String(req.params.name);
+        const r = action === 'approve' ? await sm.approve(name, 'web')
+          : action === 'quarantine' ? await sm.quarantine(name, String(req.body?.reason || 'web 手动隔离'))
+            : action === 'enable' ? await sm.enable(name)
+              : action === 'disable' ? await sm.disable(name)
+                : await sm.validate(name);
+        if (!r.ok && !(r as any).skill) { res.status(409).json({ error: (r as any).reason || (r as any).issues || '操作未完成' }); return; }
+        res.json({ ok: r.ok, name, action, skill: (r as any).skill, issues: (r as any).issues });
+      } catch (err) {
+        res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+      }
+    });
+  }
+
   // 2026-09-16 (M2-B): 长期执行层诊断 + 手动推进 —— 与 CLI /supervise 读同一份持久化记录
   app.get('/api/supervisor', async (_req, res) => {
     try {
       const { getSupervisor } = await import('../agents/execution-supervisor.js');
+      const { readSupervisorState, supervisorStatePath } = await import('../agents/supervisor-host.js');
       const { wakeReport, listRunnableGoals } = await import('../agents/goal-store.js');
       const { runnable, skipped } = await listRunnableGoals({ now: Date.now() });
       res.json({
         supervisor: getSupervisor().status(),
+        /** 宿主身份/心跳 (谁在跑、跑到哪、上次有没有好好停) */
+        host: await readSupervisorState(),
+        hostStatePath: supervisorStatePath(),
         wake: await wakeReport(),
         runnable: runnable.map((g) => ({ goalId: g.goalId, objective: g.objective, status: g.status })),
         skipped,

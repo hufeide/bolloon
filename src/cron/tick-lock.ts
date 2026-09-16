@@ -123,6 +123,12 @@ export type TickLockResult = TickLockHandle | TickLockBusy;
 
 export interface AcquireTickLockOptions {
   home?: string;
+  /**
+   * 2026-09-16: 自定义锁文件路径 (默认 cron 的 ~/.bolloon/cron/.tick.lock)。
+   * Supervisor 用同一套锁语义 (`~/.bolloon/supervisor/.tick.lock`), 但**不与 cron 共用一个文件** ——
+   * 两种 tick 的陈旧阈值与语义不同, 共文件会让一方把另一方判成陈旧。
+   */
+  lockPath?: string;
   /** 陈旧阈值 (ms), 默认 10min */
   staleMs?: number;
   now?: () => Date;
@@ -181,7 +187,7 @@ async function reclaim(lockPath: string, log: TickLockLogger, holder: TickLockIn
  */
 export async function acquireTickLock(opts: AcquireTickLockOptions = {}): Promise<TickLockResult> {
   const home = opts.home ?? os.homedir();
-  const lockPath = tickLockPath(home);
+  const lockPath = opts.lockPath ?? tickLockPath(home);
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
   const now = (opts.now ?? (() => new Date()))();
   const log = opts.log ?? noopLogger;

@@ -2001,32 +2001,92 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
   // /skills [名] — 查看正式技能 (2026-08-12 Task5): 无参列全部, 带名看详情. 运行时开始前的技能 view.
   if (cmd === '/skills' || cmd.startsWith('/skills ')) {
     try {
-      const { defaultSkillPaths, loadSkillsDir } = await import('./agents/skill-loader.js');
-      const dirs = defaultSkillPaths();
-      const metas: Array<{ name: string; description: string; status: string; triggers: string[]; body: string }> = [];
-      for (const d of dirs) {
-        const m = await loadSkillsDir(d);
-        for (const s of m) if (s.status === 'active' && !metas.some(x => x.name === s.name)) metas.push(s as any);
-      }
+      // 2026-09-16 (2-G.1): 改走统一 Skills Manager —— CLI / Web / agent 看的是同一份事实
+      const { getSkillsManager, formatSkillLine } = await import('./agents/skills-manager.js');
+      const sm = getSkillsManager();
+      const list = await sm.view();
       const q = cmd.startsWith('/skills ') ? cmd.slice('/skills '.length).trim().toLowerCase() : '';
       if (!q) {
-        appendLine(`${C_ACCENT}技能 (${metas.length}):${RESET}`);
-        if (metas.length === 0) appendLine(`  ${C_DIM}暂无正式技能 — run-end 经验可沉淀为 skill${RESET}`);
-        for (const s of metas.slice(0, 20)) {
-          const desc = (s.description || '').slice(0, 60);
-          appendLine(`  ${C_DIM}·${RESET} ${C_ACCENT}${s.name}${RESET}${desc ? `  ${C_DIM}${desc}${RESET}` : ''}`);
-        }
-        appendLine(`${C_DIM}用法: /skills <名> 查看详情${RESET}`);
+        appendLine(`${C_ACCENT}技能 (${list.length}) [status/source/trust/版本/hash]:${RESET}`);
+        if (list.length === 0) appendLine(`  ${C_DIM}暂无技能 — run-end 经验可沉淀为 skill${RESET}`);
+        for (const s of list.slice(0, 20)) appendLine(`  ${C_DIM}·${RESET} ${formatSkillLine(s)}`);
+        const h = await sm.health();
+        appendLine(`${C_DIM}健康: ${JSON.stringify(h.byStatus)}${h.drifted.length ? ` · 内容漂移 ${h.drifted.length}` : ''}${h.invalid.length ? ` · 不合格 ${h.invalid.length}` : ''}${RESET}`);
+        appendLine(`${C_DIM}用法: /skills <名> 详情 · /skill health | inspect|enable|disable|approve|validate|import|export <名|链接>${RESET}`);
       } else {
-        const hit = metas.find(s => s.name.toLowerCase() === q || s.name.toLowerCase().includes(q));
+        const hit = list.find(s => s.name.toLowerCase() === q) || list.find(s => s.name.toLowerCase().includes(q));
         if (!hit) { appendLine(`${C_WARN}未找到技能: '${q}'${RESET}`); return; }
         appendLine(`${C_ACCENT}═ ${hit.name} ═${RESET}`);
+        appendLine(`  ${C_DIM}状态:${RESET} ${hit.status}   ${C_DIM}来源:${RESET} ${hit.source}${hit.sourceRef ? ` (${hit.sourceRef.slice(0, 60)})` : ''}   ${C_DIM}信任:${RESET} ${hit.trust}`);
+        appendLine(`  ${C_DIM}版本:${RESET} v${hit.version}   ${C_DIM}内容哈希:${RESET} ${hit.contentHash}${hit.registryHash ? ` (registry ${hit.registryHash.slice(0, 10)}${hit.registryHash !== hit.contentHash ? ' ⚠ 已漂移' : ''})` : ''}`);
+        appendLine(`  ${C_DIM}目录:${RESET} ${hit.dir}   ${hit.fileCount} 个文件 / ${Math.round(hit.bytes / 1024)}KB`);
         if (hit.description) appendLine(`  ${C_DIM}描述:${RESET} ${hit.description}`);
-        if (hit.triggers && hit.triggers.length > 0) appendLine(`  ${C_DIM}触发:${RESET} ${hit.triggers.join(', ')}`);
-        const body = (hit.body || '').trim().slice(0, 1200);
-        if (body) appendLine(`  ${C_DIM}---${RESET}\n${body}`);
+        if (hit.triggers.length) appendLine(`  ${C_DIM}触发:${RESET} ${hit.triggers.join(', ')}`);
+        if (hit.issues.length) appendLine(`  ${C_WARN}问题:${RESET} ${hit.issues.join('; ')}`);
+        const body = (await import('fs/promises')).readFile(hit.skillFile, 'utf-8').catch(() => '');
+        void body;
       }
     } catch (e: any) { appendLine(`${C_ERROR}/skills 失败: ${String(e?.message || e).slice(0, 120)}${RESET}`); }
+    return;
+  }
+
+  // 2026-09-16 (2-G.1): /skill <子命令> —— 统一管理面 (enable/disable/approve/validate/quarantine/import/export/inspect/health)
+  if (cmd === '/skill' || cmd.startsWith('/skill ')) {
+    const rest = trimmed.slice('/skill'.length).trim();
+    const [sub, ...args] = rest.split(/\s+/).filter(Boolean);
+    const arg = args.join(' ').trim();
+    try {
+      const { getSkillsManager, formatSkillLine } = await import('./agents/skills-manager.js');
+      const sm = getSkillsManager();
+      if (!sub || sub === 'list') {
+        for (const s of await sm.view()) appendLine(`  ${formatSkillLine(s)}`);
+        return;
+      }
+      if (sub === 'health') {
+        const h = await sm.health();
+        appendLine(`${C_ACCENT}技能健康:${RESET} 共 ${h.total}  状态 ${JSON.stringify(h.byStatus)}  来源 ${JSON.stringify(h.bySource)}`);
+        if (h.drifted.length) { appendLine(`${C_WARN}内容漂移 (SKILL.md 被改过, 与 registry 基线不一致):${RESET}`); for (const d of h.drifted) appendLine(`  ${d.name}  registry=${String(d.expected).slice(0, 10)} 现在=${d.actual.slice(0, 10)}`); }
+        if (h.invalid.length) { appendLine(`${C_WARN}不合格:${RESET}`); for (const i of h.invalid) appendLine(`  ${i.name}: ${i.issues.join('; ')}`); }
+        if (h.duplicates.length) { appendLine(`${C_WARN}同名多处:${RESET}`); for (const d of h.duplicates) appendLine(`  ${d.name}: ${d.dirs.join(' | ')}`); }
+        if (h.missing.length) appendLine(`${C_WARN}registry 里记着但盘上没有:${RESET} ${h.missing.join(', ')}`);
+        return;
+      }
+      if (sub === 'import') {
+        if (!arg) { appendLine(`${C_ERROR}用法: /skill import <bolloon://skill/<cid> | ipfs://<cid> | <cid>>${RESET}`); return; }
+        appendLine(`${C_DIM}导入中: ${arg.slice(0, 80)} …${RESET}`);
+        const r = await sm.import(arg);
+        appendLine(r.ok ? `${C_ACCENT}✅ 已导入 ${r.name}@${r.version} (状态 installed, 信任 unverified)${RESET}` : `${C_ERROR}导入失败: ${r.error}${RESET}`);
+        return;
+      }
+      if (sub === 'export') {
+        if (!arg) { appendLine(`${C_ERROR}用法: /skill export <名>${RESET}`); return; }
+        const r = await sm.export(arg);
+        if (!r.ok) { appendLine(`${C_ERROR}导出失败: ${r.error}${RESET}`); return; }
+        appendLine(`${C_ACCENT}技能包 JSON (${Object.keys(r.bundle!.files).length} 个文件):${RESET}`);
+        appendLine(JSON.stringify(r.bundle).slice(0, 400));
+        return;
+      }
+      if (!arg) { appendLine(`${C_ERROR}用法: /skill ${sub} <名>${RESET}`); return; }
+      const act: Record<string, () => Promise<any>> = {
+        enable: () => sm.enable(arg),
+        disable: () => sm.disable(arg),
+        approve: () => sm.approve(arg, 'cli'),
+        validate: () => sm.validate(arg),
+        quarantine: () => sm.quarantine(arg, 'cli 手动隔离'),
+        inspect: async () => ({ ok: true, skill: await sm.inspect(arg) }),
+      };
+      const fn = act[sub];
+      if (!fn) { appendLine(`${C_ERROR}未知子命令: ${sub} (可用: health|import|export|inspect|enable|disable|approve|validate|quarantine)${RESET}`); return; }
+      const r = await fn();
+      if (!r.ok) { appendLine(`${C_WARN}${sub} 未完成: ${r.reason || (r.issues || []).join('; ') || '未知原因'}${RESET}`); }
+      if (r.skill) appendLine(`  ${formatSkillLine(r.skill)}`);
+      else if (r.ok) appendLine(`${C_ACCENT}✅ ${sub} ${arg}${RESET}`);
+      if (sub === 'inspect' && r.skill) {
+        appendLine(`  ${C_DIM}目录:${RESET} ${r.skill.dir}`);
+        appendLine(`  ${C_DIM}SKILL.md:${RESET} ${r.skill.skillFile}`);
+        appendLine(`  ${C_DIM}问题:${RESET} ${r.skill.issues.length ? r.skill.issues.join('; ') : '无'}`);
+      }
+    } catch (e: any) { appendLine(`${C_ERROR}/skill 失败: ${String(e?.message || e).slice(0, 160)}${RESET}`); }
     return;
   }
 
@@ -3626,6 +3686,10 @@ interface ParsedArgs {
   prompt?: string;
   json?: boolean;
   web?: boolean;
+  /** 2026-09-16 (2-C.1): 独立 Supervisor 宿主 (长期执行) */
+  supervise?: boolean;
+  superviseOnce?: boolean;
+  superviseDryRun?: boolean;
   help?: boolean;
   tools?: boolean;
   read?: boolean;
@@ -3684,6 +3748,18 @@ function parseArgs(): ParsedArgs {
         break;
       case '--web':
         result.web = true;
+        break;
+      // 2026-09-16 (2-C.1): 独立 Supervisor 宿主 —— 长期执行不依附 web 进程
+      case '--supervise':
+        result.supervise = true;
+        break;
+      case '--supervise-once':
+        result.supervise = true;
+        result.superviseOnce = true;
+        break;
+      case '--supervise-dry-run':
+        result.supervise = true;
+        result.superviseDryRun = true;
         break;
       case '--help':
       case '-h':
@@ -4113,6 +4189,29 @@ async function main() {
   }
 
   const mode = args.web ? 'web' : 'cli';
+
+  // 2026-09-16 (2-C.1): 独立 Supervisor 宿主 —— `bolloon --supervise [--supervise-once|--supervise-dry-run]`
+  //   长期执行不再依附 web 进程 (页面关掉/CLI 没开也能继续推进 Goal)。
+  if (args.supervise) {
+    const { runStandaloneSupervisorHost } = await import('./agents/supervisor-host.js');
+    const res = await runStandaloneSupervisorHost({
+      once: !!args.superviseOnce,
+      dryRun: !!args.superviseDryRun,
+      log: (m: string) => console.log(m),
+    });
+    if (args.superviseOnce) {
+      const rep = res.lastReport as any;
+      if (rep) {
+        console.log(`调度周期 #${rep.tick}: 认领 ${rep.claimed.length} · 执行 ${rep.executed.length} · 跳过 ${rep.skipped.length}${rep.errors.length ? ` · 错误 ${rep.errors.length}` : ''}`);
+        for (const s of rep.skipped.slice(0, 8)) console.log(`  跳过 ${s.goalId}: ${s.reason}`);
+        for (const e of rep.executed) console.log(`  ▶ ${e.goalId} → run=${e.runId || '-'} ${e.status || ''}${e.error ? ` (${e.error})` : ''}`);
+      }
+      console.log(`supervisor 宿主: owner=${res.state.owner} worker=${res.state.workerId} ticks=${res.ticks} 状态文件=~/.bolloon/supervisor.json`);
+    } else {
+      console.log(`[supervisor] 常驻宿主已启动 (owner=${res.state.owner}, worker=${res.state.workerId}); Ctrl-C 优雅停止`);
+    }
+    return;
+  }
   const isNonInteractive = !!(args.tool || args.prompt);
 
   const originalLog = console.log;
