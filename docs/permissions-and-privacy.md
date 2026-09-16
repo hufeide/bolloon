@@ -28,7 +28,7 @@
 | `INTERNET` | P2P 连接、从 bolloon.cn / GitHub 下载安装包、检查版本号。 | — |
 | `ACCESS_NETWORK_STATE` | 判断网络可用性，决定走局域网直连还是中继。 | — |
 | 相机 | **未申请** `CAMERA` 权限。扫码与拍摄头像通过系统相机应用完成（`ACTION_IMAGE_CAPTURE`），本应用只接收返回的图片。 | — |
-| 无障碍服务（AccessibilityService） | 提供「智能体控制」：由你在系统设置中显式开启后，智能体才可代你操作本机界面。**默认关闭**，可随时在系统设置里关闭。**应用商店版（flavor=store）不含此项**（`android/app/src/store/AndroidManifest.xml` 用 `tools:node="remove"` 摘除）。 | 是（必须用户手动开启） |
+| 完全访问权限（系统无障碍服务 `AccessibilityService`） | 提供「智能体操作手机」：由你在系统设置中确认一次后，智能体才可代你操作本机界面。**官网直装版默认引导开启（首次启动直接带你去开关页），可随时在系统设置里关闭**。**应用商店版（flavor=store）不含此项**（`android/app/src/store/AndroidManifest.xml` 用 `tools:node="remove"` 摘除）。 | 是（须用户在系统设置里确认一次） |
 | Shizuku（第三方提权通道） | 可选的高级能力：在用户自行安装 Shizuku 并授权后，调用系统级 API。**应用商店版不含此项**。 | 是 |
 | 存储/相册 | 不申请读写存储权限。头像图片在 WebView 内处理，写入应用私有目录。 | — |
 
