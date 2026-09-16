@@ -1280,6 +1280,36 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     return;
   }
 
+  // /runs — 持久化运行记录 (跨重载可读): 谁在跑 / 跑完了 / 被打断 / 卡住了
+  if (cmd === '/runs' || cmd.startsWith('/runs ')) {
+    const arg = trimmed.slice('/runs'.length).trim();
+    try {
+      const { listRuns, formatRunLine, readRun } = await import('./agents/run-store.js');
+      if (arg) {
+        const rec = await readRun(arg);
+        if (!rec) { appendLine(`${C_ERROR}没有这个运行: ${arg}${RESET}`); return; }
+        appendLine(`${C_DIM}run ${rec.runId} [${rec.surface}] ${rec.status} · ${rec.steps.length} 步 · pid ${rec.pid}${RESET}`);
+        appendLine(`${C_DIM}目标: ${rec.goal.slice(0, 120)}${RESET}`);
+        for (const s of rec.steps) {
+          appendLine(`  ${s.ok ? '✓' : '✗'} ${String(s.n).padStart(2)} ${s.tool}${s.ms ? ` (${s.ms}ms)` : ''} ${C_DIM}${(s.summary || s.error || '').slice(0, 80)}${RESET}`);
+        }
+        if (rec.error) appendLine(`${C_ERROR}结束原因: ${rec.error}${RESET}`);
+        return;
+      }
+      const runs = await listRuns({ limit: 15 });
+      if (!runs.length) {
+        appendLine(`${C_DIM}还没有运行记录 (每次 agent 运行都会落盘到 ~/.bolloon/runs/)${RESET}`);
+        return;
+      }
+      appendLine(`${C_DIM}最近 ${runs.length} 次运行 (落盘记录, 重开也还在):${RESET}`);
+      for (const r of runs) appendLine(`  ${formatRunLine(r)}`);
+      appendLine(`${C_DIM}/runs <runId> 看逐步明细${RESET}`);
+    } catch (e: any) {
+      appendLine(`${C_ERROR}/runs 失败: ${String(e?.message || e).slice(0, 150)}${RESET}`);
+    }
+    return;
+  }
+
   // /model — 无参: 交互选择器 (ink 渲染, 复用 MentionPopup); 有参: 直接切换/测连通/看状态
   if (cmd === '/model' || cmd.startsWith('/model ')) {
     const modelArg = trimmed.slice('/model'.length).trim();
@@ -2154,6 +2184,7 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     appendLine(`  ${C_ACCENT}/dequeue${RESET} 出队一条`);
     appendLine(`  ${C_ACCENT}/channel [名字|id|序号]${RESET} 切换当前智能体  ${C_DIM}无参列出所有; 支持名字/ID/序号三种解析${RESET}`);
     appendLine(`  ${C_ACCENT}/model${RESET}    模型供应商选择器  ${C_DIM}无参=选择器 · /model <名> [模型] 直接切换 · /model test 测连通${RESET}`);
+    appendLine(`  ${C_ACCENT}/runs${RESET}     运行记录 (落盘, 跨重载可读)  ${C_DIM}/runs · /runs <runId> 看逐步明细${RESET}`);
     appendLine(`  ${C_ACCENT}/setup${RESET}    初始化 / 配置总览  ${C_DIM}身份 + 供应商 + 配置文件路径${RESET}`);
     appendLine(`  ${C_ACCENT}/questions${RESET} 待回答的问题  ${C_DIM}智能体 clarify 提问时, 直接输入即回答 (或 /answer <文本>)${RESET}`);
     appendLine(`  ${C_ACCENT}/login${RESET}    登录 GitHub/Google 账号 (骨架)  ${C_DIM}暂无真实 OAuth${RESET}`);

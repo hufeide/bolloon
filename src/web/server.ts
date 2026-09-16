@@ -1616,6 +1616,9 @@ async function getAgentForChannel(
   }, true); // forceNew: true 强制创建新实例
   channelSessions.set(sessionKey, session);
 
+  // 2026-09-16: 标记运行表面 — 落盘 run 记录里能区分 web 运行 (CLI 默认 cli)
+  try { session.setRunSurface?.('web'); } catch { /* 老 session 无此方法则忽略 */ }
+
   if (channelDid) {
     console.log(`[Agent] 新建频道 ${channelId} session, DID = ${channelDid}, sessionId = ${currentSessionId}`);
   } else {
@@ -1702,6 +1705,19 @@ export async function createWebServer(port: number = 3000, options: CreateWebSer
     console.log(`[createWebServer] bootstrap 完成 (${bs.durationMs}ms)`);
   } catch (err) {
     console.warn('[createWebServer] bootstrap 失败 (非致命):', err);
+  }
+
+  // 2026-09-16: 孤儿运行对账 — 上次进程留下的 running 记录改判 interrupted。
+  // 不做这步的话, 刷新/重启后 UI 会显示"还在跑"的幽灵运行 (最典型的假状态)。
+  try {
+    const { reconcileOrphans } = await import('../agents/run-store.js');
+    const rec = await reconcileOrphans();
+    if (rec.interrupted.length) {
+      console.log(`[runs] 对账: ${rec.interrupted.length} 条上次中断的运行已标 interrupted (${rec.interrupted.slice(0, 3).join(', ')}${rec.interrupted.length > 3 ? '…' : ''})`);
+    }
+    if (rec.stillRunning.length) console.log(`[runs] 存活运行: ${rec.stillRunning.length} 条`);
+  } catch (err) {
+    console.warn('[runs] 对账失败 (非致命):', (err as Error)?.message);
   }
 
   // 2026-08-03 (Context OS P5): 初始化资产层 12+3 目录 (幂等, 每层 README 声明职责边界)
@@ -2487,6 +2503,18 @@ export async function createWebServer(port: number = 3000, options: CreateWebSer
         if (!cronHandle.disabled) console.log(`[cron] 调度器已启动 (每 ${Math.round((Number(process.env.BOLLOON_CRON_HEARTBEAT_MS) || 60_000) / 1000)}s 一轮, tick 带锁 + DND)`);
         // 暴露给 /message 使用 (主任务闸门)
         (global as any).__bolloonMainTask = { enterMainTask, exitMainTask };
+
+        // 2026-09-16: 运行失速巡检 (每 60s) — running 但长时间没新进展的运行标 stalled,
+        //   让 UI/CLI 能说"这个运行卡住了", 而不是永远转圈 (crash 由启动时对账兜底)。
+        setInterval(() => {
+          void (async () => {
+            try {
+              const { superviseRuns } = await import('../agents/run-store.js');
+              const r = await superviseRuns();
+              if (r.stalled.length) console.warn(`[runs] 失速巡检: ${r.stalled.length} 条运行标 stalled (${r.stalled.slice(0, 3).join(', ')})`);
+            } catch { /* 巡检失败不影响主流程 */ }
+          })();
+        }, 60_000);
       } catch (cronErr) {
         console.warn('[cron] 调度器启动失败 (non-fatal):', (cronErr as Error)?.message);
       }
@@ -2878,6 +2906,23 @@ ${goalDesc}
       });
     } catch (e: any) {
       res.status(400).json({ ok: false, severity: 'block', reason: e?.message ?? 'parse error' });
+    }
+  });
+
+  // 2026-09-16: 运行记录 (持久化 harness) — 当前 + 历史 agent 运行。跨重载可读。
+  app.get('/api/runs', async (req, res) => {
+    try {
+      const { listRuns, formatRunLine } = await import('../agents/run-store.js');
+      const status = String((req.query as any)?.status || '').trim();
+      const limit = Number((req.query as any)?.limit || 20);
+      const runs = await listRuns({ status: status ? (status as any) : undefined, limit });
+      res.json({
+        count: runs.length,
+        runs,
+        lines: runs.map(formatRunLine),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
     }
   });
 

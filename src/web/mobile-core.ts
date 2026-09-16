@@ -818,8 +818,11 @@ export const core = {
         const wl = (agentLayer.getLastWorklog && agentLayer.getLastWorklog()) || [];
         if (wl.length) busBroadcast({ type: 'agent-worklog', lines: wl });
       } catch (e: any) {
+        const errText = '（本地 Agent 未就绪: ' + String(e?.message || e).slice(0, 80) + '）';
+        // 失败回复也要落库: 只广播不落库的话, 重开 App / 切会话就看不到这条失败原因了
+        try { await dataLayer.appendMessage(channelId, { role: 'ai', content: errText, ts: Date.now() }); } catch { /* 落库失败不阻塞 UI */ }
         busBroadcast({ type: 'loop-status', status: 'done', message: '执行失败: ' + (e?.message || '').slice(0, 80) });
-        busBroadcast({ type: 'ai', channelId, content: '（本地 Agent 未就绪: ' + String(e?.message || e).slice(0, 80) + '）', role: 'ai' });
+        busBroadcast({ type: 'ai', channelId, content: errText, role: 'ai' });
         busBroadcast({ type: 'done', channelId });
       }
       return { ok: true };

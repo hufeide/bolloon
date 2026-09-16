@@ -28,6 +28,7 @@ import { DeepThinkingEngine, AgentCoordinator, type ThinkResult, type AgentResul
 import { WorkflowPivotLoop, createDefaultPivotConfig, type PivotLoopConfig, type LoopResult } from './workflow-pivot-loop.js';
 import { p2pDocumentTools, initDocumentReceiver } from './p2p-document-tools.js';
 import { shellExec } from './shell-tool.js';
+import { startRun, recordStep, finishRun, readRun, budgetVerdict, type RunSurface } from './run-store.js';
 import { getBranchPrefix, getCooldownMs, checkWritePath } from './shell-guard.js';
 import {
   DiscoveredAgentsManager,
@@ -287,6 +288,18 @@ export class PiAgentSession implements AgentSession {
   private currentIntent: 'question' | 'code_edit' | 'multi_step' | 'chitchat' | 'document' = 'chitchat';
   /** 2026-08-10: 本轮用户原始输入 (loop-review 任务动词兜底检测用) */
   private currentUserInput: string = '';
+  /**
+   * 2026-09-16: 持久化 run harness — 本次运行的落盘记录 id + 表面 (cli/web/cron/delegate)。
+   * 之前只有"跑完才写"的轨迹 (trajectory-store, fire-and-forget, 崩了就没有), 没有跨重载可见的
+   * 运行事实, 也没有预算闸门/失速巡检; 这里补的就是那一层。
+   */
+  private currentRunId: string = '';
+  private runSurface: RunSurface = 'cli';
+
+  /** 由 server / CLI / cron 注入运行表面 (影响落盘记录里的 surface 字段) */
+  setRunSurface(surface: RunSurface): void {
+    this.runSurface = surface;
+  }
   private currentIntentHint: string = '';
 
   /**
@@ -1296,8 +1309,40 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
       await this._hooks.fire('onLoopStart', { event: 'onLoopStart', channelId: this.currentChannelId, agentId: this.currentAgentId });
     } catch { /* hook 失败静默 */ }
 
+    // 2026-09-16: 持久化 run harness — 本次运行立即落盘 (~/.bolloon/runs/<id>.json)。
+    //   之后每步工具调用都追加一条, 所以刷新页面/进程重载/崩溃都能看到"做到哪一步"。
+    let runStopReason = '';
+    try {
+      const rec = await startRun({
+        surface: this.runSurface,
+        goal: this.currentUserInput || '(未记录目标)',
+        channelId: this.currentChannelId || undefined,
+        agentId: this.currentAgentId || undefined,
+      });
+      this.currentRunId = rec.runId;
+      onStream?.({ type: 'status', content: `🧷 运行已登记 (run=${rec.runId}, 预算 ${rec.budget.maxSteps} 步 / ${Math.round(rec.budget.deadlineMs / 60000)} 分钟)`, tool: 'harness' });
+    } catch (err) {
+      console.warn('[PiAgent] run-store startRun failed (non-fatal):', err);
+    }
+
     while (iteration < this.MAX_REACT_ITERATIONS) {
       iteration++;
+
+      // 2026-09-16: 预算闸门 (持久化 harness 的约束面) —— 到点必须**如实**终止, 不许静默算完成
+      if (this.currentRunId) {
+        try {
+          const rec = await readRun(this.currentRunId);
+          const verdict = rec ? budgetVerdict(rec) : { exceeded: false as const };
+          if (verdict.exceeded) {
+            runStopReason = verdict.reason || '运行预算用尽';
+            onStream?.({ type: 'error', content: `⛔ 运行预算用尽: ${runStopReason} (已如实终止, 不假装完成)`, tool: 'harness' });
+            finalResponse = finalResponse || `(运行预算用尽: ${runStopReason})`;
+            break;
+          }
+        } catch (err) {
+          console.warn('[PiAgent] run-store budget check failed (non-fatal):', err);
+        }
+      }
 
       // 停止条件 1: max turns (fail-safe 10000, 正常任务永远跑不到)
       //   2026-07-01 (v0.2.4 子任务 1): 委托给 react-loop.decideMaxIterations 纯函数
@@ -1741,6 +1786,22 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
           const toolDurationMs = Date.now() - toolStart;
           console.log(`[PiAgent] 工具 ${toolCall.name} 执行完成: success=${result.success} (${toolDurationMs}ms)`);
 
+          // 2026-09-16: 持久化 run harness — 每步工具调用立即落盘 (崩在这里也能看到做到哪步)
+          if (this.currentRunId) {
+            try {
+              await recordStep(this.currentRunId, {
+                tool: toolCall.name,
+                ok: !!result.success,
+                ms: toolDurationMs,
+                args: toolCall.args,
+                summary: String(result.output || '').slice(0, 200),
+                error: result.error ? String(result.error) : undefined,
+              });
+            } catch (err) {
+              console.warn('[PiAgent] run-store recordStep failed (non-fatal):', err);
+            }
+          }
+
           try { await onPostToolUse({ tool: toolCall.name, args: toolCall.args || {}, result: { success: result.success, output: result.output?.substring(0, 500), error: result.error }, durationMs: toolDurationMs }); }
           catch (postErr) { console.warn('[PiAgent] onPostToolUse failed (non-fatal):', postErr); }
 
@@ -1986,6 +2047,27 @@ lastQualityScore = this.estimateResponseQuality(reply);
       await this.reactHarness.onSessionEnd();
     } catch (err) {
       console.warn('[PiAgent] reactHarness.onSessionEnd failed (non-fatal):', err);
+    }
+
+    // 2026-09-16: 收尾落盘 — done / failed / aborted / needs_human 如实写回 (不留幽灵 running)
+    if (this.currentRunId) {
+      try {
+        // 协议里的错误分类: 鉴权类 (401/403) 不重试, 直接交人 (needs_human), 不算"失败重试"
+        const { classifyError } = await import('./run-store.js');
+        const errText = runStopReason || aiFailureReason || '';
+        const cls = errText ? classifyError(errText) : 'unknown';
+        const status: 'done' | 'failed' | 'aborted' | 'needs_human' = runStopReason
+          ? 'aborted'
+          : (aiFailed ? (cls === 'auth' ? 'needs_human' : 'failed') : 'done');
+        await finishRun(this.currentRunId, {
+          status,
+          summary: finalResponse ? String(finalResponse).slice(0, 400) : undefined,
+          error: errText || undefined,
+        });
+      } catch (err) {
+        console.warn('[PiAgent] run-store finishRun failed (non-fatal):', err);
+      }
+      this.currentRunId = '';
     }
 
     // 2026-06-16: 暴露 aiFailed 标志 — promptStream 据此决定是否自动重试整个 loop
