@@ -1422,6 +1422,21 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
       const { runnable, skipped } = await listRunnableGoals({ now: Date.now() });
       const st = getSupervisor().status();
       appendLine(`${C_DIM}supervisor: owner=${st.owner} running=${st.running ? 'yes' : 'no'} tick=${st.tickIntervalMs}ms lease=${st.leaseTtlMs}ms dryRun=${st.dryRun ? 'yes' : 'no'} ticks=${st.ticks}${RESET}`);
+      // 2026-09-16 (2-C.2): 宿主状态里的最近一次"执行器解析"阶段报告 —— 回答"这个 Goal 为什么没被执行、卡在哪一阶段"
+      try {
+        const { readSupervisorState } = await import('./agents/supervisor-host.js');
+        const hostState: any = await readSupervisorState();
+        if (hostState) {
+          appendLine(`${C_DIM}宿主: worker=${hostState.workerId} pid=${hostState.pid} ticks=${hostState.ticks ?? 0}${hostState.stoppedAt ? ` 已停止(${hostState.stopReason})` : ''}${RESET}`);
+          appendLine(`${C_DIM}最近一轮: ${hostState.lastSummary || '(无)'}${RESET}`);
+          const lr = hostState.lastResolution;
+          if (lr) {
+            appendLine(`${lr.ok ? C_ACCENT : C_WARN}解析 ${lr.goalId} ${lr.ok ? '✅ 可执行' : `⛔ 卡在 ${lr.failedStage}`}${RESET}${lr.reason ? ` — ${lr.reason}` : ''}`);
+            appendLine(`  ${C_DIM}阶段: ${lr.stages}${RESET}`);
+            for (const d of (lr.detail || [])) if (d.note || d.error) appendLine(`  ${C_DIM}· ${d.stage}: ${d.error || d.note}${RESET}`);
+          }
+        }
+      } catch { /* 宿主状态可读性不影响诊断 */ }
 
       if (arg === 'tick' || arg === 'start') {
         // CLI 侧执行器: 用当前会话的 agent (没人注入 agent 时只诊断, 不假装跑过)

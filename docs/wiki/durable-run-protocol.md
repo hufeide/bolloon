@@ -609,3 +609,42 @@ validate/resolve/snapshot/health/export) 成为 CLI/Web/agent/Supervisor 的唯�
 `skillId/name/version/contentHash/source/sourceRef/status/trust/compatibility/installedAt/updatedAt`。
 2-G.1 刻意**不改执行行为** —— enable/disable 只被记录与展示, 真正用它拦执行 (readiness gate) 与 Goal 级
 skill snapshot 属 2-G.2/2-G.4。
+
+## 17. 批次 2-C.2: 独立宿主的真 LLM 恢复闭环 — 2026-09-16
+
+> 上一批留的唯一缺口: 独立宿主"没有 tick 日志、没有建 Run"。这一批把它定位、修掉并拿到真跑证据。
+
+### 17.1 根因 (两个, 一个比一个深)
+
+1. **独立宿主没有初始化 LLM 层**: `PiAgentSession.prompt()` 开头 `minimaxAvailable = checkMinimax()` (即 `getMinimax()` 不抛错),
+   而独立宿主进程从未调用 `initMinimax()` → 判定不可用 → 直接走 `handleFallback()`。
+2. **fallback 路径连 Run 都不建**: 它 `return` 在 Run 创建之前, 于是上层只看到"执行完成但没有 Run" ——
+   长期 Supervisor 由此把"什么都没跑"当成一次正常执行 (这正是"agent 跑了但没记录"在 fallback 上的翻版)。
+   真实症状: 宿主日志 `goal=... run=- done → goal=active (还没有 Run)`, 耗时 856ms。
+
+### 17.2 修法
+
+- **新增 `src/agents/runner-resolver.ts`**: 执行器解析拆成有序阶段, 每阶段记 开始/结束/耗时/失败分类/超时原因:
+  `resolve_goal → resolve_agent → load_identity → load_session → load_skills → init_llm → create_session → prepare_resume → ready`。
+  `init_llm` 与 `create_session` 是**必需阶段**: 任一失败 → `{ok:false, kind:'none', reason:'<阶段>: <原因>', failedStage, stages}`,
+  Supervisor 只诊断 (不建 Run、不改 Goal 状态), 原因进 `wakeReport` / 宿主状态 / API。
+- **独立宿主走这套解析** (`createLocalAgentResolver` 委托), 并在 `init_llm` 阶段调用 `initMinimax()`; LLM 不可用 → 直接 unresolved
+  (不再偷偷退化成 fallback)。
+- **fallback 也必须留 Run 事实** (`pi-sdk.prompt`): 建 Goal + `startRun` + 记一步失败步骤 + `finishRun(needs_human, error='LLM 不可用')`。
+  "没跑"不许当"跑完"。
+- **阶段报告立即落盘** (`~/.bolloon/supervisor.json` 的 `lastResolution`): 不等 tick 结束就能回答"为什么没执行、卡在哪、耗时多少";
+  runner 拿不到 Run 时也如实返回 `failed` (而不是把空 runId 当 done)。
+- CLI `/supervise` 与 `GET /api/supervisor` 都展示 `lastResolution` (阶段序列 + 每阶段 note/error)。
+
+### 17.3 真跑证据 (`scripts/verify-supervisor-restart.ts`)
+
+`[5]` 段现在是**真 LLM 的完整链路**: 独立宿主起真 deepseek agent → 真建 Run 并跑起来 (步骤进记录) →
+**在运行中 SIGKILL** (盘上留 `running` 幽灵 = 真中断) → 新独立宿主自动接管 (恢复同一 Run 或按协议开新 Run, 由它自己决定) →
+无 Web 页面、无 `/resume`、无用户输入 → 结束后不留幽灵 `running`、lease 正常接管并归还、Goal 历史保留。
+
+单测: `src/test/runner-resolver.test.ts` (卡在 resolve_agent / init_llm / create_session 超时 / 显式关闭 四类失败 + 全绿有序 + runner 无 Run 时如实 failed + 诊断文本)。
+
+### 17.4 还没做
+
+- `retry_wait` 到点唤醒 (2-C.3) · 真 P2P/delegate 事件唤醒 (2-C.4) · Skill readiness gate (2-G.2) ·
+  长期判据/证据汇总 (2-F) · Web 长期执行面板 (2-H)。

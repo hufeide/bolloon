@@ -21,7 +21,7 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { acquireTickLock } from '../cron/tick-lock.js';
-import type { GoalRunner, RunnerKind, RunnerResolver } from './execution-supervisor.js';
+import type { GoalRunner, RunnerKind, RunnerResolver, RunnerResolution } from './execution-supervisor.js';
 
 // runner 解析接口定义在 execution-supervisor.ts (避免循环依赖), 这里只做再导出
 export type { GoalRunner, RunnerKind, RunnerResolver, RunnerResolution } from './execution-supervisor.js';
@@ -61,6 +61,20 @@ export interface SupervisorState {
   leaseTtlMs: number;
   /** 最近一次 tick 的执行/跳过摘要 (上限截断, 供 UI/诊断) */
   lastSummary?: string;
+  /**
+   * 最近一次执行器解析的分阶段报告 (2-C.2):
+   * 回答"这个 Goal 为什么没被执行、卡在哪一阶段、耗时多少、失败分类是什么"。
+   */
+  lastResolution?: {
+    goalId: string;
+    at: string;
+    ok: boolean;
+    failedStage?: string;
+    reason?: string;
+    stages: string;
+    /** 每阶段明细 (stage/ok/ms/note/error/errorClass) */
+    detail: { stage: string; ok: boolean; ms: number; note?: string; error?: string; errorClass?: string }[];
+  };
   /** 优雅停止时间 (非正常退出时不会有这个字段 —— 这本身就是"上次没好好停"的证据) */
   stoppedAt?: string;
   stopReason?: string;
@@ -124,6 +138,10 @@ export interface RunHostOptions {
   home?: string;
   /** 注入: 单测可换成假的 tick 锁 */
   acquireLock?: typeof acquireTickLock;
+  /** 每次写宿主状态时合并的额外字段 (例如最近一次解析阶段报告) */
+  extraState?: () => Record<string, unknown>;
+  /** 宿主创建后把"立刻落盘"的函数交出去 (解析结果不等 tick 结束就能查) */
+  onStateReady?: (write: () => Promise<void>) => void;
 }
 
 /**
@@ -152,6 +170,12 @@ export async function runSupervisorHost(opts: RunHostOptions): Promise<HostHandl
   };
   await writeSupervisorState(state, home);
 
+  const persist = async (): Promise<void> => {
+    if (opts.extraState) Object.assign(state as any, opts.extraState());
+    await writeSupervisorState(state, home);
+  };
+  // 让调用方随时能把状态写下去 (解析阶段报告一确定就可查, 不必等 tick 结束)
+  opts.onStateReady?.(persist);
   const acquire = opts.acquireLock ?? acquireTickLock;
   const useLock = opts.crossProcessLock !== false;
   let stopping = false;
@@ -177,7 +201,7 @@ export async function runSupervisorHost(opts: RunHostOptions): Promise<HostHandl
           // 别的宿主在 tick → 本轮让路 (不阻塞), 原因写进状态, 可观测
           state.lastTickAt = new Date().toISOString();
           state.lastSummary = `本轮让路: tick 锁被 ${r.holder?.pid ?? '?'}@${r.holder?.host ?? '?'} 持有`;
-          await writeSupervisorState(state, home);
+          await persist();
           log(`[supervisor-host] ${state.lastSummary}`);
           return;
         }
@@ -188,12 +212,12 @@ export async function runSupervisorHost(opts: RunHostOptions): Promise<HostHandl
       state.ticks = (state.ticks ?? 0) + 1;
       state.lastTickAt = rep.at;
       state.lastSummary = `#${rep.tick} 认领 ${rep.claimed.length} · 执行 ${rep.executed.length} · 跳过 ${rep.skipped.length}${rep.errors.length ? ` · 错误 ${rep.errors.length}` : ''}`;
-      await writeSupervisorState(state, home);
+      await persist();
       log(`[supervisor-host] ${state.lastSummary}`);
     } catch (err) {
       state.lastTickAt = new Date().toISOString();
       state.lastSummary = `tick 异常: ${String((err as Error)?.message || err).slice(0, 160)}`;
-      await writeSupervisorState(state, home).catch(() => {});
+      await persist().catch(() => {});
       log(`[supervisor-host] ${state.lastSummary}`);
     } finally {
       clearInterval(watchdog);
@@ -227,7 +251,7 @@ export async function runSupervisorHost(opts: RunHostOptions): Promise<HostHandl
     for (let i = 0; i < 300 && ticking; i++) await new Promise((r) => setTimeout(r, 100));
     state.stoppedAt = new Date().toISOString();
     state.stopReason = reason;
-    await writeSupervisorState(state, home).catch(() => {});
+    await persist().catch(() => {});
     log(`[supervisor-host] 已优雅停止 (${reason})`);
   };
 
@@ -238,55 +262,32 @@ export async function runSupervisorHost(opts: RunHostOptions): Promise<HostHandl
  * 给独立宿主用的解析器: 按 Goal 的 channelId 建/复用**专用 agent session** 执行。
  * 解析不出来 (没有 channelId / agent 不可用 / 显式关闭) → { ok:false }, Goal 只被诊断不被执行。
  */
+/**
+ * 给独立宿主用的解析器: 委托给**分阶段** resolver (`runner-resolver.ts`)。
+ * 阶段报告通过 `onResolution` 交给宿主落盘 (lastResolution), 让 wakeReport/API/CLI 能回答
+ * "这个 Goal 为什么没被执行、卡在哪一阶段、耗时多少"。
+ */
 export function createLocalAgentResolver(opts: {
-  createAgent: (channelId: string, goalId: string) => Promise<any> | any;
   /** 允许自动建 agent session 的开关 (默认开; 关掉则只诊断) */
   allow?: boolean;
-  /**
-   * 建 agent session 的超时 (默认 20s; env BOLLOON_SUPERVISE_CREATE_TIMEOUT_MS)。
-   * agent session 初始化可能挂住 (P2P/DID/网络) —— 解析器**不许把整个 tick 挂死**:
-   * 超时即 ok:false, 本轮只诊断, Goal 状态不动, 下一轮再来。
-   */
   createTimeoutMs?: number;
+  stageTimeoutMs?: number;
+  home?: string;
+  cwd?: string;
   log?: (msg: string) => void;
+  /** 注入 (测试): 自定义建 agent / LLM 探测 */
+  createAgent?: (channelId: string, goalId: string) => Promise<any> | any;
+  probeLlm?: () => Promise<{ ok: boolean; provider?: string; model?: string; hasKey?: boolean; reason?: string }>;
+  /** 每次解析后回调 (宿主用它落盘阶段报告) */
+  onResolution?: (goalId: string, res: any) => void;
 }): RunnerResolver {
-  const cache = new Map<string, any>();
+  const cache = new Map<string, RunnerResolution>();
   return async (req) => {
-    const goal = req.goal;
-    if (opts.allow === false) {
-      return { ok: false, kind: 'none', reason: '本地执行被显式关闭 (BOLLOON_SUPERVISE_AGENT=0): 只诊断不执行' };
-    }
-    if (!goal.channelId) {
-      return { ok: false, kind: 'none', reason: 'Goal 没有 channelId: 无法解析执行器 (不假装执行)' };
-    }
-    let agent = cache.get(goal.channelId);
-    if (!agent) {
-      const timeoutMs = opts.createTimeoutMs ?? (Number(process.env.BOLLOON_SUPERVISE_CREATE_TIMEOUT_MS) || 20_000);
-      try {
-        agent = await Promise.race([
-          Promise.resolve(opts.createAgent(goal.channelId, goal.goalId)),
-          new Promise((_r, rej) => {
-            const t = setTimeout(() => rej(new Error(`agent session 创建超时 (${timeoutMs}ms)`)), timeoutMs);
-            t.unref?.();
-          }),
-        ]);
-      } catch (err) {
-        return { ok: false, kind: 'none', reason: `agent session 创建失败/超时: ${String((err as Error)?.message || err).slice(0, 120)}` };
-      }
-      if (!agent) return { ok: false, kind: 'none', reason: 'agent session 不可用' };
-      cache.set(goal.channelId, agent);
-    }
-    const runner: GoalRunner = async (r) => {
-      if (r.kind === 'resume' && r.prevRunId && typeof agent.resumeRun === 'function') {
-        const res = await agent.resumeRun(r.prevRunId);
-        return { runId: r.prevRunId, status: res?.ok ? 'done' : 'failed', error: res?.ok ? undefined : res?.reason };
-      }
-      agent.setGoalId?.(goal.goalId);
-      agent.setContinuationGuards?.(r.guards || []);
-      await agent.prompt(r.instruction);
-      return { runId: agent.getLastRunId?.() || agent.getRunId?.(), status: 'done' };
-    };
-    return { ok: true, runner, kind: 'standalone' };
+    const { resolveGoalRunner } = await import('./runner-resolver.js');
+    const res = await resolveGoalRunner(req, opts as any);
+    opts.onResolution?.(req.goal.goalId, res);
+    if (res.ok && res.runner) cache.set(req.goal.goalId, res);
+    return res;
   };
 }
 
@@ -323,14 +324,23 @@ export async function runStandaloneSupervisorHost(opts: StandaloneHostOptions = 
   const log = opts.log ?? ((m: string) => console.log(m));
   const { ExecutionSupervisor } = await import('./execution-supervisor.js');
 
+  let lastResolution: any = null;
+  let persistNow: () => Promise<void> = async () => {};
   const resolver = opts.dryRun
     ? async (req: any): Promise<any> => ({ ok: false, kind: 'none', reason: `dry-run: 不执行 (goal=${req.goal.goalId})` })
     : createLocalAgentResolver({
       allow: process.env.BOLLOON_SUPERVISE_AGENT !== '0',
       log,
-      createAgent: async (channelId: string) => {
-        const { createAgentSession } = await import('./pi-sdk.js');
-        return createAgentSession({ cwd: process.cwd(), peerId: `supervise:${channelId}`, channelId } as any, true);
+      home: opts.home,
+      onResolution: (goalId: string, res: any) => {
+        lastResolution = {
+          goalId, at: new Date().toISOString(), ok: !!res.ok,
+          failedStage: res.failedStage, reason: res.reason,
+          stages: (res.stages || []).map((x: any) => `${x.stage}${x.ok ? '✓' : '✗'}${x.ms}ms`).join(' → '),
+          detail: (res.stages || []).map((x: any) => ({ stage: x.stage, ok: x.ok, ms: x.ms, note: x.note, error: x.error, errorClass: x.errorClass })),
+        };
+        log(`[supervisor-host] 解析 ${res.ok ? '✅ 可执行' : `⛔ 卡在 ${res.failedStage}`} — ${res.reason || ''}`);
+        void persistNow().catch(() => {});          // 阶段报告立刻落盘
       },
     });
 
@@ -352,6 +362,8 @@ export async function runStandaloneSupervisorHost(opts: StandaloneHostOptions = 
     dryRun: !!opts.dryRun,
     home: opts.home,
     log,
+    extraState: () => (lastResolution ? { lastResolution } : {}),
+    onStateReady: (write) => { persistNow = write; },
   });
 
   if (opts.once) {

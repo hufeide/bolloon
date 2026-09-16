@@ -781,7 +781,40 @@ export class PiAgentSession implements AgentSession {
     });
 
     if (!this.minimaxAvailable) {
+      // 2026-09-16 (2-C.2): fallback **也必须留下 Run 事实**。
+      //   旧行为: 直接返回兜底文案, 连 Run 都不建 —— 上层 (独立宿主/Supervisor) 只看到"执行完成但没有 Run",
+      //   于是把"什么都没跑"当成一次正常执行 (这正是"agent 跑了但没记录"的老毛病在 fallback 路径的翻版)。
       const response = await this.handleFallback(input);
+      try {
+        let boundGoalId = this.currentGoalId;
+        if (!boundGoalId) {
+          const g = await createGoal({
+            objective: this.currentUserInput || input.slice(0, 200),
+            channelId: this.currentChannelId || undefined,
+            agentId: this.currentAgentId || undefined,
+            createdBy: this.runSurface,
+          });
+          boundGoalId = g.goalId;
+        }
+        this.currentGoalId = boundGoalId;
+        const rec = await startRun({
+          surface: this.runSurface,
+          goal: this.currentUserInput || input.slice(0, 200),
+          goalId: boundGoalId,
+          channelId: this.currentChannelId || undefined,
+          agentId: this.currentAgentId || undefined,
+        });
+        this.lastRunId = rec.runId;
+        await attachRun(boundGoalId, rec.runId).catch(() => null);
+        await recordStep(rec.runId, { tool: 'llm', ok: false, error: 'LLM 不可用 (provider 未初始化/无 apiKey) → 走了 fallback' });
+        await finishRun(rec.runId, {
+          status: 'needs_human',
+          error: 'LLM 不可用: provider 未初始化或无 apiKey (fallback 不是执行结果, 需要配置或人工处理)',
+        });
+        console.log(`[PiAgent] LLM 不可用 → 本次仍落 Run ${rec.runId} (needs_human), 不伪装成正常执行`);
+      } catch (err) {
+        await recordDegradation({ kind: 'core', op: 'pi-sdk.fallbackRun', runId: this.lastRunId || '', message: String((err as Error)?.message || err).slice(0, 160) }).catch(() => {});
+      }
       this.messageHistory.push({ role: 'assistant', content: response });
       this.reportUsageToContextManager();
       this.finishTrajectory(trajRec, response);

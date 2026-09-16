@@ -174,21 +174,24 @@ const fs = require('fs');
   killTree(b.child!);
   await wait(500);
 
-  // ═══════════ [5] 真 LLM 版同一条链路 ═══════════
-  console.log('\n[5] 真 LLM: 真 agent 跑到一半被 SIGKILL → 新宿主自动恢复同一 runId');
-  // 用复制过来的真实 channel (有真 channel 上下文, session 初始化不会因缺上下文而挂住)
+  // ═══════════ [5] 真 LLM 版同一条链路 (2-C.2 核心验收) ═══════════
+  console.log('\n[5] 真 LLM: 独立宿主真 agent 跑起来 → SIGKILL → 新独立宿主自动接管 (无页面/无 /resume)');
   let realChannelId = 'ch-restart-llm';
   try {
     const raw = JSON.parse(await fsp.readFile(path.join(HOME, '.bolloon', 'channels.json'), 'utf8'));
     const arr = Array.isArray(raw) ? raw : (raw.channels || []);
     if (arr[0]?.id) realChannelId = arr[0].id;
-  } catch { /* 没有 channels.json 就用占位 id (session 会在无 channel 上下文下初始化) */ }
+  } catch { /* 没有 channels.json 就用占位 id */ }
+  const LLM_PROBE = `${PROBE}.llm`;
   const llmGoal = await G.createGoal({
-    objective: `请用 write_file 把字符串 llm-restart 写进文件 ${PROBE}.llm, 再用 read_file 读回确认, 最后说明结果。`,
+    objective: `请用 write_file 把字符串 llm-restart-v1 写进文件 ${LLM_PROBE}, 再用 read_file 读回确认, 最后用一句话说明结果。`,
     channelId: realChannelId, agentId: 'ag-restart', createdBy: 'verify-restart',
   });
   await G.updateGoal(llmGoal.goalId, { status: 'active' });
   await G.setContinuation(llmGoal.goalId, { autoContinue: true, wakeReason: 'active' });
+  // 清空调度池: 只留这条 (maxPerTick=1)
+  await G.updateGoal(goal.goalId, { status: 'paused' });
+  await G.setContinuation(goal.goalId, { autoContinue: false, wakeReason: 'paused' });
 
   const llmHostFile = path.join(tmpRoot, 'host-llm.cjs');
   await fsp.writeFile(llmHostFile, `
@@ -199,38 +202,58 @@ const fs = require('fs');
   setInterval(() => {}, 1000);
 })();
 `, 'utf8');
-  // 预算小一点, 让 agent 有机会在几步之内被我们杀掉
   process.env.BOLLOON_RUN_MAX_STEPS = process.env.BOLLOON_RUN_MAX_STEPS || '8';
 
-  // 清空调度池: 只留这条 LLM 目标 (maxPerTick=1, 否则别的 active 目标会占掉唯一槽位)
-  await G.updateGoal(goal.goalId, { status: 'paused' });
-  await G.setContinuation(goal.goalId, { autoContinue: false, wakeReason: 'paused' });
   const c = await spawnUntil(['npx', 'tsx', llmHostFile], /LLM_HOST_READY=/, 90_000);
   check('独立宿主(真 LLM)起来了', c.matched, c.out.slice(-300));
-  // 等它真的建了 run 并跑了至少一步
+
+  // 等"真 agent 跑起来且仍在运行中"→ 立刻 SIGKILL (这样才叫"跑一半被杀")
   let llmRunId = '';
-  for (let i = 0; i < 120; i++) {
-    await wait(1000);
+  let killedWhileRunning = false;
+  for (let i = 0; i < 240; i++) {
+    await wait(500);
     const g = await G.readGoal(llmGoal.goalId);
-    if (g?.currentRunId) {
-      const rec = await R.readRun(g.currentRunId);
-      if (rec && rec.steps.length >= 1) { llmRunId = rec.runId; break; }
-      if (rec?.status === 'running' && Date.now() - Date.parse(rec.startedAt) > 8000) { llmRunId = rec.runId; break; }
-    }
+    if (!g?.currentRunId) continue;
+    const rec = await R.readRun(g.currentRunId);
+    if (!rec) continue;
+    if (rec.status === 'running' && rec.steps.length >= 1) { llmRunId = rec.runId; killedWhileRunning = true; break; }
+    if (rec.status !== 'running' && rec.steps.length >= 1 && !llmRunId) { llmRunId = rec.runId; }   // 跑完了也记下来 (退化成 continue 路径)
+    if (Date.now() - Date.parse(rec.startedAt) > 60_000 && rec.steps.length >= 1) { llmRunId = rec.runId; break; }
   }
-  checkGap('真 agent 起了 Run 并跑了起来', !!llmRunId, `goal=${llmGoal.goalId} run=${llmRunId} | 宿主输出: ${c.out.slice(-400)}`);
+  check('真 agent 起了 Run 并跑了起来', !!llmRunId, `goal=${llmGoal.goalId} run=${llmRunId} | 宿主输出: ${c.out.slice(-260)}`);
+  const stC = await H.readSupervisorState(HOME);
+  check('宿主状态里留下阶段报告 (lastResolution 有阶段与耗时)', !!stC?.lastResolution?.stages?.includes('init_llm✓'), JSON.stringify(stC?.lastResolution?.stages || null));
   killTree(c.child!);
   await wait(1000);
   const llmGhost = llmRunId ? await R.readRun(llmRunId) : null;
-  checkGap('真 agent 被杀 → 盘上留 running 幽灵 (真中断, 不是预置状态)', llmGhost?.status === 'running', String(llmGhost?.status));
+  if (killedWhileRunning) {
+    check('真 agent 被杀 → 盘上留 running 幽灵 (真中断, 不是预置状态)', llmGhost?.status === 'running', String(llmGhost?.status));
+  } else {
+    checkGap('真 agent 被杀前已自行收尾 (退化为 continue 路径, 未构成"跑一半被杀"证据)', false, `status=${llmGhost?.status}`);
+  }
 
-  const d = await spawnUntil(['npx', 'tsx', llmHostFile], /goal=.*→ goal=|无执行器/, 240_000);
-  checkGap('第二个宿主有输出 (恢复动作可观测)', d.matched || d.out.length > 0, d.out.slice(-300));
-  await wait(1500);
+  const d = await spawnUntil(['npx', 'tsx', llmHostFile], /goal=.*→ goal=|无执行器|解析/, 240_000);
+  // 等新宿主把这条 run 真正收尾 (它正在跑 ≠ 幽灵; 真 agent 恢复要几十秒)
+  for (let i = 0; i < 300; i++) {
+    await wait(1000);
+    const gg = await G.readGoal(llmGoal.goalId);
+    const recs = await Promise.all((gg?.runs || []).map((id) => R.readRun(id)));
+    if (recs.length && recs.every((r) => r && r.status !== 'running')) break;
+  }
+  const gAfter2 = await G.readGoal(llmGoal.goalId);
+  const runsAfter2 = await Promise.all((gAfter2?.runs || []).map((id) => R.readRun(id)));
   const llmAfter = llmRunId ? await R.readRun(llmRunId) : null;
-  checkGap('新宿主自动恢复了这条真 Run (同一 runId)', !!llmAfter && llmAfter.runId === llmRunId, `after=${llmAfter?.runId} before=${llmRunId}`);
-  checkGap('真 Run 收尾状态如实 (不留 running)', !!llmAfter && llmAfter.status !== 'running', String(llmAfter?.status));
-  checkGap('恢复留痕 (recovery action=resume)', !!llmAfter?.recovery.some((r) => r.action === 'resume'), JSON.stringify(llmAfter?.recovery.map((r) => r.action)));
+  check('新宿主接管后没有留下"幽灵 running" (任何一条 run 都不再是 running)', runsAfter2.every((r) => r && r.status !== 'running'), JSON.stringify(runsAfter2.map((r) => `${r?.runId}:${r?.status}`)));
+  check('同一 Goal 的历史保留 (原 Run 仍在)', !!gAfter2?.runs.includes(llmRunId), JSON.stringify(gAfter2?.runs));
+  const resumedSame = !!llmAfter?.recovery.some((r) => r.action === 'resume');
+  const continuedNew = (gAfter2?.runs.length || 0) > 1;
+  check('自动接管: 恢复同一 Run 或按协议开新 Run (两者其一, 且都由新宿主自动完成)',
+    resumedSame || continuedNew, `resume=${resumedSame} newRun=${continuedNew} runs=${JSON.stringify(gAfter2?.runs)}`);
+  check('接管动作留痕 (recovery / continuation.lastRunId 有记录)', resumedSame || !!gAfter2?.continuation?.lastRunId, JSON.stringify(gAfter2?.continuation || {}).slice(0, 200));
+  check('side effect 只发生一次 (探针文件内容没有被第二次写覆盖)', (await fsp.readFile(LLM_PROBE, 'utf8').catch(() => '(未创建)')) === 'llm-restart-v1', await fsp.readFile(LLM_PROBE, 'utf8').catch(() => '(未创建)'));
+  check('新宿主 lease 正常接管并归还', (await G.readLease(llmGoal.goalId)) === null);
+  const stD = await H.readSupervisorState(HOME);
+  check('新宿主身份换新 (workerId 与 A/C 不同)', !!stD && stD.workerId !== stC?.workerId, JSON.stringify({ old: stC?.workerId, now: stD?.workerId }));
   killTree(d.child!);
   await wait(500);
 

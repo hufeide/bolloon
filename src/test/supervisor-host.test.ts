@@ -160,18 +160,22 @@ describe('宿主: tick 互斥 · 状态落盘 · 优雅停止', () => {
     expect(ticks).toBe(0);                            // dry-run 不执行
   });
 
-  it('独立宿主的本地解析器: 没有 channelId → ok:false (只诊断)', async () => {
-    const { host } = await mods();
+  it('独立宿主的本地解析器: 没有 channelId → ok:false (只诊断, 卡在 resolve_agent)', async () => {
+    const { host, gs } = await mods();
+    // 用真 Goal (2-C.2 起解析第一阶段会校验 Goal 确实存在)
+    const g = await gs.createGoal({ objective: '没有 channel 的目标' });
     const r = host.createLocalAgentResolver({ createAgent: () => ({}) as any });
-    const res: any = await r({ goal: { goalId: 'g1', objective: 'x', successCriteria: [], constraints: [], status: 'active', createdAt: '', updatedAt: '', runs: [], completedCriteria: [], unresolvedItems: [], evidence: [] } } as any);
+    const res: any = await r({ goal: g, kind: 'first_run', instruction: 'x', guards: [] } as any);
     expect(res.ok).toBe(false);
-    expect(res.reason).toContain('channelId');
+    expect(res.failedStage).toBe('resolve_agent');
+    expect(String(res.reason)).toContain('channelId');
   });
 
   it('独立宿主的本地解析器: 显式关闭 → ok:false (不偷偷执行)', async () => {
-    const { host } = await mods();
+    const { host, gs } = await mods();
+    const g = await gs.createGoal({ objective: 'x', channelId: 'ch-1' });
     const r = host.createLocalAgentResolver({ allow: false, createAgent: () => ({}) as any });
-    const res: any = await r({ goal: { goalId: 'g1', channelId: 'ch', objective: 'x', successCriteria: [], constraints: [], status: 'active', createdAt: '', updatedAt: '', runs: [], completedCriteria: [], unresolvedItems: [], evidence: [] } } as any);
+    const res: any = await r({ goal: g, kind: 'first_run', instruction: 'x', guards: [] } as any);
     expect(res.ok).toBe(false);
     expect(String(res.reason)).toContain('关闭');
   });
