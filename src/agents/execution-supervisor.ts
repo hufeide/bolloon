@@ -63,9 +63,11 @@ export function decideGoalOutcome(
   opts: { now?: number; maxAttempts?: number } = {},
 ): GoalDecision {
   const now = opts.now ?? Date.now();
-  const maxAttempts = opts.maxAttempts ?? 3;
+  // maxAttempts = 允许的自动继续次数 (默认 2) → 第 3 次失败进 needs_human
+  const maxAttempts = opts.maxAttempts ?? 2;
   const attempts = (goal.continuation?.attempts || 0);
   const nextAction = run?.checkpoint?.nextAction;
+  // 这一轮没有失败/没有等待 → 自动继续计数清零 (连续失败才累加)
   const base = { autoContinue: true, lastRunId: run?.runId, nextAction };
 
   if (!run) {
@@ -106,7 +108,7 @@ export function decideGoalOutcome(
     case 'aborted':
       return {
         goalStatus: 'active',
-        continuation: { ...base, wakeReason: 'active' },
+        continuation: { ...base, wakeReason: 'active', wakeAt: undefined },
         reason: `运行被中止 (${run.errorClass || run.error || '预算/人工'}): 目标仍 active, 交给下一个 Run 继续`,
       };
 
@@ -119,10 +121,10 @@ export function decideGoalOutcome(
           reason: `判据全部满足: ${verdict.reason}`,
         };
       }
-      // Run 说完成, 但 Goal 的判据/证据不足 → 不许装作完成
+      // Run 说完成, 但 Goal 的判据/证据不足 → 不许装作完成 (这一轮没失败, 自动继续计数清零)
       return {
         goalStatus: 'active',
-        continuation: { ...base, wakeReason: 'active' },
+        continuation: { ...base, wakeReason: 'active', wakeAt: undefined, attempts: 0 },
         reason: `Run 已 done 但目标未达成 (${verdict.reason}) → 继续下一个 Run`,
       };
     }
@@ -211,6 +213,16 @@ export interface SupervisorOptions {
   maxPerTick?: number;
   /** 固定执行器 (简单宿主/测试用) */
   runner?: GoalRunner;
+  /**
+   * 可注入时钟 (2026-09-16, 2-C.3): 生产用真实时间, 测试/验收可用假时钟推进
+   * (唤醒判定、退避、wakeReport 都走它, 保证"到点"这件事只有一个事实来源)。
+   */
+  now?: () => number;
+  /**
+   * 自动继续的最大次数 (默认 2, env BOLLOON_GOAL_MAX_RETRIES):
+   * 第 1、2 次失败 → retry_wait 自动续跑; **第 3 次失败 → needs_human**。
+   */
+  maxRetries?: number;
   /** 动态执行器解析 (生产宿主用: web / CLI / 独立进程 各自解析) */
   resolver?: RunnerResolver;
   onEvent?: (e: { kind: string; goalId?: string; runId?: string; message: string }) => void;
@@ -244,6 +256,8 @@ export class ExecutionSupervisor {
   private readonly maxPerTick: number;
   private readonly runner?: GoalRunner;
   private readonly resolver?: RunnerResolver;
+  private readonly now: () => number;
+  private readonly maxRetries: number;
   private readonly onEvent?: SupervisorOptions['onEvent'];
   private readonly logFn?: (msg: string) => void;
   private timer: NodeJS.Timeout | null = null;
@@ -259,6 +273,8 @@ export class ExecutionSupervisor {
     this.maxPerTick = opts.maxPerTick ?? 1;
     this.runner = opts.runner;
     this.resolver = opts.resolver;
+    this.now = opts.now ?? (() => Date.now());
+    this.maxRetries = opts.maxRetries ?? (Number(process.env.BOLLOON_GOAL_MAX_RETRIES) >= 0 ? Number(process.env.BOLLOON_GOAL_MAX_RETRIES) : 2);
     this.onEvent = opts.onEvent;
     this.logFn = opts.log;
   }
@@ -320,7 +336,7 @@ export class ExecutionSupervisor {
       report.supervised = await superviseRuns();
 
       // 2. 扫描可执行 Goal
-      const { runnable, skipped } = await listRunnableGoals({ now: Date.now(), owner: this.owner });
+      const { runnable, skipped } = await listRunnableGoals({ now: this.now(), owner: this.owner });
       report.skipped = skipped;
 
       // 3. 逐个推进 (每个 Goal: 抢 lease → 执行 → 决策 → 释放 lease)
@@ -369,6 +385,15 @@ export class ExecutionSupervisor {
       this.log(`[supervisor] goal=${goal.goalId} 扫描后状态已变 (别的 worker 推进过) → 让路`);
       report.skipped.push({ goalId: goal.goalId, reason: '状态在扫描后被其它 worker 推进 (乐观并发检查) → 本周期不重复执行' });
       return { goalId: goal.goalId, status: 'stale_skip' };
+    }
+
+    // 到点唤醒 (2-C.3): 这条 Goal 之前是 retry_wait —— 现在唤醒它, 旧的 wakeAt/wakeReason 必须清掉,
+    //   否则下一轮 tick 还会把它当"等时间"重复跳过 (或留下过期的等待事实)。
+    if (goal.continuation?.wakeReason === 'retry_wait' || goal.status === 'retry_wait') {
+      await setContinuation(goal.goalId, { wakeReason: 'active', wakeAt: undefined });
+      report.skipped.push({ goalId: goal.goalId, reason: `到点唤醒: 已清 wakeAt (第 ${(goal.continuation?.attempts || 0) + 1} 次自动继续)` });
+      this.emit({ kind: 'retry_woke', goalId: goal.goalId, message: `到点唤醒, 第 ${(goal.continuation?.attempts || 0) + 1} 次自动继续` });
+      this.log(`[supervisor] goal=${goal.goalId} retry_wait 到点 → 唤醒并清 wakeAt`);
     }
 
     const prevRunId = goal.currentRunId;
@@ -437,7 +462,7 @@ export class ExecutionSupervisor {
       // 新 Run 必须挂在同一 Goal 下; 没挂上就是执行器没接住 goalId → 如实记, 不掩盖
       report.errors.push(`${goal.goalId}: 新 Run ${finalRunId} 未绑定本 Goal (goalId=${finalRun.goalId || '空'})`);
     }
-    const decision = decideGoalOutcome(goal, finalRun, { now: Date.now() });
+    const decision = decideGoalOutcome(goal, finalRun, { now: this.now(), maxAttempts: this.maxRetries });
     await this.applyDecision(goal, decision, finalRun);
     this.emit({ kind: 'goal_decision', goalId: goal.goalId, runId: finalRunId, message: `${finalRun?.status || result.status || '?'} → ${decision.goalStatus}: ${decision.reason}` });
     this.log(`[supervisor] goal=${goal.goalId} run=${finalRunId || '-'} ${finalRun?.status || result.status || '?'} → goal=${decision.goalStatus} (${decision.reason}) ${Date.now() - t0}ms`);

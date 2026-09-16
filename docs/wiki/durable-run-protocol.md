@@ -648,3 +648,38 @@ skill snapshot 属 2-G.2/2-G.4。
 
 - `retry_wait` 到点唤醒 (2-C.3) · 真 P2P/delegate 事件唤醒 (2-C.4) · Skill readiness gate (2-G.2) ·
   长期判据/证据汇总 (2-F) · Web 长期执行面板 (2-H)。
+
+## 18. 批次 2-C.3: retry_wait 真正自动唤醒 — 2026-09-16
+
+> 目标链路: `Run transient failed → Goal retry_wait → 写 wakeAt → 未到点 Supervisor 跳过 → 到点自动 claim → 开新 Run → 继续`,
+> **全程不需要 `/wake`, 不需要人工 tick**。
+
+### 18.1 这一批补的四件事
+
+1. **可注入时钟** (`ExecutionSupervisor({ now })`): 唤醒判定、退避计算、wakeReport 全走同一个时间来源
+   → 生产用真实时间, 测试/验收可用假时钟推进 (不必等 60s/5min 才验证退避)。**"到点"只有一个事实来源。**
+2. **到点唤醒时清掉旧等待事实**: claim 之后若 `wakeReason==='retry_wait'` → 写回 `wakeReason:'active'`, `wakeAt` 清空,
+   并在 tick 报告里留一条 `到点唤醒: 已清 wakeAt (第 N 次自动继续)`; 否则下一轮会拿着过期的 wakeAt 反复跳过。
+3. **阈值显式化**: 允许的自动继续次数 = `maxRetries` (默认 **2**, env `BOLLOON_GOAL_MAX_RETRIES`)
+   → 第 1、2 次失败自动退避续跑, **第 3 次失败 → `needs_human`** (`autoContinue=false`, 再 tick 也不复活)。
+   成功一轮 → `attempts` **清零** (连续失败才累加)。
+4. **跳过原因可读**: `wakeReport()` 对 retry_wait 输出 `等时间 (wakeAt, 还剩 Xs, 已自动继续 N 次)`。
+
+### 18.2 真跑验收 (`scripts/verify-supervisor-retry-wake.ts`, 18/18)
+
+| 场景 | 结果 |
+|---|---|
+| 未来 wakeAt → 宿主 tick 跳过 (真时间, 无 Run 产生) + wakeReport 说清"还剩多久/已继续几次" | ✅ |
+| 到点 → 宿主**自己**认领并开新 Run; 旧 wakeAt 被消费 (新 wakeAt 是下一轮退避, 晚于旧值) | ✅ |
+| 非幂等动作不重做 (守卫跨 Run 生效, 探针文件只写一次) | ✅ |
+| **杀掉宿主 → 重启新进程** → 仍认盘上 wakeAt, 到点自动继续 (无人 /wake) | ✅ |
+| `attempts` 跨进程保留 (重启不清零), 达阈值如实转 `needs_human` | ✅ |
+| 退避序列真生效: 0 → 15s → 60s → 5min (真实时间戳差值, 走真 tick) | ✅ |
+| 第 3 次失败 → `needs_human` + `autoContinue=false`; 时间过去 10 分钟再 tick 也不复活 | ✅ |
+
+单测 `src/test/supervisor-retry-wake.test.ts` 7 条 (未到点跳过 + 到点执行 + 重启认旧 wakeAt + 退避序列 + 阈值 + env 阈值 + auth 不走退避)。
+
+### 18.3 还没做
+
+- 2-C.4 真 P2P/delegate 事件唤醒 (`notifyExternal` 已在, 真实事件源未接) · 2-G.2 skill snapshot + readiness gate ·
+  2-G.3 事务型 import · 2-G.4 skill-Supervisor 联动 · 2-F 判据生成与长期证据 · 2-H Web 长期执行面板。

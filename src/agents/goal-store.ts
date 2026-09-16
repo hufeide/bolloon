@@ -503,7 +503,10 @@ export async function wakeReport(now = Date.now()): Promise<{ goalId: string; st
     let wake = '立即';
     if (g.status === 'completed') wake = '不再唤醒';
     else if (g.status === 'paused' || c?.autoContinue === false) wake = `等人 (${c?.wakeReason || g.status})`;
-    else if (c?.wakeAt && Date.parse(c.wakeAt) > now) wake = `等时间 (${c.wakeAt})`;
+    else if (c?.wakeAt && Date.parse(c.wakeAt) > now) {
+      const left = Math.round((Date.parse(c.wakeAt) - now) / 1000);
+      wake = `等时间 (${c.wakeAt}, 还剩 ${left}s${c.attempts ? `, 已自动继续 ${c.attempts} 次` : ''})`;
+    }
     else if (c?.wakeReason === 'awaiting_external') wake = `等外部事件${c.needsExternal ? ` (${c.needsExternal})` : ''}`;
     else if (live) wake = `已被 ${lease!.owner} 认领`;
     out.push({ goalId: g.goalId, status: g.status, wake, autoContinue: c?.autoContinue !== false, lease: live ? lease!.owner : undefined });
