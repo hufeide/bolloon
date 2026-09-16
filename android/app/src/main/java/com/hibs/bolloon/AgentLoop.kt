@@ -1,4 +1,4 @@
-package com.bolloon.agent.rokid
+package com.hibs.bolloon
 
 /**
  * AgentLoop — Android Agent 的 ReAct 循环 (2026-08-15, 复刻桌面核心 harness)

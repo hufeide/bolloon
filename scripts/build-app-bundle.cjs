@@ -23,7 +23,7 @@ const ELECTRON_DIST = path.join(ROOT, 'node_modules', 'electron', 'dist');
 const ELECTRON_APP = path.join(ELECTRON_DIST, 'Electron.app');
 const APP_NAME = 'Bolloon Agent';
 const PRODUCT_NAME = 'Bolloon Agent';
-const APP_ID = 'com.bolloon.agent';
+const APP_ID = 'com.hibs.bolloon';
 const OUTPUT_DIR = path.join(ROOT, 'release', 'mac-arm64');
 const TARGET_APP = path.join(OUTPUT_DIR, `${APP_NAME}.app`);
 

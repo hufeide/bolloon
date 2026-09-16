@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 DESKTOP="${1:-http://127.0.0.1:54188}"
 OUT="${2:-/tmp/ios-join-evidence}"
 APP="build/dd/Build/Products/Debug-iphonesimulator/App.app"
-BUNDLE_ID="com.bolloon.agent"
+BUNDLE_ID="com.hibs.bolloon"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-$HOME/Downloads/Xcode.app/Contents/Developer}"
 
 [ -d "$APP" ] || { echo "❌ 找不到 $APP — 先跑 npm run ios:sim"; exit 1; }

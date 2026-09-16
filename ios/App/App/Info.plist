@@ -30,7 +30,7 @@
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>CFBundleURLName</key>
-			<string>com.bolloon.agent.deeplink</string>
+			<string>com.hibs.bolloon.deeplink</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>bolloon</string>

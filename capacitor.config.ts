@@ -11,7 +11,7 @@
 import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'com.bolloon.agent',
+  appId: 'com.hibs.bolloon',
   appName: 'Bolloon Agent',
   // iOS 包用 dist/ios (mobile.html 作入口): CAP_WEB_DIR=dist/ios npx cap sync ios
   webDir: process.env.CAP_WEB_DIR || 'dist/web',

@@ -17,17 +17,17 @@ if (keystorePropsFile.exists()) {
 def hasReleaseSigning = keystorePropsFile.exists() && keystoreProps['storeFile']
 
 android {
-    namespace 'com.bolloon.agent.rokid'
+    namespace 'com.hibs.bolloon'
     // compileSdk 36: capacitor-android 8.4.1 的 androidx 1.17 (activity/core/webkit) AAR metadata
     // 强制要求 compileSdk >= 36; targetSdk 仍 35 (platform-35 适配, 设备行为 = Android 15)。
     compileSdk 36
 
     defaultConfig {
-        applicationId 'com.bolloon.agent.rokid'
+        applicationId 'com.hibs.bolloon'
         minSdk 28
         targetSdk 35
-        versionCode 25
-        versionName '0.4.22.3'
+        versionCode 26
+        versionName '0.4.24'
     }
 
     signingConfigs {

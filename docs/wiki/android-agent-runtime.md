@@ -271,5 +271,5 @@ Ghost (io.github.ghost-in-the-droid/android-agent): Android+iOS Agent 框架, 62
 
 ## 关联
 
-- 代码: `android/app/src/main/java/com/bolloon/agent/rokid/` (BolloonAccessibilityService / AndroidAgentTools / AgentLoop / RemoteLlm / ShizukuManager / LlmBackend / AgentRuntimeHolder)
+- 代码: `android/app/src/main/java/com/hibs/bolloon/` (BolloonAccessibilityService / AndroidAgentTools / AgentLoop / RemoteLlm / ShizukuManager / LlmBackend / AgentRuntimeHolder)
 - 参考: https://a2ui.org/specification/v1.0-a2ui/ (UI 渲染) + AOHP/AutoDroid (arXiv)

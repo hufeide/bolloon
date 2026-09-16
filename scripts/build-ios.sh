@@ -45,7 +45,7 @@ case "$MODE" in
       -destination 'generic/platform=iOS Simulator' -derivedDataPath build/dd build \
       CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO | tail -3
     echo "✅ 模拟器 App: build/dd/Build/Products/Debug-iphonesimulator/App.app"
-    echo "   运行: xcrun simctl install booted <app> && xcrun simctl launch booted com.bolloon.agent"
+    echo "   运行: xcrun simctl install booted <app> && xcrun simctl launch booted com.hibs.bolloon"
     ;;
   --verify)
     echo "④ 真机 Release 编译 (免签名, 仅验证能编译)"

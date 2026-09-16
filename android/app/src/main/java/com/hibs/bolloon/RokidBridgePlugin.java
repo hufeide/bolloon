@@ -1,4 +1,4 @@
-package com.bolloon.agent.rokid;
+package com.hibs.bolloon;
 
 import android.Manifest;
 import android.bluetooth.BluetoothAdapter;

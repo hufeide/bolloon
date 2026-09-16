@@ -92,7 +92,7 @@ echo "④ 上传到 $UI_REPO Release ($TAG)…"
 if ! gh release view "$TAG" --repo "$UI_REPO" >/dev/null 2>&1; then
   gh release create "$TAG" --repo "$UI_REPO" \
     --title "Bolloon iOS $VER" \
-    --notes "Bolloon iOS 开发版 $VER (bundle: com.bolloon.agent)
+    --notes "Bolloon iOS 开发版 $VER (bundle: com.hibs.bolloon)
 
 OTA 安装: ${PAGES_URL}/install.html  →  手机 · iOS  →  安装 iOS App
 

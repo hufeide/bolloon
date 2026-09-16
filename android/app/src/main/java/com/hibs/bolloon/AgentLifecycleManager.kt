@@ -1,4 +1,4 @@
-package com.bolloon.agent.rokid
+package com.hibs.bolloon
 
 /**
  * AgentLifecycleManager — Agent 生命周期状态机 (Phase 4, 参考 Hermes subagent_lifecycle.py)

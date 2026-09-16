@@ -1,4 +1,4 @@
-package com.bolloon.agent.rokid
+package com.hibs.bolloon
 
 /**
  * LifecycleGuard — 防自杀命令拒绝 (Phase 4, 参考 Hermes cron/lifecycle_guard.py)

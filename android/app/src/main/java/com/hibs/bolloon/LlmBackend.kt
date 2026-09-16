@@ -1,4 +1,4 @@
-package com.bolloon.agent.rokid
+package com.hibs.bolloon
 
 /**
  * LlmBackend — LLM 后端抽象 (Phase 3)

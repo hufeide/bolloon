@@ -2,7 +2,7 @@
   "name": "Bolloon Agent",
   "short_name": "Bolloon",
   "description": "去中心化智能体网络 — 手机端 (P2P / DID / 数字资源)",
-  "id": "com.bolloon.agent.mobile",
+  "id": "com.hibs.bolloon",
   "start_url": "./mobile.html",
   "scope": "./",
   "display": "standalone",

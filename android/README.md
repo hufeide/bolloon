@@ -49,7 +49,7 @@ sdkmanager --sdk_root=C:\tools\android-sdk "system-images;android-36.1;google_ap
 /c/tools/android-sdk/emulator/emulator.exe -avd Medium_Phone_API_36.1 -no-snapshot &
 adb wait-for-device
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell am start -n com.bolloon.agent.rokid/.MainActivity
+adb shell am start -n com.hibs.bolloon/.MainActivity
 adb exec-out screencap -p > screen.png
 ```
 

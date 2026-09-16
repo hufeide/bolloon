@@ -70,7 +70,7 @@ Xcode 里:
 ### 真机 / TestFlight / App Store
 
 需要 Apple Developer Program ($99/yr). 步骤:
-1. 在 https://developer.apple.com 注册, 创建 App ID `com.bolloon.agent`
+1. 在 https://developer.apple.com 注册, 创建 App ID `com.hibs.bolloon`
 2. 创建 iOS Development / Distribution 证书
 3. 创建 Provisioning Profile (Development + App Store)
 4. Xcode → Signing & Capabilities → 选 Team

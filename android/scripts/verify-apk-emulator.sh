@@ -6,7 +6,7 @@ set -x
 SDK=/c/tools/android-sdk
 ADB="$SDK/platform-tools/adb.exe"
 APK="${1:-D:/AI/bolloon/android/app/build/outputs/apk/debug/bolloon-0.4.20.apk}"
-PKG=com.bolloon.agent.rokid
+PKG=com.hibs.bolloon
 OUT=/d/AI/bolloon/android/captures
 mkdir -p "$OUT"
 

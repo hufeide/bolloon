@@ -26,7 +26,7 @@ done
 "$SDK/platform-tools/adb.exe" install -r "$APK" || exit 1
 
 # 4. 启动 MainActivity
-"$SDK/platform-tools/adb.exe" shell am start -n com.bolloon.agent.rokid/.MainActivity || exit 1
+"$SDK/platform-tools/adb.exe" shell am start -n com.hibs.bolloon/.MainActivity || exit 1
 sleep 8
 
 # 5. 截图
