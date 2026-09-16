@@ -302,6 +302,8 @@ export class PiAgentSession implements AgentSession {
    * 运行事实, 也没有预算闸门/失速巡检; 这里补的就是那一层。
    */
   private currentRunId: string = '';
+  /** 上一次运行的 runId (收尾不清空; 见 getLastRunId) */
+  private lastRunId: string = '';
   private runSurface: RunSurface = 'cli';
   /**
    * 2026-09-16 (Milestone 1): 本次运行因**持久化失败**被硬停。
@@ -1286,6 +1288,16 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
   private breakerReason = '';
   /** 2026-09-16 (M3): 运行中核心写失败 (状态迁移等) —— 交给循环顶部硬闸, 不吞 */
   private persistenceFailure = '';
+  /**
+   * 2026-09-16 (M2-B): Supervisor 开新 Run 继续同一 Goal 时注入"上一个 Run 已成功的非幂等动作"。
+   * 与 resume 的重放守卫同源 (run-store 的 buildContinuationPlan), 保证跨 Run 也不重复副作用。
+   */
+  private continuationGuards: { tool: string; argsDigest?: string; summary: string }[] = [];
+
+  /** Supervisor / CLI 注入跨 Run 重放守卫 */
+  setContinuationGuards(guards: { tool: string; argsDigest?: string; summary: string }[]): void {
+    this.continuationGuards = Array.isArray(guards) ? guards : [];
+  }
 
   /** CLI / Web 注入"当前目标" (有 goalId 就在该 Goal 下执行) */
   setGoalId(goalId: string): void {
@@ -1357,6 +1369,14 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
 
   getRunId(): string {
     return this.currentRunId;
+  }
+
+  /**
+   * 2026-09-16 (M2-B): **上一次**运行的 runId —— prompt 收尾时 `currentRunId` 会被清空,
+   * 而 Supervisor / 控制面要在运行结束后才知道"刚才跑的是哪条 run" (否则会拿旧 run 做决策)。
+   */
+  getLastRunId(): string {
+    return this.lastRunId || this.currentRunId;
   }
 
   /**
@@ -1471,6 +1491,7 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
     if (this.resumeRunId) {
       // ── 恢复模式: 复用原来的 runId, 不新建 run (历史保留) ──
       this.currentRunId = this.resumeRunId;
+      this.lastRunId = this.resumeRunId;
       try {
         await markRunRunning(this.currentRunId);
       } catch (err) {
@@ -1516,6 +1537,7 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
           agentId: this.currentAgentId || undefined,
         });
         this.currentRunId = rec.runId;
+        this.lastRunId = rec.runId;
         this.currentGoalId = rec.goalId || this.currentGoalId;
         if (this.currentGoalId) {
           // Run → Goal 反查链: runId → goalId → objective / success criteria
@@ -2016,10 +2038,15 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
           const toolStart = Date.now();
           // 2026-09-16 (M2): 恢复重放守卫 —— 中断前**已成功执行过的非幂等动作**恢复后不再重做,
           //   直接复用当时的结果 (避免重复副作用: 重复写文件/重复提交/重复付款)。
+          //   (M2-B: 守卫也覆盖"上一个 Run 已做过的非幂等动作" —— 跨 Run 续跑同样不许重做)
           let replaySkip: string | null = null;
-          if (this.resumeRunId && this.resumePlan) {
+          const guards = [
+            ...(this.resumePlan?.replayGuards || []),
+            ...(this.continuationGuards || []),
+          ];
+          if (guards.length) {
             const d = argsDigestOf(toolCall.args);
-            const hit = this.resumePlan.replayGuards.find((g) => g.tool === toolCall.name && (!g.argsDigest || !d || g.argsDigest === d));
+            const hit = guards.find((g) => g.tool === toolCall.name && (!g.argsDigest || !d || g.argsDigest === d));
             if (hit) replaySkip = hit.summary;
           }
           let result = replaySkip

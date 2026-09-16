@@ -20,7 +20,52 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 
-export type GoalStatus = 'open' | 'active' | 'paused' | 'completed' | 'failed' | 'abandoned';
+/**
+ * 2026-09-16 (M2-B/A): Goal 状态机与 leo 计划的 2-C 唤醒表 1:1 对齐。
+ * 语义: active=现在就能推进; recovering=崩溃接管中; retry_wait=等 retryAt; awaiting_external=等外部事件;
+ *       stalled=失速待 Supervisor 决策; paused/needs_human=等人; completed/failed/abandoned=终态。
+ */
+export type GoalStatus =
+  | 'open' | 'active' | 'recovering' | 'retry_wait' | 'awaiting_external' | 'stalled'
+  | 'paused' | 'needs_human' | 'completed' | 'failed' | 'abandoned';
+
+/** 可被 Supervisor 自动唤醒推进的状态 (其余必须等人或等外部事件) */
+export const GOAL_RUNNABLE_STATUSES: GoalStatus[] = ['open', 'active', 'recovering', 'retry_wait', 'stalled'];
+
+/**
+ * 2026-09-16 (M2-A): 长期执行的**调度元数据** —— 回答"这个目标下一次该在何时、因为什么被唤醒"。
+ * 不新增第四套目标库: 它就挂在 Goal 上 (GoalStore 仍是唯一长期事实来源)。
+ */
+export interface GoalContinuation {
+  /** 下一个 Run 的入口动作 (来自上一个 Run 的 checkpoint) */
+  nextAction?: string;
+  /** 唤醒原因: 状态机语义 */
+  wakeReason?: 'new_goal' | 'active' | 'recovering' | 'retry_wait' | 'awaiting_external' | 'stalled' | 'paused' | 'needs_human' | 'completed' | 'failed';
+  /** 何时可被唤醒 (retry_wait 用; ISO 时间) */
+  wakeAt?: string;
+  /** 是否允许自动继续 (false = 必须人等: paused / needs_human) */
+  autoContinue: boolean;
+  /** 在等什么外部事件 (peer/delegate/网络), 人可读描述 */
+  needsExternal?: string;
+  /** 已完成动作数 (跨 Run 汇总, 用于 continuation 指令) */
+  completedActions?: number;
+  /** 跨 Run 的非幂等重放守卫 (上一个 Run 已成功的非幂等动作) */
+  replayGuards?: { tool: string; argsDigest?: string; summary: string }[];
+  /** 自动继续的尝试次数 (退避/熔断用) */
+  attempts?: number;
+  /** 最近一次执行的 runId */
+  lastRunId?: string;
+  updatedAt?: string;
+}
+
+/** 2026-09-16 (M2-B): 执行权租约 —— 保证同一 Goal 同时只有一个 worker */
+export interface GoalLease {
+  owner: string;
+  leaseId: string;
+  claimedAt: string;
+  lastHeartbeat: string;
+  leaseUntil: string;
+}
 
 /** Goal 的持久化形态 */
 export interface GoalRecord {
@@ -47,6 +92,10 @@ export interface GoalRecord {
   /** 目标级证据 (成功步骤的事实摘要) */
   evidence: string[];
   resolution?: { reason: string; at: string };
+  /** 长期执行调度元数据 (M2-A) */
+  continuation?: GoalContinuation;
+  /** 执行权租约镜像 (真值在 <goalId>.lease 文件; 这里只为可读) */
+  lease?: GoalLease;
 }
 
 export interface CreateGoalOptions {
@@ -256,4 +305,208 @@ export async function findActiveGoal(opts: { channelId?: string; agentId?: strin
 export function formatGoalLine(g: GoalRecord): string {
   const done = `${g.completedCriteria.length}/${g.successCriteria.length || 0}`;
   return `${g.goalId}  [${g.status.padEnd(9)}] 判据 ${done.padStart(4)}  run=${(g.currentRunId || '-').slice(0, 12)}  ${g.objective.slice(0, 44)}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2026-09-16 (M2-A): continuation —— "下一次何时、因为什么被唤醒"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 写调度元数据 (合并式)。
+ * 这是 2-A 的落地: Goal 永远能回答"下一步是什么/还需不需要自动继续/在等什么"。
+ */
+export async function setContinuation(goalId: string, patch: Partial<GoalContinuation>): Promise<GoalRecord | null> {
+  return withGoalLock(goalId, async () => {
+    const rec = await readGoal(goalId);
+    if (!rec) return null;
+    rec.continuation = {
+      ...(rec.continuation || { autoContinue: true }),
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    };
+    rec.updatedAt = new Date().toISOString();
+    await writeGoal(rec);
+    return rec;
+  });
+}
+
+/** 幂等地累加自动继续尝试次数 (退避用) */
+export async function bumpContinuationAttempts(goalId: string): Promise<number> {
+  const rec = await readGoal(goalId);
+  const n = (rec?.continuation?.attempts || 0) + 1;
+  await setContinuation(goalId, { attempts: n });
+  return n;
+}
+
+export async function resetContinuationAttempts(goalId: string): Promise<void> {
+  await setContinuation(goalId, { attempts: 0 });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2026-09-16 (M2-B): 执行权租约 (跨进程排他) —— 真值在 <goalId>.lease 文件, 用 O_EXCL 独占创建
+// ─────────────────────────────────────────────────────────────────────────────
+
+function leasePath(goalId: string): string {
+  return path.join(goalsDir(), `${goalId}.lease`);
+}
+
+function pidAlive(pid: number): boolean {
+  if (!pid) return false;
+  if (pid === process.pid) return true;
+  try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === 'EPERM'; }
+}
+
+export interface LeaseClaimResult {
+  ok: boolean;
+  lease?: GoalLease & { pid?: number; host?: string };
+  reason?: string;
+  /** 被拒时: 当前持有者 */
+  holder?: GoalLease & { pid?: number; host?: string };
+}
+
+export async function readLease(goalId: string): Promise<(GoalLease & { pid?: number; host?: string }) | null> {
+  try {
+    return JSON.parse(await fs.readFile(leasePath(goalId), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 抢执行权 (原子: 独占创建 lease 文件)。
+ * 可回收条件 (任一):
+ *   ① leaseUntil 已过期 (TTL)
+ *   ② 持有者进程已不在 (更早回收 —— 持有者可证明已死, 不必等满 TTL)
+ * 不可回收: 持有者活着且未过期 → 明确返回 ok:false + holder (调用方据此"让路", 不是报错)
+ */
+export async function claimGoal(
+  goalId: string,
+  opts: { owner: string; ttlMs?: number; now?: number } = { owner: 'unknown' },
+): Promise<LeaseClaimResult> {
+  const ttl = opts.ttlMs ?? 90_000;
+  const now = opts.now ?? Date.now();
+  await fs.mkdir(goalsDir(), { recursive: true });
+  const p = leasePath(goalId);
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const claimedAt = new Date(now).toISOString();
+    const lease: GoalLease & { pid: number; host: string } = {
+      owner: opts.owner,
+      leaseId: `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`,
+      claimedAt,
+      lastHeartbeat: claimedAt,
+      leaseUntil: new Date(now + ttl).toISOString(),
+      pid: process.pid,
+      host: os.hostname(),
+    };
+    try {
+      const fh = await fs.open(p, 'wx');
+      await fh.writeFile(JSON.stringify(lease, null, 2), 'utf8');
+      await fh.close();
+      // 镜像到 Goal 文件 (只为可读; 真值在 lease 文件)
+      await updateGoal(goalId, { lease: { owner: lease.owner, leaseId: lease.leaseId, claimedAt, lastHeartbeat: claimedAt, leaseUntil: lease.leaseUntil } });
+      return { ok: true, lease };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+        return { ok: false, reason: `lease 文件不可创建: ${String((err as Error)?.message || err).slice(0, 120)}` };
+      }
+      const holder = await readLease(goalId);
+      if (!holder) { await fs.rm(p, { force: true }); continue; }   // 坏文件 → 当陈旧回收
+      const expired = Date.parse(String(holder.leaseUntil || '')) <= now;
+      const dead = holder.pid ? !pidAlive(Number(holder.pid)) : false;
+      if (expired || dead) {
+        await fs.rm(p, { force: true });
+        continue;
+      }
+      return { ok: false, reason: `lease 被占用 (owner=${holder.owner}, until=${holder.leaseUntil})`, holder };
+    }
+  }
+  return { ok: false, reason: 'lease 抢占重试后仍失败' };
+}
+
+/** 续租 (必须带自己的 leaseId: 被接管后旧 worker 不能再续租, 也就不能再写) */
+export async function heartbeatGoal(goalId: string, leaseId: string, ttlMs = 90_000, now = Date.now()): Promise<{ ok: boolean; reason?: string; lease?: GoalLease }> {
+  const cur = await readLease(goalId);
+  if (!cur) return { ok: false, reason: 'lease 不存在 (可能已过期被回收)' };
+  if (cur.leaseId !== leaseId) return { ok: false, reason: `lease 已被接管 (当前 owner=${cur.owner})` };
+  const next = { ...cur, lastHeartbeat: new Date(now).toISOString(), leaseUntil: new Date(now + ttlMs).toISOString() };
+  try {
+    await fs.writeFile(leasePath(goalId), JSON.stringify(next, null, 2), 'utf8');
+  } catch (err) {
+    return { ok: false, reason: `续租写失败: ${String((err as Error)?.message || err).slice(0, 120)}` };
+  }
+  await updateGoal(goalId, { lease: { owner: next.owner, leaseId: next.leaseId, claimedAt: next.claimedAt, lastHeartbeat: next.lastHeartbeat, leaseUntil: next.leaseUntil } });
+  return { ok: true, lease: next };
+}
+
+/** 释放执行权 (只释放自己的那把) */
+export async function releaseGoal(goalId: string, leaseId: string): Promise<{ ok: boolean; reason?: string }> {
+  const cur = await readLease(goalId);
+  if (!cur) {
+    await updateGoal(goalId, { lease: undefined });
+    return { ok: true };
+  }
+  if (cur.leaseId !== leaseId) return { ok: false, reason: `lease 已被接管, 未释放 (当前 owner=${cur.owner})` };
+  await fs.rm(leasePath(goalId), { force: true });
+  await updateGoal(goalId, { lease: undefined });
+  return { ok: true };
+}
+
+/**
+ * 扫出"现在就该跑"的 Goal (M2-B 第 1-2 步: 扫描 + 判断可否唤醒)。
+ * 规则: 状态 ∈ active/recovering; autoContinue !== false; wakeAt 未到则跳过; 有活租约则跳过。
+ * 返回附带"为什么没被选"的说明, 便于诊断 (不静默)。
+ */
+export async function listRunnableGoals(opts: { now?: number; owner?: string } = {}): Promise<{
+  runnable: GoalRecord[];
+  skipped: { goalId: string; status: GoalStatus; reason: string }[];
+}> {
+  const now = opts.now ?? Date.now();
+  const all = await listGoals({ limit: 100 });
+  const runnable: GoalRecord[] = [];
+  const skipped: { goalId: string; status: GoalStatus; reason: string }[] = [];
+  for (const g of all) {
+    const c = g.continuation;
+    const skip = (reason: string) => skipped.push({ goalId: g.goalId, status: g.status, reason });
+
+    // 终态 / 等人 / 等外部事件 → 一律不自动唤醒 (这是 2-C 唤醒表的硬规则)
+    if (g.status === 'completed' || g.status === 'failed' || g.status === 'abandoned') continue;
+    if (g.status === 'paused') { skip('paused: 等用户 resume (重启也不会自动跑)'); continue; }
+    if (g.status === 'needs_human') { skip(`needs_human: 等人工 approve (${c?.wakeReason || ''})`); continue; }
+    if (g.status === 'awaiting_external' || c?.wakeReason === 'awaiting_external') {
+      skip(`awaiting_external: 等外部事件${c?.needsExternal ? ` (${c.needsExternal})` : ''}, 不重复发送`);
+      continue;
+    }
+    if (c?.autoContinue === false) { skip(`autoContinue=false (${c.wakeReason || '等人'})`); continue; }
+    if (g.status === 'retry_wait' || (c?.wakeAt && Date.parse(c.wakeAt) > now)) {
+      if (c?.wakeAt && Date.parse(c.wakeAt) > now) { skip(`retry_wait: 时间未到 (${c.wakeAt})`); continue; }
+      // retry_wait 且时间已到 → 可跑
+    }
+    const lease = await readLease(g.goalId);
+    const held = !!lease && Date.parse(String(lease.leaseUntil || '')) > now && (lease.pid ? pidAlive(Number(lease.pid)) : true);
+    if (held) { skip(`lease 被 ${lease!.owner} 持有至 ${lease!.leaseUntil}`); continue; }
+    runnable.push(g);
+  }
+  // 先跑等着跑最久的 (公平性: 不让一个 Goal 霸占所有 tick)
+  runnable.sort((a, b) => Date.parse(a.updatedAt || a.createdAt) - Date.parse(b.updatedAt || b.createdAt));
+  return { runnable, skipped };
+}
+
+/** CLI/Web 可见的长期执行诊断 (每个 Goal 为什么在/不在跑) */
+export async function wakeReport(now = Date.now()): Promise<{ goalId: string; status: GoalStatus; wake: string; autoContinue: boolean; lease?: string }[]> {
+  const goals = await listGoals({ limit: 50 });
+  const out: { goalId: string; status: GoalStatus; wake: string; autoContinue: boolean; lease?: string }[] = [];
+  for (const g of goals) {
+    const c = g.continuation;
+    const lease = await readLease(g.goalId);
+    const live = lease && Date.parse(String(lease.leaseUntil || '')) > now && (lease.pid ? pidAlive(Number(lease.pid)) : true);
+    let wake = '立即';
+    if (g.status === 'completed') wake = '不再唤醒';
+    else if (g.status === 'paused' || c?.autoContinue === false) wake = `等人 (${c?.wakeReason || g.status})`;
+    else if (c?.wakeAt && Date.parse(c.wakeAt) > now) wake = `等时间 (${c.wakeAt})`;
+    else if (c?.wakeReason === 'awaiting_external') wake = `等外部事件${c.needsExternal ? ` (${c.needsExternal})` : ''}`;
+    else if (live) wake = `已被 ${lease!.owner} 认领`;
+    out.push({ goalId: g.goalId, status: g.status, wake, autoContinue: c?.autoContinue !== false, lease: live ? lease!.owner : undefined });
+  }
+  return out;
 }

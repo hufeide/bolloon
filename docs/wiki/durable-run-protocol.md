@@ -397,3 +397,146 @@ npx vitest run src/test/goal-store.test.ts src/test/run-store.test.ts
 6. **2-F 成功执行但 Goal 未完成**: 创建 Goal 时生成或要求判据; 成功步骤产生 candidate evidence; 更新 criterion; `completeGoalIfEligible` 是**唯一**完成出口。
 
 **下一批的验收 (按行为, 不按接口)**: ① 跨预算继续 (Run1 maxSteps → 自动 Run2 → Run3 → Goal completed) ② 进程崩溃自动恢复且已完成步骤不重跑 ③ 页面与进程都消失后重启 server 自动恢复 ④ 委派无响应 → awaiting_external → 事件到达自动唤醒 ⑤ 两个 worker 抢同一 Goal (A 崩溃后 lease 过期 B 才接管) ⑥ 用户 pause 后重启仍是 paused, resume 才继续。
+
+## 14. 批次 1: Goal continuation + ExecutionSupervisor + lease (2-A / 2-B) — 2026-09-16
+
+> 这一批补的是**长期执行层**: 不再是"一次执行能不能恢复", 而是"这个目标还要不要继续执行, 由谁执行, 什么时候执行"。
+
+### 14.1 层次与职责分界
+
+```
+Goal (长期目标)            ← GoalStore = 目标唯一事实来源 (含调度元数据)
+  ↓
+ExecutionSupervisor        ← 持续调度与唤醒 (常驻 worker, 不依赖浏览器/页面)
+  ↓
+Run (一个有限执行片段)      ← RunStore = 一次执行事实来源
+  ↓
+PiAgentHarness             ← 这一段能不能安全执行 (生命周期的唯一入口)
+  ↓
+Pi Agent                   ← 实际执行
+```
+
+原则: **Harness 管「这一段能不能安全执行」; Supervisor 管「这个目标还要不要继续执行」。**
+不把一个长期目标做成一个超长 Run —— Run 受预算限制, 结束后必须留下 continuation。
+
+### 14.2 2-A 冻结: Goal / Run / Continuation 边界
+
+**Goal 状态机与 2-C 唤醒表 1:1 对齐** (不再只用 active/paused 硬撑):
+
+`open` · `active`(现在就能推进) · `recovering`(崩溃接管中) · `retry_wait`(等 retryAt) ·
+`awaiting_external`(等外部事件) · `stalled`(失速待决策) · `paused` / `needs_human`(等人) ·
+`completed` / `failed` / `abandoned`(终态)
+
+**Continuation 字段挂在 Goal 上** (不新增第四套目标库):
+
+| 字段 | 含义 |
+|---|---|
+| `nextAction` | 下一个 Run 的入口动作 (来自上一个 Run 的 checkpoint) |
+| `wakeReason` | 唤醒原因 (状态机语义) |
+| `wakeAt` | 何时可被唤醒 (retry_wait) |
+| `autoContinue` | 是否允许自动继续 (false = 必须等人) |
+| `needsExternal` | 在等什么外部事件 |
+| `completedActions` | 跨 Run 累计已完成动作 |
+| `replayGuards` | 跨 Run 非幂等重放守卫 |
+| `attempts` | 自动继续尝试次数 (退避/熔断) |
+| `lastRunId` | 最近一次执行的 runId |
+
+完成标准 (本批已验证): **预算耗尽不会让 Goal 失败**; **Run 可以结束而 Goal 仍 active**;
+**Goal 能明确指出下一次何时、因为什么被唤醒** (`wakeReport()`)。
+
+### 14.3 2-B ExecutionSupervisor
+
+常驻 worker (`src/agents/execution-supervisor.ts`), 不塞进 web request, 不依赖页面是否打开。
+tick 默认 30s, lease TTL 90s, `maxPerTick` 1 (长期执行要克制)。
+
+一个调度周期:
+
+```
+对账孤儿 reconcileOrphans + 失速巡检 superviseRuns
+  → listRunnableGoals (含"为什么没被选中")
+  → claimGoal (原子抢 lease, 抢不到就让路并记原因)
+  → 乐观并发检查 (扫描后状态若被别的 worker 推进过 → 让路)
+  → 决定 resume (可恢复状态) 或 continue_new_run (上一条 Run 已终结) 或 first_run
+  → 执行 runner (期间按 TTL/3 续租; 续租失败 = 已被接管 → 记事件, 不掩盖)
+  → 读回 Run → decideGoalOutcome → 写 Goal 状态 + continuation + 证据 → 释放 lease
+  → 下一个 Goal
+```
+
+**runner 由调用方注入**: Web 用 channel agent (`setGoalId` + `prompt` / `resumeRun`), CLI 用当前会话 agent,
+测试用假的。**没有注入 runner 时只诊断不执行 (dry-run), 绝不假装跑过。**
+
+### 14.4 lease 语义 (跨进程排他)
+
+- 真值是 `<goalId>.lease` 文件, 用 `O_EXCL` 独占创建 → **claim 本身是原子操作**; Goal 上的 `lease` 字段只是镜像。
+- 字段: `owner` `leaseId` `claimedAt` `lastHeartbeat` `leaseUntil` (+ `pid` / `host`)。
+- 可回收 (任一): ① `leaseUntil` 过期 (TTL) ② **持有者进程已死** (更早回收 —— 持有者可证明已死, 不必等满 TTL)。
+- 不可回收: 持有者活着且未过期 → 明确返回 `ok:false` + holder (调用方**让路**, 不是报错)。
+- 被接管后旧 worker 不能再写: 旧 `leaseId` 的续租/释放一律失败 (`lease 已被接管`)。
+
+### 14.5 2-D reducer: Run 结束 → Goal 决策 (确定性, 纯函数)
+
+| Run 结果 | Goal | 下一步 |
+|---|---|---|
+| `done` + 判据全满足 | `completed` | 经 `completeGoalIfEligible` (唯一出口) |
+| `done` + 判据未满足 | `active` | 继续下一个 Run (**Run done ≠ Goal completed**) |
+| `aborted` (预算/人工) | `active` | 交给下一个 Run (Goal 不失败) |
+| `interrupted` | `recovering` | Supervisor 走 `prepareResume` (同一条 Run) |
+| `stalled` | `stalled` | Supervisor 决策恢复或转人工 |
+| `awaiting_external` | `awaiting_external` | 等事件, **不重发请求** |
+| `failed` transient/network/5xx | `retry_wait` | `wakeAt` = now + 退避 (0/15s/60s/5min/15min) |
+| `failed` auth / repeat_failure / persist_failed / policy_denied / bad_args / no_such_tool, 或 `attempts ≥ 3` | `needs_human` | `autoContinue=false`, 等人 approve |
+| `paused` (人定的) | `paused` | 不覆盖人的决定 |
+
+### 14.6 唤醒表 (2-C 的运行时落地)
+
+`listRunnableGoals()` 只把**现在就该跑**的 Goal 交出去, 其余连**原因**一起返回 (不静默跳过):
+
+| 状态 | 能否自动唤醒 |
+|---|---|
+| `open` / `active` / `recovering` / `stalled` | ✅ 立即 |
+| `retry_wait` | ✅ 但仅当 `wakeAt` 已到 |
+| `awaiting_external` | ❌ 等外部事件 (`notifyExternal` 唤醒) |
+| `paused` / `needs_human` | ❌ 等人 (重启也不会自动跑) |
+| `completed` / `failed` / `abandoned` | ❌ 终态 |
+| (任何状态) 有活 lease | ❌ 已被别的 worker 认领 |
+
+### 14.7 控制面
+
+```
+GET  /api/supervisor            supervisor 状态 + 每个 Goal 的唤醒原因 + 可推进/跳过清单
+POST /api/supervisor/tick       手动一个调度周期
+POST /api/goals/:id/wake        外部事件到达 → 唤醒在等它的 Goal (不在等 → 409, 可 force)
+
+CLI: /supervise · /supervise tick · /wake <goalId>
+
+env: BOLLOON_SUPERVISOR=0 (关闭) · BOLLOON_SUPERVISOR_TICK_MS · BOLLOON_SUPERVISOR_LEASE_MS · BOLLOON_SUPERVISOR_MAX_PER_TICK
+```
+
+### 14.8 验证 (真跑, 2026-09-16)
+
+```bash
+npx tsx scripts/verify-supervisor.ts        # 37/37
+npx vitest run src/test/supervisor-lease.test.ts   # 24/24
+```
+
+`verify-supervisor.ts` 的 8 组:
+① 跨进程 lease 排他 (真两个进程) ② worker 崩溃接管 (SIGKILL 后死进程即时回收) ③ 被接管者不能写
+④ 跨预算/跨 Run 继续 (真 deepseek: 一个 Goal 跨 2 条 Run, 新 Run 挂同一 Goal, 非幂等守卫跨 Run 传递)
+⑤ 两个 Supervisor 同时 tick → 只执行一次 ⑥ 唤醒表 (paused/awaiting_external 不自动跑 + 事件唤醒)
+⑦ 诊断可读 ⑧ 预算耗尽 → Run 如实 `aborted` + Goal 不失败 + Supervisor 自动开下一个 Run
+
+**本批真跑抓到的两个真 bug** (都已修 + 有回归断言):
+
+1. `prompt` 收尾会清空 `currentRunId` → 控制面/Supervisor 事后读 `getRunId()` 恒为空, 会**拿上一条 Run 做决策**。
+   修法: 新增 `getLastRunId()` (收尾不清空), web/CLI/验收三处改用。
+2. 并发 tick 下 "陈旧快照" 会让**同一个 Goal 被两个 worker 各跑一次** (lease 在对方释放后就成了合法认领)。
+   修法: 认领后重读 Goal 做**乐观并发检查** (状态/当前 run/run 列表/continuation 变过就让路)。
+
+### 14.9 本批**没有**做到的 (批次 2/3 的起点)
+
+- **重启后自动继续**还没做端到端验收: Supervisor 会在 web 启动时 `start()`, `interrupted → recovering → resume` 的链路已接线,
+  但"进程重启后真的自己续跑"这条验收属于批次 2 (2-C)。
+- `retry_wait` 的到点唤醒只有状态与 `wakeAt` 落盘, **定时唤醒的端到端验收**待批次 2。
+- **外部事件的真实来源** (peer/delegate 回调) 未接: `notifyExternal` + API + CLI 已通, 但真 P2P 事件端到端未验。
+- **判据生成**: 新建 Goal 的 `successCriteria` 可能为空 → 完成门永远拒绝自动完成 (安全但不自动); 判据生成/更新属 2-F。
+- **Web 前端 Run/Goal 面板**仍缺 (API 已就绪)。

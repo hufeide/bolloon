@@ -1720,6 +1720,48 @@ export async function createWebServer(port: number = 3000, options: CreateWebSer
     console.warn('[runs] 对账失败 (非致命):', (err as Error)?.message);
   }
 
+  // 2026-09-16 (M2-B): ExecutionSupervisor —— 长期执行层。
+  //   页面关掉、进程重启后由它把 Goal 继续下去; 跨进程排他靠 Goal lease (不是内存状态)。
+  //   Harness 管"这一段能不能安全执行", Supervisor 管"这个目标还要不要继续执行"。
+  if (process.env.BOLLOON_SUPERVISOR !== '0') {
+    try {
+      const { getSupervisor } = await import('../agents/execution-supervisor.js');
+      const sup = getSupervisor({
+        tickIntervalMs: Number(process.env.BOLLOON_SUPERVISOR_TICK_MS) || 30_000,
+        leaseTtlMs: Number(process.env.BOLLOON_SUPERVISOR_LEASE_MS) || 90_000,
+        maxPerTick: Number(process.env.BOLLOON_SUPERVISOR_MAX_PER_TICK) || 1,
+        log: (m: string) => console.log(m),
+        onEvent: (e: any) => { try { broadcast({ type: 'supervisor', ...e }); } catch { /* UI 广播失败不影响调度 */ } },
+        runner: async (req: any) => {
+          const goal = req.goal;
+          if (!goal?.channelId) {
+            return { status: 'blocked', error: 'Goal 没有 channelId: 无法在 web 进程内执行 (请在会话里继续, 或用 CLI /supervise)' };
+          }
+          const agent: any = await getAgentForChannel(goal.channelId, goal.agentId || '', undefined, undefined);
+          if (!agent) return { status: 'failed', error: 'agent 不可用' };
+          if (req.kind === 'resume' && req.prevRunId && typeof agent.resumeRun === 'function') {
+            const r = await agent.resumeRun(req.prevRunId);
+            return { runId: req.prevRunId, status: r?.ok ? 'done' : 'failed', error: r?.ok ? undefined : r?.reason };
+          }
+          // 跨预算继续: 新 Run 必须挂在同一个 Goal 下 (setGoalId), 并带上上一个 Run 的非幂等守卫
+          agent.setGoalId?.(goal.goalId);
+          agent.setContinuationGuards?.(req.guards || []);
+          const reply = await agent.prompt(req.instruction);
+          // 注意: prompt 收尾会清空 currentRunId → 必须读 lastRunId (否则会拿上一条 run 做决策)
+          const runId = agent.getLastRunId?.() || agent.getRunId?.();
+          return { runId, status: 'done', reply: typeof reply === 'string' ? reply.slice(0, 500) : undefined };
+        },
+      });
+      sup.start();
+      const st = sup.status();
+      console.log(`[supervisor] 长期执行层已启动 (owner=${st.owner}, tick=${st.tickIntervalMs}ms, lease=${st.leaseTtlMs}ms${st.dryRun ? ', DRY-RUN' : ''})`);
+    } catch (err) {
+      console.warn('[supervisor] 启动失败 (非致命):', (err as Error)?.message);
+    }
+  } else {
+    console.log('[supervisor] 长期执行层已关闭 (BOLLOON_SUPERVISOR=0)');
+  }
+
   // 2026-08-03 (Context OS P5): 初始化资产层 12+3 目录 (幂等, 每层 README 声明职责边界)
   try {
     const { ensureContextOsDirs } = await import('../bootstrap/context-os.js');
@@ -2910,6 +2952,60 @@ ${goalDesc}
   });
 
   // 2026-09-16: 运行记录 (持久化 harness) — 当前 + 历史 agent 运行。跨重载可读。
+  // 2026-09-16 (M2-B): 长期执行层诊断 + 手动推进 —— 与 CLI /supervise 读同一份持久化记录
+  app.get('/api/supervisor', async (_req, res) => {
+    try {
+      const { getSupervisor } = await import('../agents/execution-supervisor.js');
+      const { wakeReport, listRunnableGoals } = await import('../agents/goal-store.js');
+      const { runnable, skipped } = await listRunnableGoals({ now: Date.now() });
+      res.json({
+        supervisor: getSupervisor().status(),
+        wake: await wakeReport(),
+        runnable: runnable.map((g) => ({ goalId: g.goalId, objective: g.objective, status: g.status })),
+        skipped,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  // 手动踢一个调度周期 (调试/验收用; 不改变任何"事实来源")
+  app.post('/api/supervisor/tick', async (_req, res) => {
+    try {
+      const { getSupervisor } = await import('../agents/execution-supervisor.js');
+      const report = await getSupervisor().tickOnce();
+      res.json({ ok: true, report });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  // 2026-09-16 (2-E 第 4 类): 外部事件到达 → 唤醒在等它的 Goal (不重发已成功的请求)
+  app.post('/api/goals/:goalId/wake', async (req, res) => {
+    const goalId = String(req.params.goalId);
+    try {
+      const { getSupervisor } = await import('../agents/execution-supervisor.js');
+      const { readGoal, setContinuation } = await import('../agents/goal-store.js');
+      const g = await readGoal(goalId);
+      if (!g) { res.status(404).json({ error: `goal 不存在: ${goalId}` }); return; }
+      const woke = await getSupervisor().notifyExternal(goalId);
+      if (!woke) {
+        // 没在等外部事件也要如实回答 (可能它其实在等人/在跑), 但允许显式加急
+        if (req.body?.force) {
+          await setContinuation(goalId, { wakeReason: 'active', autoContinue: true, wakeAt: undefined, needsExternal: undefined });
+          res.json({ ok: true, goalId, woke: false, forced: true, note: `原状态 ${g.status} (不在等外部事件), 已按 force 加急` });
+          return;
+        }
+        res.status(409).json({ error: `Goal 不在等外部事件 (status=${g.status}, wakeReason=${g.continuation?.wakeReason || '无'})`, force_hint: '加 body {"force":true} 可强制加急' });
+        return;
+      }
+      res.json({ ok: true, goalId, woke: true, note: '已唤醒: 下一次 Supervisor tick 会推进它' });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) });
+    }
+  });
+
+  // 2026-09-16 (M5): 运行列表 —— Web 与 CLI 读同一份 run 事实 (~/.bolloon/runs)
   app.get('/api/runs', async (req, res) => {
     try {
       const { listRuns, formatRunLine } = await import('../agents/run-store.js');

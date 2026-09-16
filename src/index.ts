@@ -1413,6 +1413,59 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     return;
   }
 
+  // 2026-09-16 (M2-B): /supervise — 长期执行层 (状态/唤醒原因/手动推进一个周期) · /wake <goalId> — 外部事件唤醒
+  if (cmd === '/supervise' || cmd.startsWith('/supervise ')) {
+    const arg = trimmed.slice('/supervise'.length).trim();
+    try {
+      const { getSupervisor } = await import('./agents/execution-supervisor.js');
+      const { wakeReport, listRunnableGoals, formatGoalLine } = await import('./agents/goal-store.js');
+      const { runnable, skipped } = await listRunnableGoals({ now: Date.now() });
+      const st = getSupervisor().status();
+      appendLine(`${C_DIM}supervisor: owner=${st.owner} running=${st.running ? 'yes' : 'no'} tick=${st.tickIntervalMs}ms lease=${st.leaseTtlMs}ms dryRun=${st.dryRun ? 'yes' : 'no'} ticks=${st.ticks}${RESET}`);
+
+      if (arg === 'tick' || arg === 'start') {
+        // CLI 侧执行器: 用当前会话的 agent (没人注入 agent 时只诊断, 不假装跑过)
+        const runner = agent
+          ? async (req: any) => {
+            if (req.kind === 'resume' && req.prevRunId && typeof (agent as any).resumeRun === 'function') {
+              const r = await (agent as any).resumeRun(req.prevRunId);
+              return { runId: req.prevRunId, status: r?.ok ? 'done' : 'failed', error: r?.ok ? undefined : r?.reason };
+            }
+            (agent as any).setGoalId?.(req.goal.goalId);
+            (agent as any).setContinuationGuards?.(req.guards || []);
+            await (agent as any).prompt(req.instruction);
+            return { runId: (agent as any).getLastRunId?.() || (agent as any).getRunId?.(), status: 'done' };
+          }
+          : undefined;
+        const { ExecutionSupervisor } = await import('./agents/execution-supervisor.js');
+        const sup = new ExecutionSupervisor({ runner: runner as any, maxPerTick: 1, log: (m) => appendLine(`${C_DIM}${m}${RESET}`) });
+        const rep = await sup.tickOnce();
+        appendLine(`${C_ACCENT}调度周期 #${rep.tick}${RESET}  认领 ${rep.claimed.length} · 执行 ${rep.executed.length}${rep.skipped.length ? ` · 跳过 ${rep.skipped.length}` : ''}`);
+        for (const s of rep.skipped.slice(0, 6)) appendLine(`  ${C_DIM}跳过 ${s.goalId}: ${s.reason}${RESET}`);
+        for (const e of rep.executed) appendLine(`  ▶ ${e.goalId} → run=${e.runId || '-'} ${e.status || ''}${e.error ? ` (${e.error})` : ''}`);
+        return;
+      }
+
+      const rows = await wakeReport();
+      if (!rows.length) { appendLine(`${C_DIM}还没有目标。${RESET}`); return; }
+      for (const r of rows.slice(0, 12)) appendLine(`  ${r.goalId}  [${r.status}]  唤醒: ${r.wake}${r.lease ? `  (lease ${r.lease})` : ''}`);
+      if (runnable.length) { appendLine(`${C_DIM}现在可推进:${RESET}`); for (const g of runnable.slice(0, 5)) appendLine(`  ${formatGoalLine(g)}`); }
+      appendLine(`${C_DIM}/supervise tick 手动推进一个周期${RESET}`);
+    } catch (e: any) { appendLine(`${C_ERROR}/supervise 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`); }
+    return;
+  }
+
+  if (cmd === '/wake' || cmd.startsWith('/wake ')) {
+    const goalId = trimmed.slice('/wake'.length).trim();
+    if (!goalId) { appendLine(`${C_ERROR}用法: /wake <goalId> (外部事件到达后唤醒在等它的目标)${RESET}`); return; }
+    try {
+      const { getSupervisor } = await import('./agents/execution-supervisor.js');
+      const woke = await getSupervisor().notifyExternal(goalId);
+      appendLine(woke ? `${C_ACCENT}✅ 已唤醒 ${goalId} (下一次 tick 推进; 不重发已成功的请求)${RESET}` : `${C_DIM}${goalId} 不在等待外部事件 (未改动)${RESET}`);
+    } catch (e: any) { appendLine(`${C_ERROR}/wake 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`); }
+    return;
+  }
+
   // /model — 无参: 交互选择器 (ink 渲染, 复用 MentionPopup); 有参: 直接切换/测连通/看状态
   if (cmd === '/model' || cmd.startsWith('/model ')) {
     const modelArg = trimmed.slice('/model'.length).trim();
@@ -2291,6 +2344,8 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     appendLine(`  ${C_ACCENT}/resume${RESET}   从 checkpoint 继续一次运行  ${C_DIM}/resume · /resume <runId> (不是重发原 prompt)${RESET}`);
     appendLine(`  ${C_ACCENT}/pause${RESET}    暂停一次运行  ${C_DIM}/pause · /pause <runId>${RESET}`);
     appendLine(`  ${C_ACCENT}/approve${RESET}  批准等待人工处置的运行  ${C_DIM}/approve · /approve <runId>${RESET}`);
+    appendLine(`  ${C_ACCENT}/supervise${RESET} 长期执行层状态与唤醒原因  ${C_DIM}/supervise · /supervise tick${RESET}`);
+    appendLine(`  ${C_ACCENT}/wake${RESET}     外部事件到达 → 唤醒在等的目标  ${C_DIM}/wake <goalId>${RESET}`);
     appendLine(`  ${C_ACCENT}/goals${RESET}    目标 (判据/证据/完成门)  ${C_DIM}/goals · /goals <goalId>${RESET}`);
     appendLine(`  ${C_ACCENT}/setup${RESET}    初始化 / 配置总览  ${C_DIM}身份 + 供应商 + 配置文件路径${RESET}`);
     appendLine(`  ${C_ACCENT}/questions${RESET} 待回答的问题  ${C_DIM}智能体 clarify 提问时, 直接输入即回答 (或 /answer <文本>)${RESET}`);

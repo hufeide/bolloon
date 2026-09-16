@@ -820,41 +820,7 @@ export async function prepareResume(runId: string): Promise<{ ok: boolean; reaso
     return { ok: false, reason: `状态 ${rec.status} 不可恢复 (可恢复: ${RESUMABLE_STATUSES.join('/')})` };
   }
 
-  const completedSteps = rec.steps.filter((s) => s.ok);
-  const replayGuards = rec.steps
-    .filter((s) => s.ok && isNonIdempotentTool(s.tool))
-    .map((s) => ({ tool: s.tool, argsDigest: s.argsDigest, summary: s.summary || '(已执行)' }));
-
-  let objective: string | undefined;
-  let goalId = rec.goalId;
-  if (goalId) {
-    try {
-      const { readGoal } = await import('./goal-store.js');
-      const g = await readGoal(goalId);
-      objective = g?.objective;
-    } catch { /* goal-store 不可用不影响恢复 */ }
-  }
-
-  // nextAction 要能直接指路 (恢复指令的核心): 上一步成功 → 别重做, 收尾确认; 上一步失败 → 先处理失败
-  const last = rec.steps[rec.steps.length - 1];
-  const defaultNext = last
-    ? (last.ok
-      ? `上一步 ${last.tool} 已成功; 如果目标已达成, 直接给出结论与证据并收尾 (不要重复已完成的动作)`
-      : `上一步 ${last.tool} 失败 (${String(last.error || '未知').slice(0, 100)}); 先处理这个失败再继续目标`)
-    : '继续未完成的目标 (先读最近失败步骤, 不要重复已成功的动作)';
-
-  const plan: ResumePlan = {
-    run: rec,
-    checkpoint: rec.checkpoint,
-    completedSteps,
-    lastStep: last,
-    nextAction: rec.checkpoint?.nextAction && !/由这一步的结果决定/.test(rec.checkpoint.nextAction)
-      ? rec.checkpoint.nextAction
-      : defaultNext,
-    replayGuards,
-    objective,
-    goalId,
-  };
+  const plan = await buildPlanFromRecord(rec);
 
   // 抢占归属 + 状态机: resumed run 归当前进程 (否则启动对账会把它再判成 interrupted)
   const claimed = await withRunLock(runId, () => coreWrite('prepareResume', runId, async () => {
@@ -872,13 +838,62 @@ export async function prepareResume(runId: string): Promise<{ ok: boolean; reaso
 
   await recordRecovery(runId, {
     errorClass: (rec.errorClass as ErrorClass) || 'crash',
-    message: `从 checkpoint 恢复 (已完成 ${completedSteps.length} 步, 非幂等守卫 ${replayGuards.length} 条)`,
+    message: `从 checkpoint 恢复 (已完成 ${plan.completedSteps.length} 步, 非幂等守卫 ${plan.replayGuards.length} 条)`,
     action: 'resume',
     checkpointBefore: rec.steps.length,
     changedPlan: rec.steps.length > 0,
   });
 
   return { ok: true, plan };
+}
+
+/**
+ * 2026-09-16 (M2-B): **只读**为一个新 Run 生成"继续同一 Goal"的计划 (Supervisor 跨预算续跑用)。
+ * 不改状态、不抢归属 —— 与 prepareResume 的区别是: 这条 Run 已经结束了, 我们要开下一条。
+ */
+export async function buildContinuationPlan(prevRunId: string): Promise<ResumePlan | null> {
+  const rec = await readRun(prevRunId);
+  if (!rec) return null;
+  return buildPlanFromRecord(rec);
+}
+
+/** 计划构造的唯一实现 (resume 与 continuation 共用, 避免两套语义漂移) */
+async function buildPlanFromRecord(rec: RunRecord): Promise<ResumePlan> {
+  const completedSteps = rec.steps.filter((s) => s.ok);
+  const replayGuards = rec.steps
+    .filter((s) => s.ok && isNonIdempotentTool(s.tool))
+    .map((s) => ({ tool: s.tool, argsDigest: s.argsDigest, summary: s.summary || '(已执行)' }));
+
+  let objective: string | undefined;
+  const goalId = rec.goalId;
+  if (goalId) {
+    try {
+      const { readGoal } = await import('./goal-store.js');
+      const g = await readGoal(goalId);
+      objective = g?.objective;
+    } catch { /* goal-store 不可用不影响恢复 */ }
+  }
+
+  // nextAction 要能直接指路 (恢复指令的核心): 上一步成功 → 别重做, 收尾确认; 上一步失败 → 先处理失败
+  const last = rec.steps[rec.steps.length - 1];
+  const defaultNext = last
+    ? (last.ok
+      ? `上一步 ${last.tool} 已成功; 如果目标已达成, 直接给出结论与证据并收尾 (不要重复已完成的动作)`
+      : `上一步 ${last.tool} 失败 (${String(last.error || '未知').slice(0, 100)}); 先处理这个失败再继续目标`)
+    : '继续未完成的目标 (先读最近失败步骤, 不要重复已成功的动作)';
+
+  return {
+    run: rec,
+    checkpoint: rec.checkpoint,
+    completedSteps,
+    lastStep: last,
+    nextAction: rec.checkpoint?.nextAction && !/由这一步的结果决定/.test(rec.checkpoint.nextAction)
+      ? rec.checkpoint.nextAction
+      : defaultNext,
+    replayGuards,
+    objective,
+    goalId,
+  };
 }
 
 /** 恢复真正开始执行时: recovering → running */
