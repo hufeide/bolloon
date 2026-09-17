@@ -17,6 +17,7 @@ import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import { spawn, type ChildProcess } from 'child_process';
 
+const REAL_HOME = os.homedir();                      // 必须在覆盖 HOME 之前取 (否则复制不到真实 LLM 配置)
 const tmpRoot = path.join(os.tmpdir(), 'bolloon-retrywake-' + Date.now());
 const HOME = path.join(tmpRoot, 'home');
 process.env.HOME = HOME;
