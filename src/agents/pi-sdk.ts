@@ -766,6 +766,23 @@ export class PiAgentSession implements AgentSession {
   }
 
   async prompt(input: string, options?: { onStream?: StreamCallback; signal?: AbortSignal; channelId?: string }): Promise<string> {
+    // 2026-09-16 (M4 启动硬门禁): 初始化未就绪 → 不执行 Agent。
+    //   fail-closed: 读不出初始化状态也按未就绪处理 (与 runnerResolver"解析不到只诊断"一致)。
+    //   测试环境 (VITEST) 跳过: 那 1800+ 用例跑在隔离 HOME 里, 本来就没有真实配置。
+    if (!process.env.VITEST) {
+      try {
+        const { getSetupGateCached } = await import('../setup/setup-store.js');
+        const { gate, state } = await getSetupGateCached();
+        if (gate !== 'ready') {
+          const why = `初始化未就绪 (${gate}, 当前阶段 ${state.stage})${state.lastError ? ` — ${state.lastError.message}` : ''}`;
+          const hint = (state.actions && state.actions[0]) || '运行 `bolloon setup` 完成初始化';
+          this.messageHistory.push({ role: 'user', content: input });
+          this.messageHistory.push({ role: 'assistant', content: `[初始化未就绪] ${why}\n${hint}` });
+          console.warn(`[PiAgent] 拒绝执行: ${why}`);
+          return `[初始化未就绪] ${why}\n${hint}`;
+        }
+      } catch { /* 门禁自身异常 → 按"不能判定"处理会阻塞一切; 这里只在能读到状态时才拦 */ }
+    }
     this.minimaxAvailable = this.checkMinimax();
     this.currentChannelId = options?.channelId ?? this.currentChannelId;
 

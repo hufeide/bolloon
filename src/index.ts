@@ -4255,13 +4255,35 @@ async function main() {
   // 2026-09-13: 首次运行引导 — 没有可用模型供应商 / 还没有用户身份时, 先走初始化向导
   //   (放在 CLI 启动前: 用户先回答"你是谁 / 用哪个模型", 再进 TUI 面板)
   if (isCLIInteractive) {
+    // 2026-09-16 (M4 启动硬门禁): 先把初始化事实读出来 —— 未就绪就**先修**, 修不好就非零退出。
+    //   旧行为是"向导失败也只 warn, 照常进对话", 结果是半成品配置能进运行态 (看起来启动成功、实际不可执行)。
+    const w = (m: string) => process.stderr.write(m.endsWith('\n') ? m : m + '\n');
+    let gateEv: any = null;
     try {
-      const { isFirstRun, runSetupWizard } = await import('./cli/setup-wizard.js');
-      if (await isFirstRun()) {
-        await runSetupWizard({ interactive: true });
+      const { refreshSetupState, describeSetup } = await import('./setup/setup-store.js');
+      gateEv = await refreshSetupState({ light: true });
+      if (gateEv.gate !== 'ready') {
+        w(describeSetup(gateEv));
+        if (process.env.BOLLOON_SKIP_SETUP === '1') {
+          w('⚠ BOLLOON_SKIP_SETUP=1 → 诊断模式: 可以看状态/修配置, 但 agent 执行被门禁拦住 (不能绕过)');
+        } else {
+          const { runSetupWizard } = await import('./cli/setup-wizard.js');
+          await runSetupWizard({ interactive: true });
+          const after = await refreshSetupState({});
+          if (after.gate !== 'ready') {
+            w(describeSetup(after));
+            w('⛔ 初始化未完成 → 退出 (不会以"看起来能跑"的状态进入对话)');
+            process.exit(1);
+          }
+          w('✅ 初始化完成, 进入正常模式');
+        }
       }
     } catch (e: any) {
-      console.warn('[setup] 初始化向导失败 (不阻塞启动):', String(e?.message || e).slice(0, 200));
+      // 评估/向导自身异常: fail-closed —— 不假装就绪
+      w(`⛔ 初始化流程失败 (fail-closed): ${String(e?.message || e).slice(0, 200)}`);
+      w(`   当前状态评估: ${gateEv ? gateEv.gate : '未知 (评估都没跑通)'}`);
+      w('   排查: `bolloon setup --status` (或删掉 ~/.bolloon/setup-state.json 后重跑 setup)');
+      process.exit(1);
     }
   }
 

@@ -5,6 +5,7 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import * as os from 'os';
 
 export type ModelProvider = 'openai' | 'anthropic' | 'ollama' | 'openrouter' | 'gemini' | 'minimax' | 'deepseek' | 'kimi' | 'glm' | 'qwen' | 'mimo' | 'grok' | 'local';
 
@@ -24,11 +25,16 @@ export interface LLMConfig {
   updatedAt: string;
 }
 
-const CONFIG_DIR = path.join(process.env.HOME || '/tmp', '.bolloon');
+/** 2026-09-16 (M1): 不再在模块加载时固定 HOME —— 独立宿主/测试注入/长驻进程都走同一个解析 */
+function configDir(): string {
+  const env = process.env.BOLLOON_HOME?.trim();
+  if (env) return env;
+  return path.join(process.env.HOME || os.homedir() || '/tmp', '.bolloon');
+}
 // 2026-08-07: llm-config.json → bolloon-config.json (统一配置文件名, Bolloon 自己有写权限)
 //   initialize() 会做一次迁移: 旧文件存在且新文件不存在 → 复制旧内容, 之后统一读写新文件
-const CONFIG_PATH = path.join(CONFIG_DIR, 'bolloon-config.json');
-const LEGACY_CONFIG_PATH = path.join(CONFIG_DIR, 'llm-config.json');
+const CONFIG_PATH = path.join(configDir(), 'bolloon-config.json');
+const LEGACY_CONFIG_PATH = path.join(configDir(), 'llm-config.json');
 
 export const DEFAULT_PROVIDER_CONFIGS: Record<ModelProvider, ProviderConfig> = {
   openai: {
@@ -266,7 +272,7 @@ class LLMConfigStore {
     if (this.initialized) return;
 
     try {
-      await fs.mkdir(CONFIG_DIR, { recursive: true });
+      await fs.mkdir(configDir(), { recursive: true });
       // 2026-08-07: 迁移 — 旧 llm-config.json 存在且新 bolloon-config.json 不存在时复制旧内容
       try {
         await fs.access(CONFIG_PATH);

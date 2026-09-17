@@ -1753,13 +1753,22 @@ export async function createWebServer(port: number = 3000, options: CreateWebSer
         };
         return { ok: true, runner, kind: 'web' as const };
       };
+      // 2026-09-16 (M4): 初始化未就绪 → Supervisor 只诊断 (不解析执行器, 不执行任何 Goal)
+      let setupReadyForSupervisor = false;
+      try {
+        const { getSetupGateCached } = await import('../setup/setup-store.js');
+        const g = await getSetupGateCached();
+        setupReadyForSupervisor = g.gate === 'ready';
+        if (!setupReadyForSupervisor) console.warn(`[supervisor] 初始化未就绪 (${g.gate}, 阶段 ${g.state.stage}) → 只诊断, 不执行 Goal`);
+      } catch { console.warn('[supervisor] 初始化状态不可读 → 只诊断, 不执行 Goal'); }
+
       const sup = getSupervisor({
         tickIntervalMs: tickMs,
         leaseTtlMs: leaseMs,
         maxPerTick: Number(process.env.BOLLOON_SUPERVISOR_MAX_PER_TICK) || 1,
         log: (m: string) => console.log(m),
         onEvent: (e: any) => { try { broadcast({ type: 'supervisor', ...e }); } catch { /* UI 广播失败不影响调度 */ } },
-        resolver: resolver as any,
+        resolver: setupReadyForSupervisor ? (resolver as any) : undefined,
       });
       // 宿主层: 跨进程单 tick 互斥 + 宿主身份/心跳落盘 + 优雅停止
       const host = await runSupervisorHost({
@@ -2974,6 +2983,17 @@ ${goalDesc}
   });
 
   // 2026-09-16: 运行记录 (持久化 harness) — 当前 + 历史 agent 运行。跨重载可读。
+  // 2026-09-16 (M1/M3): 初始化状态 —— CLI 与 Web 读同一份事实 (setup-state.json + 各领域 store)
+  app.get('/api/setup', async (_req, res) => {
+    try {
+      const { evaluateSetup, describeSetup, resolveBolloonHome } = await import('../setup/setup-store.js');
+      const ev = await evaluateSetup({ light: false });
+      res.json({ gate: ev.gate, stage: ev.state.stage, readiness: ev.state.readiness, allow: ev.state.allow, completed: ev.state.completed, inputs: ev.state.inputs, lastError: ev.state.lastError, reasons: ev.reasons, nextActions: ev.nextActions, summary: describeSetup(ev), bolloonHome: resolveBolloonHome() });
+    } catch (err) {
+      res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200), gate: 'blocked' });
+    }
+  });
+
   // 2026-09-16 (2-G.1): Skills Manager —— 与 CLI `/skills` `/skill` 读同一份事实 (skills-registry.json + 技能目录)
   app.get('/api/skills', async (_req, res) => {
     try {
@@ -3062,6 +3082,7 @@ ${goalDesc}
 
   // 手动踢一个调度周期 (调试/验收用; 不改变任何"事实来源")
   app.post('/api/supervisor/tick', async (_req, res) => {
+    if (!(await setupGate(res))) return;
     try {
       const { getSupervisor } = await import('../agents/execution-supervisor.js');
       const report = await getSupervisor().tickOnce();
@@ -4204,7 +4225,27 @@ ${goalDesc}
     });
   });
 
+  // 2026-09-16 (M4): agent 执行硬门禁 —— 未 ready 时这些路由 503 + 结构化初始化状态 (Web 只显示初始化页)
+  const setupGate = async (res: any): Promise<boolean> => {
+    try {
+      const { getSetupGateCached } = await import('../setup/setup-store.js');
+      const { gate, state } = await getSetupGateCached();
+      if (gate === 'ready') return true;
+      res.status(503).json({
+        error: `初始化未就绪 (${gate}, 阶段 ${state.stage}) — 请先完成初始化`,
+        gate, stage: state.stage, readiness: state.readiness,
+        nextActions: state.actions, lastError: state.lastError || null,
+      });
+      return false;
+    } catch (err) {
+      // fail-closed: 连门禁都读不出来 → 不放行
+      res.status(503).json({ error: `初始化状态不可读 (fail-closed): ${String((err as Error)?.message || err).slice(0, 160)}`, gate: 'blocked' });
+      return false;
+    }
+  };
+
   app.post('/message', async (req, res) => {
+    if (!(await setupGate(res))) return;
     const { text, channelId, channelDid, attachments } = req.body;
     if (!text) {
       return res.status(400).json({ error: 'No text provided' });

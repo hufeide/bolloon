@@ -142,8 +142,11 @@ export async function isFirstRun(home: string = os.homedir()): Promise<boolean> 
     if (!usable) return true;
     const user = await readUserIdentity(home);
     return !user;
-  } catch {
-    return false;   // 判断失败不阻塞启动
+  } catch (e: any) {
+    // 2026-09-16 (M0/M4): **fail-closed** —— 判断失败必须按"需要初始化"处理。
+    //   旧行为 `return false` 会把"读取配置失败"当成"不需要初始化", 半成品配置因此蒙混进入运行态。
+    console.warn('[setup] 首次运行判定失败, 按"需要初始化"处理 (fail-closed):', String(e?.message || e).slice(0, 160));
+    return true;
   }
 }
 
