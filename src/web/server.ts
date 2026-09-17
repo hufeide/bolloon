@@ -2983,6 +2983,93 @@ ${goalDesc}
   });
 
   // 2026-09-16: 运行记录 (持久化 harness) — 当前 + 历史 agent 运行。跨重载可读。
+  // 2026-09-16 (2-F/2-H): 判据 (criteria) + 长期执行面板 API —— CLI/Web 读同一份 Goal 事实
+  app.get('/api/goals/:id/criteria', async (req, res) => {
+    try {
+      const { longTermStatus } = await import('../agents/goal-criteria.js');
+      const { readGoal } = await import('../agents/goal-store.js');
+      const g = await readGoal(req.params.id);
+      if (!g) return res.status(404).json({ error: 'goal 不存在' });
+      const st = await longTermStatus(req.params.id);
+      res.json({ goalId: g.goalId, objective: g.objective, status: g.status, successCriteria: g.successCriteria, completedCriteria: g.completedCriteria, criteriaSource: g.criteriaSource, criteriaConfirmed: g.criteriaConfirmed === true, criteriaVersion: g.criteriaVersion, proposedCriteria: g.proposedCriteria || null, unresolvedItems: g.unresolvedItems, evidence: (g.evidence || []).slice(-10), longTerm: st });
+    } catch (err) { res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) }); }
+  });
+
+  app.post('/api/goals/:id/criteria', async (req, res) => {
+    try {
+      const { confirmCriteria, proposeForGoal } = await import('../agents/goal-criteria.js');
+      const { readGoal } = await import('../agents/goal-store.js');
+      const g = await readGoal(req.params.id);
+      if (!g) return res.status(404).json({ error: 'goal 不存在' });
+      const criteria = Array.isArray(req.body?.criteria) ? req.body.criteria.map((c: any) => String(c)) : undefined;
+      if (req.body?.propose === true) {
+        const p = await proposeForGoal(req.params.id);
+        return res.json({ ok: p.ok, proposed: p.criteria, needsHuman: !!p.needsHuman, reason: p.reason || null });
+      }
+      // 默认: 确认 (可同时改内容)
+      const r = await confirmCriteria(req.params.id, { criteria, by: 'web' });
+      res.status(r.ok ? 200 : 409).json({ ok: r.ok, reason: r.reason || null, criteria: r.goal?.successCriteria, criteriaVersion: r.goal?.criteriaVersion });
+    } catch (err) { res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) }); }
+  });
+
+  // 长期执行面板 (纯静态页, 直接打已有 API; 未 ready 时 chat 路由本来就 503)
+  app.get('/goals', (_req, res) => {
+    res.type('html').send(`<!doctype html><meta charset="utf-8"><title>Bolloon 长期执行</title>
+<style>body{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;max-width:1000px;margin:32px auto;padding:0 16px;line-height:1.55;color:#181818}
+h1{font-size:20px}h2{font-size:15px;margin-top:22px}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid #eee;padding:6px 8px;text-align:left;vertical-align:top}
+.ok{color:#0a7d32}.bad{color:#b00020}.dim{color:#666}button{font-size:12px;padding:4px 8px;margin-right:4px}code{background:#f6f6f6;padding:1px 4px;border-radius:4px}</style>
+<h1>长期执行面板</h1>
+<p class="dim">数据 = <code>/api/goals</code> · <code>/api/runs</code> · <code>/api/goals/:id/criteria</code> · <code>/api/supervisor</code> (与 CLI 同一份事实)</p>
+<div id="sup"></div>
+<h2>目标 (Goals)</h2><table id="goals"><thead><tr><th>goalId</th><th>状态</th><th>判据</th><th>下一动作</th><th>Runs</th><th>操作</th></tr></thead><tbody></tbody></table>
+<h2>运行 (Runs, 最近 20)</h2><table id="runs"><thead><tr><th>runId</th><th>goalId</th><th>状态</th><th>步数</th><th>恢复</th><th>操作</th></tr></thead><tbody></tbody></table>
+<pre id="log" class="dim"></pre>
+<script>
+const log = (m) => { document.getElementById('log').textContent = typeof m === 'string' ? m : JSON.stringify(m, null, 1); };
+async function j(u){ const r = await fetch(u); return await r.json(); }
+async function view(id){
+  const c = await j('/api/goals/'+id+'/criteria');
+  log(c);
+}
+async function act(id, what){
+  if (what === 'confirm') { const r = await fetch('/api/goals/'+id+'/criteria',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})}); log(await r.json()); }
+  else if (what === 'propose') { const r = await fetch('/api/goals/'+id+'/criteria',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({propose:true})}); log(await r.json()); }
+  else if (what === 'wake') { const r = await fetch('/api/goals/'+id+'/wake',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({force:true})}); log(await r.json()); }
+  else if (what === 'resume') { const r = await fetch('/api/runs/'+id+'/resume',{method:'POST'}); log(await r.json()); }
+  else if (what === 'pause') { const r = await fetch('/api/runs/'+id+'/pause',{method:'POST'}); log(await r.json()); }
+  else if (what === 'abort') { const r = await fetch('/api/runs/'+id+'/abort',{method:'POST'}); log(await r.json()); }
+  refresh();
+}
+async function refresh(){
+  try {
+    const sup = await j('/api/supervisor');
+    document.getElementById('sup').innerHTML = '<b>Supervisor</b> owner='+(sup.state?.owner||'-')+' worker='+(sup.state?.workerId||'-')+' ticks='+(sup.ticks||0)+
+      ' <span class="dim">lease='+(sup.leaseTtlMs||'-')+'ms tick='+(sup.tickIntervalMs||'-')+'ms</span>';
+  } catch(e){ document.getElementById('sup').textContent = 'supervisor 不可用: '+e; }
+  const gs = await j('/api/goals');
+  const gtb = document.querySelector('#goals tbody'); gtb.innerHTML = '';
+  for (const g of (gs.goals || [])) {
+    let crit = g.successCriteria?.length ? (g.completedCriteria?.length||0)+'/'+g.successCriteria.length : '<span class="bad">无判据</span>';
+    const src = g.criteriaSource ? ' <span class="dim">('+g.criteriaSource+(g.criteriaConfirmed?'✓':'?')+')</span>' : '';
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td><code>'+g.goalId+'</code></td><td>'+g.status+'</td><td>'+crit+src+'</td><td class="dim">'+
+      ((g.continuation&&(g.continuation.nextAction||g.continuation.wakeReason))||'-')+'</td><td>'+((g.runs||[]).length)+'</td>'+
+      '<td><button onclick="view(\''+g.goalId+'\')">详情</button><button onclick="act(\''+g.goalId+'\',\'confirm\')">确认判据</button><button onclick="act(\''+g.goalId+'\',\'propose\')">提候选</button><button onclick="act(\''+g.goalId+'\',\'wake\')">唤醒</button></td>';
+    gtb.appendChild(tr);
+  }
+  const rs = await j('/api/runs');
+  const rtb = document.querySelector('#runs tbody'); rtb.innerHTML = '';
+  for (const r of (rs.runs || []).slice(-20).reverse()) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td><code>'+String(r.runId).slice(0,14)+'</code></td><td class="dim">'+(r.goalId||'-')+'</td><td>'+r.status+'</td><td>'+((r.steps||[]).length)+'</td><td>'+((r.recovery||[]).length)+'</td>'+
+      '<td><button onclick="act(\''+r.runId+'\',\'resume\')">resume</button><button onclick="act(\''+r.runId+'\',\'pause\')">pause</button><button onclick="act(\''+r.runId+'\',\'abort\')">abort</button></td>';
+    rtb.appendChild(tr);
+  }
+}
+refresh(); setInterval(refresh, 5000);
+</script>`);
+  });
+
   // 2026-09-16 (Phase 4): Onboard API —— 与 CLI 共用同一条执行器 (src/setup/onboard.ts)
   //   页面只负责"提交本步输入", 阶段判定/校验/真实验证/原子提交/门禁全在服务端同一份事实里。
   const setupState = async () => {

@@ -60,7 +60,7 @@ export function continuationBackoffMs(attempts: number): number {
 export function decideGoalOutcome(
   goal: GoalRecord,
   run: RunRecord | null,
-  opts: { now?: number; maxAttempts?: number } = {},
+  opts: { now?: number; maxAttempts?: number; lastRunStatus?: string } = {},
 ): GoalDecision {
   const now = opts.now ?? Date.now();
   // maxAttempts = 允许的自动继续次数 (默认 2) → 第 3 次失败进 needs_human
@@ -113,7 +113,7 @@ export function decideGoalOutcome(
       };
 
     case 'done': {
-      const verdict = evaluateGoalCompletion(goal);
+      const verdict = evaluateGoalCompletion(goal, { lastRunStatus: opts.lastRunStatus || run.status });
       if (verdict.complete) {
         return {
           goalStatus: 'completed',
@@ -494,7 +494,26 @@ export class ExecutionSupervisor {
       // 新 Run 必须挂在同一 Goal 下; 没挂上就是执行器没接住 goalId → 如实记, 不掩盖
       report.errors.push(`${goal.goalId}: 新 Run ${finalRunId} 未绑定本 Goal (goalId=${finalRun.goalId || '空'})`);
     }
-    const decision = decideGoalOutcome(goal, finalRun, { now: this.now(), maxAttempts: this.maxRetries });
+    // 2026-09-16 (2-F): 决策前先做两件事 —— ① 跨 Run 汇总证据; ② 没判据就提候选 (未确认 → 不许完成)。
+    //   放在决策之前, 因为"有没有判据/判据是否被满足"正是决策的输入 (之前放在 completed 分支里 = 永远轮不到)。
+    try {
+      const { aggregateEvidence, proposeForGoal } = await import('./goal-criteria.js');
+      await aggregateEvidence(goal.goalId);
+      const refreshedBefore = await readGoal(goal.goalId);
+      // 只在"这一轮正常跑完"时提候选判据 —— 失败/中断要留给 retry 退避逻辑, 不能把重试变成"交人"
+      const ranClean = String(finalRun?.status || '') === 'done';
+      if (ranClean && refreshedBefore && !refreshedBefore.successCriteria.length && !['completed', 'failed', 'abandoned'].includes(refreshedBefore.status)) {
+        const p = await proposeForGoal(goal.goalId);
+        if (p.ok) this.log(`[supervisor] goal=${goal.goalId} 已提候选判据 (待确认, 未确认前不会判完成)`);
+        else this.log(`[supervisor] goal=${goal.goalId} 判据生成失败 → 交人: ${p.reason}`);
+      }
+    } catch (err) {
+      this.log(`[supervisor] 证据/判据处理失败: ${(err as Error)?.message}`);
+    }
+
+    // 重新读一次 Goal: Run 期间判据可能已被满足 (否则会拿旧快照判决)
+    const goalForDecision = (await readGoal(goal.goalId)) || goal;
+    const decision = decideGoalOutcome(goalForDecision, finalRun, { now: this.now(), maxAttempts: this.maxRetries, lastRunStatus: finalRun?.status });
     await this.applyDecision(goal, decision, finalRun);
     this.emit({ kind: 'goal_decision', goalId: goal.goalId, runId: finalRunId, message: `${finalRun?.status || result.status || '?'} → ${decision.goalStatus}: ${decision.reason}` });
     this.log(`[supervisor] goal=${goal.goalId} run=${finalRunId || '-'} ${finalRun?.status || result.status || '?'} → goal=${decision.goalStatus} (${decision.reason}) ${Date.now() - t0}ms`);
@@ -514,6 +533,7 @@ export class ExecutionSupervisor {
 
     // 唯一完成出口: 只有经 completeGoalIfEligible 才能把 Goal 判成 completed
     if (decision.goalStatus === 'completed') {
+      // 完成门 (判据存在 + 已确认 + 全满足 + 有证据 + 无未解决项 + 最近 Run 健康)
       const r = await completeGoalIfEligible(goal.goalId);
       if (!r.ok) {
         // 完成门拒绝 → 如实退回 active, 并保留原因 (不许装作完成)

@@ -20,6 +20,10 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fsp from 'fs/promises';
 import * as crypto from 'crypto';
+// 2026-09-16 (2-G.3): 事务型导入复用底层真实实现 (别名避免与上面重名)
+import { parseSkillBundle as parseBundleLoose, parseSkillRef as parseSkillRefLoose, fetchSkillBundle as fetchBundleLoose } from './skill-share.js';
+import { sanitizeSkillName as sanitizeNameLoose, getUserSkillsDir as userSkillsDirLoose, getProjectSkillsDir as projectSkillsDirLoose } from './skill-writer.js';
+import { parseSkillFile as parseSkillFileLoose } from './skill-loader.js';
 import { parseSkillFile, SkillMeta, defaultSkillPaths } from './skill-loader.js';
 import { getUserSkillsDir, getProjectSkillsDir } from './skill-writer.js';
 import {
@@ -388,6 +392,8 @@ export class SkillsManager {
     if (!rec) return { ok: false, reason: `没有这个技能: ${name}` };
     if (rec.issues.length) return { ok: false, reason: `技能不合格, 不能启用: ${rec.issues.join('; ')}` };
     const skill = await this.patchRegistry(name, { status: 'enabled' }, opts.home);
+    // 2-G.4: 技能又能用了 → 重评被它拦住的 Goal (回 active, 等 Supervisor 继续)
+    await this.onRegistryChanged({ home: opts.home ?? this.home, action: 'enable', name }).catch(() => null);
     return { ok: true, skill: skill || undefined };
   }
 
@@ -395,6 +401,12 @@ export class SkillsManager {
     const rec = await this.inspect(name, opts);
     if (!rec) return { ok: false, reason: `没有这个技能: ${name}` };
     const skill = await this.patchRegistry(name, { status: 'disabled' }, opts.home);
+    // 2-G.4: 记录"谁依赖它" (不打断当前 Run; 下一次 Run 前由 2-G.2 门禁拦)
+    try {
+      const { markDependentsOfSkill } = await import('./skill-supervisor-link.js');
+      const affected = await markDependentsOfSkill(name, { home: opts.home ?? this.home, reason: '技能被禁用' });
+      if (affected.length) console.warn(`[skills] ${name} 被禁用; 依赖它的 Goal: ${affected.join(', ')} (下一次 Run 前会门禁)`);
+    } catch { /* 联动失败不影响禁用结果 */ }
     return { ok: true, skill: skill || undefined };
   }
 
@@ -418,6 +430,12 @@ export class SkillsManager {
     };
     await writeRegistry(reg, opts.home ?? this.home);
     this.cache = null;
+    // 2-G.4: 隔离 = 不再可信 → 依赖它的 Goal 下一次 Run 前必然门禁失败
+    try {
+      const { markDependentsOfSkill } = await import('./skill-supervisor-link.js');
+      const affected = await markDependentsOfSkill(name, { home: opts.home ?? this.home, reason: `技能被隔离: ${reason}` });
+      if (affected.length) console.warn(`[skills] ${name} 被隔离; 依赖它的 Goal: ${affected.join(', ')}`);
+    } catch { /* 联动失败不影响隔离结果 */ }
     return { ok: true, skill: (await this.inspect(name, opts)) || undefined };
   }
 
@@ -442,6 +460,14 @@ export class SkillsManager {
    * 事务化 (临时目录 + 原子移动 + hash 校验) 属 2-G.3。
    */
   async import(ref: string, opts: { home?: string; cwd?: string; force?: boolean; scope?: 'user' | 'project'; source?: SkillSource } = {}): Promise<{ ok: boolean; name?: string; version?: string; error?: string; skill?: SkillRecord }> {
+    // 2026-09-16 (2-G.3): 统一走事务版 (暂存 → 原子替换 → 校验 → 回滚), 失败不污染当前技能环境
+    const tx = await this.importTransactional({ ref }, opts);
+    if (tx.ok) await this.onRegistryChanged({ home: opts.home ?? this.home, action: 'import', name: tx.name }).catch(() => null);
+    return { ok: tx.ok, name: tx.name, version: tx.version, error: tx.error, skill: tx.skill };
+  }
+
+  /** @deprecated 保留旧签名以兼容; 内部已走事务版 */
+  private async importLegacy(ref: string, opts: { home?: string; cwd?: string; force?: boolean; scope?: 'user' | 'project'; source?: SkillSource } = {}): Promise<{ ok: boolean; name?: string; version?: string; error?: string; skill?: SkillRecord }> {
     const cid = parseSkillRef(ref);
     if (!cid) return { ok: false, error: `无法识别的技能引用 (要 bolloon://skill/<cid> / ipfs://<cid> / 裸 CID): ${ref.slice(0, 60)}` };
     const fetched = await fetchSkillBundle(cid);
@@ -463,6 +489,14 @@ export class SkillsManager {
 
   /** 从已解析的技能包装入 (本地文件/已取到的包) */
   async install(bundleJson: string, opts: { home?: string; cwd?: string; force?: boolean; source?: SkillSource; sourceRef?: string } = {}): Promise<{ ok: boolean; name?: string; error?: string; skill?: SkillRecord }> {
+    // 2026-09-16 (2-G.3): 同样走事务 (install 的默认来源保持 'imported')
+    const tx = await this.importTransactional({ bundleJson }, { ...opts, source: opts.source || 'imported' });
+    if (tx.ok) await this.onRegistryChanged({ home: opts.home ?? this.home, action: 'install', name: tx.name }).catch(() => null);
+    return { ok: tx.ok, name: tx.name, error: tx.error, skill: tx.skill };
+  }
+
+  /** @deprecated 旧的"直接写正式目录"实现 (保留对照, 不再被 import/install 调用) */
+  private async installLegacy(bundleJson: string, opts: { home?: string; cwd?: string; force?: boolean; source?: SkillSource; sourceRef?: string } = {}): Promise<{ ok: boolean; name?: string; error?: string; skill?: SkillRecord }> {
     const parsed = parseSkillBundle(bundleJson);
     if (!parsed.ok || !parsed.bundle) return { ok: false, error: parsed.error || '包格式非法' };
     const inst = await installSkillBundle(parsed.bundle, { home: opts.home ?? this.home, cwd: opts.cwd ?? this.cwd, force: opts.force });
@@ -477,6 +511,186 @@ export class SkillsManager {
       }, h);
     }
     return { ok: true, name: parsed.bundle.name, skill: (await this.inspect(parsed.bundle.name, { home: h })) || undefined };
+  }
+
+
+  // ── 事务型导入 (2-G.3, 2026-09-16) ───────────────────────────────────────
+  /**
+   * 把 import/install 变成**事务**:
+   *   读来源 → 预备校验 (名字/路径穿越/SKILL.md frontmatter/版本门) → 写暂存目录
+   *   → 原子替换 (旧目录先改名保留) → 校验落地结果 → 更新 registry
+   * 任何一步失败: 正式目录不变 · registry 不变 · 暂存清理 · 失败原因可查询 (importHistory)。
+   * 中途被 SIGKILL: 只可能留下 `.<name>-staging-*` 暂存或 `.<name>.bak-*` 备份 →
+   *   recoverInterruptedImports() 会清理暂存并把备份恢复回正式位置。
+   */
+  async importTransactional(input: { ref?: string; bundleJson?: string }, opts: { home?: string; cwd?: string; force?: boolean; scope?: 'user' | 'project'; source?: SkillSource } = {}):
+    Promise<{ ok: boolean; name?: string; version?: string; error?: string; step?: string; backup?: string; skill?: SkillRecord }> {
+    const h = opts.home ?? this.home;
+    const started = Date.now();
+    const fail = async (step: string, error: string, name?: string) => {
+      await this.recordImportFailure({ step, error, name, ref: input.ref, at: new Date().toISOString() });
+      return { ok: false, error, step, name };
+    };
+
+    // 0) 先清上一次中断留下的暂存/备份, 避免互相干扰
+    await this.recoverInterruptedImports({ home: h }).catch(() => null);
+
+    // 1) 取包 (ref 走 IPFS; bundleJson 直接用)
+    let bundle: any = null;
+    let sourceRef = 'local-bundle';
+    if (input.bundleJson) {
+      const parsed: any = parseBundleLoose(input.bundleJson);
+      if (!parsed?.ok || !parsed.bundle) return await fail('parse', parsed?.error || '包格式非法 (不是 bolloon-skill-bundle/1 JSON)');
+      bundle = parsed.bundle; sourceRef = 'local-bundle';
+    } else if (input.ref) {
+      const cid = parseSkillRefLoose(input.ref);
+      if (!cid) return await fail('parse', `无法识别的技能引用: ${String(input.ref).slice(0, 60)}`);
+      const fetched: any = await fetchBundleLoose(cid);
+      if (!fetched?.ok || !fetched.bundle) return await fail('fetch', fetched?.error || '取包失败');
+      bundle = fetched.bundle; sourceRef = cid;
+    } else {
+      return await fail('parse', '必须给 ref 或 bundleJson');
+    }
+
+    // 2) 预备校验 (全部发生在动正式目录之前)
+    if (!bundle || typeof bundle !== 'object') return await fail('parse', '包内容不是对象');
+    const name = sanitizeNameLoose(bundle.name);
+    if (!name) return await fail('validate', '技能名非法 (清洗后为空)');
+    if (!bundle.files || typeof bundle.files !== 'object') return await fail('validate', '包内没有 files', name);
+    const skillMd = bundle.files['SKILL.md'];
+    if (typeof skillMd !== 'string' || !skillMd.trim()) return await fail('validate', '包内缺少 SKILL.md', name);
+    const fm = parseFrontmatterLoose(skillMd);
+    if (!fm) return await fail('validate', 'SKILL.md 缺少合法 frontmatter (--- 包裹)', name);
+    if (!fm.name) return await fail('validate', 'SKILL.md frontmatter 缺 name', name);
+    for (const rel of Object.keys(bundle.files)) {
+      const norm = path.normalize(rel).replace(/^([/\\])+/, '');
+      if (norm.startsWith('..') || path.isAbsolute(norm)) return await fail('validate', `技能包含非法路径 (路径穿越): ${rel}`, name);
+    }
+    const base = opts.scope === 'project' ? projectSkillsDirLoose(opts.cwd ?? this.cwd) : userSkillsDirLoose(h);
+    const targetDir = path.join(base, name);
+    const existingMeta = await parseSkillFileLoose(path.join(targetDir, 'SKILL.md'));
+    const existingVersion = String(existingMeta?.frontmatter?.version ?? '0.0.0');
+    const incomingVersion = String(bundle.version || fm.version || '0.0.0');
+    if (existingMeta && cmpVersionLoose(existingVersion, incomingVersion) >= 0 && !opts.force) {
+      return await fail('version', `本地已有 ${name}@${existingVersion}, 来的是 ${incomingVersion} (不更新; force=true 可强制)`, name);
+    }
+
+    // 3) 写暂存目录 (同名 . 前缀 → discover 不会当成技能)
+    const staging = path.join(base, `.${name}-staging-${started}`);
+    await fsp.mkdir(staging, { recursive: true });
+    try {
+      for (const [rel, content] of Object.entries(bundle.files)) {
+        const norm = path.normalize(rel).replace(/^([/\\])+/, '');
+        const abs = path.join(staging, norm);
+        await fsp.mkdir(path.dirname(abs), { recursive: true });
+        await fsp.writeFile(abs, String(content), 'utf-8');
+      }
+    } catch (err) {
+      await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
+      return await fail('stage', `写暂存失败: ${String((err as Error)?.message || err).slice(0, 160)}`, name);
+    }
+
+    // 4) 原子替换: 旧目录改名保留 (备份), 暂存改名就位
+    let backup: string | undefined;
+    try {
+      const exists = await fsp.stat(targetDir).then(() => true).catch(() => false);
+      if (exists) {
+        backup = path.join(base, `.${name}.bak-${started}`);
+        await fsp.rename(targetDir, backup);
+      }
+      await fsp.rename(staging, targetDir);
+    } catch (err) {
+      // 回滚: 备份放回, 暂存清掉
+      await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
+      if (backup) await fsp.rename(backup, targetDir).catch(() => {});
+      return await fail('swap', `原子替换失败 (已回滚): ${String((err as Error)?.message || err).slice(0, 160)}`, name);
+    }
+
+    // 5) 校验落地结果 (读回来再确认一次)
+    //    回滚条件只看**结构性失败** (SKILL.md 解析不出来); 内容质量类提示 (如正文过少) 只记警告 ——
+    //    否则用户自己的"简洁技能"永远装不回来 (导出→安装 自洽被打破)。
+    this.cache = null;
+    const parsedBack = await parseSkillFileLoose(path.join(targetDir, 'SKILL.md')).catch(() => null);
+    const after = await this.inspect(name, { home: h }).catch(() => null);
+    if (!parsedBack) {
+      await fsp.rm(targetDir, { recursive: true, force: true }).catch(() => {});
+      if (backup) await fsp.rename(backup, targetDir).catch(() => {});
+      return await fail('verify', `落地校验失败 (已回滚): SKILL.md 装完解析不出来`, name);
+    }
+    if (after && (after.issues || []).length) {
+      await appendImportHistory(h, { at: new Date().toISOString(), ok: true, kind: 'warning', name, step: 'verify', warning: (after.issues || []).slice(0, 3).join('; ') }).catch(() => {});
+    }
+
+    // 6) registry 更新 (失败不致命: 下次 discover 会重建)
+    try {
+      await this.patchRegistry(name, {
+        status: 'installed', source: opts.source || 'shared', sourceRef,
+        trust: 'unverified', contentHash: after?.contentHash || '', version: after?.version || incomingVersion,
+      }, h);
+    } catch (err) {
+      await this.recordImportFailure({ step: 'registry', error: `registry 更新失败: ${String((err as Error)?.message || err).slice(0, 140)}`, name, ref: input.ref, at: new Date().toISOString() });
+    }
+    await this.recordImportSuccess({ name, version: after?.version || incomingVersion, ref: input.ref, backup, at: new Date().toISOString() });
+    return { ok: true, name, version: after?.version || incomingVersion, backup, skill: after || undefined };
+  }
+
+
+  // ── 与 Supervisor 的长期联动 (2-G.4, 2026-09-16) ────────────────────────
+  /**
+   * 技能注册表发生变化 (导入成功 / 启用 / 禁用 / 隔离 / 漂移) → 重新评估**被技能拦住的 Goal**:
+   *   · 技能又能用了 → 重新冻结快照 + Goal 回 active (等 Supervisor 下一轮继续)
+   *   · 技能被禁用/隔离/漂移 → 交给 2-G.2 的执行前门禁拦 (这里只把状态标清, 不抢执行权)
+   */
+  async onRegistryChanged(opts: { home?: string; action: string; name?: string } = { action: 'unknown' }): Promise<{ rechecked: number; resumed: string[]; stillBlocked: string[] }> {
+    const h = opts.home ?? this.home;
+    try {
+      const { reconsiderSkillBlockedGoals } = await import('./skill-supervisor-link.js');
+      const res = await reconsiderSkillBlockedGoals({ home: h, action: opts.action, name: opts.name });
+      return res;
+    } catch (err) {
+      console.warn(`[skills] 联动重评失败 (不影响导入结果): ${String((err as Error)?.message || err).slice(0, 140)}`);
+      return { rechecked: 0, resumed: [], stillBlocked: [] };
+    }
+  }
+
+  /** 清理中断残留: 暂存目录删掉; 备份且正式目录缺失 → 恢复备份 (不丢已装技能) */
+  async recoverInterruptedImports(opts: { home?: string; cwd?: string } = {}): Promise<{ removedStaging: string[]; restored: string[] }> {
+    const h = opts.home ?? this.home;
+    const removedStaging: string[] = []; const restored: string[] = [];
+    for (const base of [userSkillsDirLoose(h), projectSkillsDirLoose(opts.cwd ?? this.cwd)]) {
+      let entries: string[] = [];
+      try { entries = await fsp.readdir(base); } catch { continue; }
+      for (const e of entries) {
+        if (/^\..*-staging-\d+$/.test(e)) { await fsp.rm(path.join(base, e), { recursive: true, force: true }).catch(() => {}); removedStaging.push(e); continue; }
+        const m = /^\.(.+)\.bak-(\d+)$/.exec(e);
+        if (m) {
+          const live = path.join(base, m[1]);
+          const liveExists = await fsp.stat(live).then(() => true).catch(() => false);
+          if (!liveExists) {
+            await fsp.rename(path.join(base, e), live).catch(() => {});
+            restored.push(`${m[1]} (from ${e})`);
+          }
+        }
+      }
+    }
+    return { removedStaging, restored };
+  }
+
+  /** 导入历史/失败原因 (CLI/Web 可查) */
+  async importHistory(opts: { home?: string; limit?: number } = {}): Promise<any[]> {
+    const h = opts.home ?? this.home;
+    try {
+      const raw = JSON.parse(await fsp.readFile(importHistoryPath(h), 'utf8'));
+      return (Array.isArray(raw) ? raw : []).slice(-1 * (opts.limit || 20));
+    } catch { return []; }
+  }
+
+  private async recordImportSuccess(rec: Record<string, unknown>): Promise<void> {
+    await appendImportHistory(this.home, { ...rec, ok: true, kind: 'success' }).catch(() => {});
+  }
+
+  private async recordImportFailure(rec: Record<string, unknown>): Promise<void> {
+    await appendImportHistory(this.home, { ...rec, ok: false, kind: 'failure' }).catch(() => {});
   }
 
   // ── 视图 ─────────────────────────────────────────────────────────────────
@@ -503,4 +717,46 @@ export function resetSkillsManagerForTest(): void {
 /** 一行摘要 (CLI / 日志用) */
 export function formatSkillLine(s: SkillRecord): string {
   return `${s.name.padEnd(28)} ${String(s.status).padEnd(11)} ${String(s.source).padEnd(9)} ${String(s.trust).padEnd(10)} v${s.version.padEnd(8)} ${s.contentHash.slice(0, 10)}${s.issues.length ? `  ⚠ ${s.issues.length} 个问题` : ''}`;
+}
+
+
+// ── 事务型导入的小工具 (2-G.3) ───────────────────────────────────────────────
+
+function importHistoryPath(home: string): string {
+  return path.join(home, '.bolloon', 'skill-imports.json');
+}
+
+async function appendImportHistory(home: string, rec: Record<string, unknown>): Promise<void> {
+  const p = importHistoryPath(home);
+  await fsp.mkdir(path.dirname(p), { recursive: true });
+  let arr: unknown[] = [];
+  try { const raw = JSON.parse(await fsp.readFile(p, 'utf8')); if (Array.isArray(raw)) arr = raw; } catch { /* 首次 */ }
+  arr.push(rec);
+  await fsp.writeFile(p, JSON.stringify(arr.slice(-50), null, 2), 'utf8');
+}
+
+/** 极简 frontmatter 解析 (只要 name/version, 用于预备校验) */
+export function parseFrontmatterLoose(text: string): { name?: string; version?: string } | null {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(text || ''));
+  if (!m) return null;
+  const out: { name?: string; version?: string } = {};
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = /^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.+)$/.exec(line.trim());
+    if (!kv) continue;
+    const key = kv[1].toLowerCase(); const val = kv[2].replace(/^["']|["']$/g, '').trim();
+    if (key === 'name') out.name = val;
+    if (key === 'version') out.version = val;
+  }
+  return out;
+}
+
+/** 版本比较 (semver 数字段; 非法段当 0) */
+export function cmpVersionLoose(a: string, b: string): number {
+  const pa = String(a).split('.').map((x) => Number(String(x).replace(/[^0-9]/g, '')) || 0);
+  const pb = String(b).split('.').map((x) => Number(String(x).replace(/[^0-9]/g, '')) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d > 0 ? 1 : -1;
+  }
+  return 0;
 }

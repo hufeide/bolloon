@@ -111,6 +111,16 @@ export interface GoalRecord {
   evidence: string[];
   /** 2026-09-16 (2-G.2): 这个目标依赖的技能 (前缀 '?' = 可选) —— 首次执行时冻结版本+hash */
   requiredSkills?: string[];
+  /** 2026-09-16 (2-F): 判据从哪来 (user = 用户明确给出; agent_proposed = 候选, 未确认前不许完成) */
+  criteriaSource?: 'user' | 'agent_proposed' | 'imported' | 'unknown';
+  /** 判据是否已被确认 (候选判据 false → 永不自动完成) */
+  criteriaConfirmed?: boolean;
+  /** 判据版本 (每次改判据 +1, 便于审计"用的哪一版判据") */
+  criteriaVersion?: number;
+  criteriaConfirmedBy?: string;
+  criteriaConfirmedAt?: string;
+  /** 候选判据 (未确认时留痕) */
+  proposedCriteria?: string[];
   /** 冻结的技能快照 (后续 Run 不重新随意扫目录; 漂移要人工批准) */
   skillSnapshot?: { name: string; version: string; contentHash: string; source?: string; resolvedAt: string }[];
   resolution?: { reason: string; at: string };
@@ -185,6 +195,10 @@ export async function createGoal(opts: CreateGoalOptions): Promise<GoalRecord> {
     goalId: newGoalId(),
     objective: String(opts.objective || '').slice(0, 500),
     successCriteria: (opts.successCriteria || []).map((c) => String(c).slice(0, 200)).slice(0, 20),
+    // 用户明确给出判据 → 直接视为已确认 (criteriaSource=user); 没给 → unknown, 之后由 agent 提候选
+    criteriaSource: (opts.successCriteria && opts.successCriteria.length) ? 'user' : 'unknown',
+    criteriaConfirmed: !!(opts.successCriteria && opts.successCriteria.length),
+    criteriaVersion: 1,
     constraints: (opts.constraints || []).map((c) => String(c).slice(0, 200)).slice(0, 20),
     requiredSkills: (opts.requiredSkills || []).map((c) => String(c).slice(0, 120)).slice(0, 20),
     budget: opts.budget,
@@ -294,9 +308,21 @@ export async function addEvidence(goalId: string, evidence: string[]): Promise<G
  *   全部必要判据满足 + 有证据 + 无未解决项 → 才允许 completed。
  *   未声明 successCriteria 的目标**永不**自动完成 (需要人显式确认) —— 否则"模型说完成"就变成了完成。
  */
-export function evaluateGoalCompletion(goal: GoalRecord): { complete: boolean; reason: string; missing: string[] } {
+export function evaluateGoalCompletion(goal: GoalRecord, opts: { lastRunStatus?: string } = {}): { complete: boolean; reason: string; missing: string[] } {
   if (!goal.successCriteria.length) {
     return { complete: false, reason: '未声明 successCriteria: 不允许自动判完成 (需人工确认)', missing: [] };
+  }
+  // 2-F: 候选判据 (未确认) 不许当作完成条件
+  if (goal.criteriaSource === 'agent_proposed' && goal.criteriaConfirmed !== true) {
+    return { complete: false, reason: `判据是 agent 提的候选 (v${goal.criteriaVersion || 1}), 未经人确认 → 不许判完成`, missing: goal.successCriteria };
+  }
+  if (goal.criteriaConfirmed === false) {
+    return { complete: false, reason: '判据未确认 → 不许判完成', missing: goal.successCriteria };
+  }
+  // 2-F: 最近一条 Run 还处于"没跑完"的状态 (失败/中断/失速) → 不许判完成
+  const lastRunStatus = opts.lastRunStatus;
+  if (lastRunStatus && ['failed', 'interrupted', 'stalled'].includes(String(lastRunStatus))) {
+    return { complete: false, reason: `最近一条 Run 状态是 ${lastRunStatus} (未处理好) → 不许判完成`, missing: [] };
   }
   const missing = goal.successCriteria
     .map((c, i) => ({ c, i }))
@@ -314,11 +340,50 @@ export function evaluateGoalCompletion(goal: GoalRecord): { complete: boolean; r
   return { complete: true, reason: '全部判据满足 + 有证据 + 无未解决项', missing: [] };
 }
 
+/**
+ * 设置/确认判据 (2-F)。
+ *   source: 谁给的 (user 显式给 / agent_proposed 候选 / imported)
+ *   confirm: 是否视为已确认 —— **候选判据必须显式 confirm 才可能完成**
+ */
+export async function setCriteria(
+  goalId: string,
+  opts: { criteria?: string[]; source?: GoalRecord['criteriaSource']; confirm?: boolean; by?: string },
+): Promise<GoalRecord | null> {
+  return withGoalLock(goalId, async () => {
+    const rec = await readGoal(goalId);
+    if (!rec) return null;
+    if (opts.criteria) {
+      rec.successCriteria = opts.criteria.map((c) => String(c).slice(0, 200)).slice(0, 20);
+      rec.criteriaVersion = (rec.criteriaVersion || 1) + 1;
+      rec.completedCriteria = [];                       // 判据变了 → 之前的满足记录作废 (避免拿旧判据凑完成)
+    }
+    if (opts.source) rec.criteriaSource = opts.source;
+    if (opts.confirm !== undefined) {
+      rec.criteriaConfirmed = opts.confirm;
+      rec.criteriaConfirmedBy = opts.confirm ? (opts.by || 'human') : undefined;
+      rec.criteriaConfirmedAt = opts.confirm ? new Date().toISOString() : undefined;
+    }
+    if (opts.source === 'agent_proposed' && !opts.confirm) rec.proposedCriteria = rec.successCriteria;
+    rec.updatedAt = new Date().toISOString();
+    await writeGoal(rec);
+    return rec;
+  });
+}
+
 /** 通过完成门就落 completed, 否则保持原状态并回传原因 (不静默) */
 export async function completeGoalIfEligible(goalId: string): Promise<{ ok: boolean; reason: string; goal: GoalRecord | null; missing?: string[] }> {
   const goal = await readGoal(goalId);
   if (!goal) return { ok: false, reason: `goal 不存在: ${goalId}`, goal: null };
-  const verdict = evaluateGoalCompletion(goal);
+  // 2-F: 把"最近一条 Run 的真实状态"一起纳入完成门 (失败/中断/失速时不许判完成)
+  let lastRunStatus: string | undefined;
+  try {
+    const lastRunId = goal.currentRunId || goal.runs?.[goal.runs.length - 1];
+    if (lastRunId) {
+      const { readRun } = await import('./run-store.js');
+      lastRunStatus = (await readRun(lastRunId))?.status;
+    }
+  } catch { /* 读不到就不加这一条约束, 其余判据照旧 */ }
+  const verdict = evaluateGoalCompletion(goal, { lastRunStatus });
   if (!verdict.complete) return { ok: false, reason: verdict.reason, goal, missing: verdict.missing };
   const next = await updateGoal(goalId, {
     status: 'completed',

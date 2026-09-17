@@ -1413,6 +1413,37 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     return;
   }
 
+  // 2026-09-16 (2-F): /criteria <goalId> [confirm|propose <text...>] —— 判据：看/确认/改/让 agent 提候选
+  if (cmd === '/criteria' || cmd.startsWith('/criteria ')) {
+    const rest = trimmed.slice('/criteria'.length).trim();
+    try {
+      const { longTermStatus, confirmCriteria, proposeForGoal } = await import('./agents/goal-criteria.js');
+      const { readGoal } = await import('./agents/goal-store.js');
+      const [goalId, action, ...words] = rest.split(/\s+/).filter(Boolean);
+      if (!goalId) { appendLine(`${C_DIM}用法: /criteria <goalId> [confirm | propose | set <判据用;分>]${RESET}`); return; }
+      const g = await readGoal(goalId);
+      if (!g) { appendLine(`${C_ERROR}没有这个目标: ${goalId}${RESET}`); return; }
+      if (action === 'propose') {
+        const p = await proposeForGoal(goalId);
+        appendLine(p.ok ? `${C_DIM}候选判据 (待确认):\n${p.criteria.map((c, i) => `  [${i}] ${c}`).join('\n')}${RESET}` : `${C_ERROR}无法生成判据: ${p.reason}${RESET}`);
+        return;
+      }
+      const list = action === 'set' && words.length ? words.join(' ').split(';').map((x) => x.trim()).filter(Boolean) : undefined;
+      if (action === 'confirm' || list) {
+        const r = await confirmCriteria(goalId, { criteria: list, by: 'cli' });
+        appendLine(r.ok ? `${C_DIM}判据已确认 (v${r.goal?.criteriaVersion}): ${(r.goal?.successCriteria || []).join(' | ')}${RESET}` : `${C_ERROR}${r.reason}${RESET}`);
+        return;
+      }
+      const st = await longTermStatus(goalId);
+      appendLine(`${C_DIM}goal ${g.goalId} [${g.status}] 判据来源=${g.criteriaSource || 'unknown'} 已确认=${g.criteriaConfirmed === true} v${g.criteriaVersion || 1}${RESET}`);
+      g.successCriteria.forEach((c, i) => appendLine(`  ${g.completedCriteria.includes(i) ? '✓' : '·'} [${i}] ${c}`));
+      if (g.proposedCriteria?.length) appendLine(`  ${C_DIM}候选 (未确认): ${g.proposedCriteria.join(' | ')}${RESET}`);
+      appendLine(`  长期完成: ${st.canComplete ? '✅ 可判完成' : `❌ ${st.reason}`}`);
+      appendLine(`  ${C_DIM}检查: ${Object.entries(st.checks).map(([k, v]) => `${k}=${v ? '✓' : '✗'}`).join(' ')}${RESET}`);
+    } catch (e: any) { appendLine(`${C_ERROR}/criteria 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`); }
+    return;
+  }
+
   // 2026-09-16 (M2-B): /supervise — 长期执行层 (状态/唤醒原因/手动推进一个周期) · /wake <goalId> — 外部事件唤醒
   if (cmd === '/supervise' || cmd.startsWith('/supervise ')) {
     const arg = trimmed.slice('/supervise'.length).trim();

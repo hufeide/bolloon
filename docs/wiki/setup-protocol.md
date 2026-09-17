@@ -14,7 +14,7 @@ tags: [setup, onboarding, first-run, setup-store, onboard, readiness, gate, fail
 
 # Bolloon 初始化协议 (Setup Protocol)
 
-> 状态: **Phase 1–7 已落地并真跑验收 (51/51)** / 上一批 M0–M6 中的 M2–M6 已随之完成。
+> 状态: **Phase 1–7 已落地 (真跑 51/51); 批次 2-C.4 / 2-G.2 / 2-G.3 / 2-G.4 / 2-F / 2-H 全部完成 (真跑 30+18+30+30)**。
 > 唯一状态文件: `~/.bolloon/setup-state.json` (由 `src/setup/setup-store.ts` 读写);
 > 唯一执行器: `src/setup/onboard.ts` (CLI / Web / Electron 全部走它)。
 
@@ -134,10 +134,10 @@ Electron: readSetupFact() / shouldShowOnboard() / maybeShowFirstRun()
 
 | 项 | 状态 |
 |---|---|
-| 2-C.4 真 P2P / delegate 事件唤醒 Goal | 未做 (API/`notifyExternal` 已通, 真实事件源未接) |
-| 2-G.2 Goal 级 skill snapshot | 未做 (readiness 汇总已做, Goal 绑定的 requiredSkills 快照未做) |
-| 2-G.3 事务型 skill import | 未做 (统一入口已做, 临时目录+原子替换未做) |
-| 2-G.4 skill 与 Supervisor 长期联动 | 未做 |
-| 2-F 判据自动生成与长期证据汇总 | 未做 |
-| 2-H Web 长期执行面板 (Goal/Run) | 未做 (首启 Onboard 页已做) |
-| Electron 打包后的 Onboard 页面路由 | 事实层已接, 打包侧调用待确认 |
+| 2-C.4 真 P2P / delegate 事件唤醒 Goal | **已完成** (2026-09-16): 外部等待协议 (requestId/continuationId/expectedSource/expectedEvent/expiresAt) + 来源/correlation/过期/eventId 去重 + 真签名入站 (`AgentMessaging.dispatchSignedMessage` → goal-event-bridge) + 超时转人工; 真跑 **30/30** (`verify-goal-external-wake.ts`) |
+| 2-G.2 Goal 级 skill snapshot + 执行前门禁 | **已完成**: 首次执行冻结 name/version/contentHash/resolvedAt, 缺/未启用/损坏/漂移 → 不启动 Run + needs_human, 可选技能缺失只记降级, 漂移要人工批准; 真跑 **18/18** (`verify-skill-gate.ts`) |
+| 2-G.3 事务型 skill import | **已完成**: 预备校验 (名字/路径穿越/SKILL.md frontmatter/版本门) → 暂存 → 原子替换 (旧目录改名保留) → 读回校验 → registry; 失败回滚 + 原因可查 (`importHistory`); SIGKILL 中断可恢复; 真跑 **30/30** (`verify-skill-import.ts` [1]-[7]) |
+| 2-G.4 skill 与 Supervisor 长期联动 | **已完成**: 导入/启用 → 被拦 Goal 自动重评回 active; 禁用/隔离 → 下一次 Run 前门禁拦 (不打断当前 Run); 漂移不隐式升级; 真跑见上 (`verify-skill-import.ts` [8][9]) |
+| 2-F 判据自动生成与长期证据汇总 | **已完成**: criteriaSource/criteriaConfirmed/criteriaVersion; 用户给判据=已确认, 没给→agent 提候选 (未确认永不完成); 模糊目标交人; 证据跨 Run 汇总; 完成门 = 判据存在+已确认+全满足+有证据+无未解决项+最近 Run 健康; 真跑 **30/30** (`verify-goal-criteria.ts`) |
+| 2-H Web 长期执行面板 (Goal/Run) | **已完成**: `GET /goals` 面板 (Goals/Runs/Supervisor 状态 + 确认判据/提候选/唤醒/resume/pause/abort) + `GET/POST /api/goals/:id/criteria`; 与 CLI 同一份事实; 见 `verify-goal-criteria.ts` [7] |
+| Electron 打包后的 Onboard 页面路由 | 事实层已接 (`readSetupFact/shouldShowOnboard`), 打包侧调用待确认 |
