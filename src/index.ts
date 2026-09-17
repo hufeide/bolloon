@@ -3704,6 +3704,12 @@ interface ParsedArgs {
   /** 2026-09-16 (2-C.1): 独立 Supervisor 宿主 (长期执行) */
   supervise?: boolean;
   superviseOnce?: boolean;
+  // 2026-09-16 (Phase 4): 统一 Onboard 入口 (CLI 与 Web 共用 src/setup/onboard.ts)
+  setupStatus?: boolean;
+  setupResume?: boolean;
+  setupRepair?: boolean;
+  setupReconfigure?: boolean;
+  setupTest?: boolean;
   superviseDryRun?: boolean;
   help?: boolean;
   tools?: boolean;
@@ -3768,6 +3774,11 @@ function parseArgs(): ParsedArgs {
       case '--supervise':
         result.supervise = true;
         break;
+      case '--setup-status': result.setupStatus = true; break;
+      case '--setup-resume': result.setupResume = true; break;
+      case '--setup-repair': result.setupRepair = true; break;
+      case '--setup-reconfigure': result.setupReconfigure = true; break;
+      case '--setup-test': result.setupTest = true; break;
       case '--supervise-once':
         result.supervise = true;
         result.superviseOnce = true;
@@ -4207,6 +4218,44 @@ async function main() {
 
   // 2026-09-16 (2-C.1): 独立 Supervisor 宿主 —— `bolloon --supervise [--supervise-once|--supervise-dry-run]`
   //   长期执行不再依附 web 进程 (页面关掉/CLI 没开也能继续推进 Goal)。
+  // 2026-09-16 (Phase 4): Onboard 统一入口 —— CLI / Web 共用同一条执行器 (src/setup/onboard.ts)
+  //   --setup-status 只读; --setup-resume 从失败阶段继续; --setup-repair 迁移/备份坏文件后就地修;
+  //   --setup-reconfigure 只改选中项 (新配置测通才切 active); --setup-test 重跑连通性 + 运行时。
+  if (args.setupStatus || args.setupResume || args.setupRepair || args.setupReconfigure || args.setupTest) {
+    const mode = args.setupStatus ? 'status' : args.setupRepair ? 'repair' : args.setupReconfigure ? 'reconfigure' : args.setupTest ? 'test' : 'resume';
+    if (mode === 'status') {
+      const { evaluateSetup, describeSetup } = await import('./setup/setup-store.js');
+      const ev = await evaluateSetup();
+      process.stdout.write(describeSetup(ev) + '\n');
+      process.exit(ev.gate === 'ready' ? 0 : 1);
+    }
+    const { defaultWizardIO } = await import('./cli/setup-wizard.js');
+    const { runOnboard } = await import('./setup/onboard.js');
+    const wizIO = defaultWizardIO();
+    const res = await runOnboard({
+      mode: mode as any,
+      io: {
+        print: (m: string) => process.stdout.write(m + '\n'),
+        ask: async (q: string, o?: { defaultValue?: string }) => wizIO.ask(q, o?.defaultValue ? { default: o.defaultValue } : undefined),
+        askHidden: async (q: string) => wizIO.ask(q, { hidden: true }),
+        confirm: async (q: string, d = true) => {
+          const a = String(await wizIO.ask(`${q} (y/n)`, { default: d ? 'y' : 'n' })).trim().toLowerCase();
+          return a === '' ? d : /^(y|yes|1|true|是)$/.test(a);
+        },
+        select: async (q: string, choices: { value: string; label: string; hint?: string }[]) => {
+          process.stdout.write(q + '\n');
+          choices.forEach((c, i) => process.stdout.write(`  ${i + 1}) ${c.label}${c.hint ? ` — ${c.hint}` : ''}\n`));
+          const a = String(await wizIO.ask('选择 (序号或名称)', { default: '1' })).trim();
+          if (!a) return choices[0]?.value || '';
+          if (/^\d+$/.test(a) && choices[Number(a) - 1]) return choices[Number(a) - 1].value;
+          const hit = choices.find((c) => c.value === a) || choices.find((c) => a && c.value.startsWith(a));
+          return hit?.value || a;
+        },
+      },
+    });
+    process.exit(res.ok ? 0 : 1);
+  }
+
   if (args.supervise) {
     const { runStandaloneSupervisorHost } = await import('./agents/supervisor-host.js');
     const res = await runStandaloneSupervisorHost({

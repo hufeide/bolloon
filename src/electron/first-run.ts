@@ -6,6 +6,7 @@
  */
 import { BrowserWindow, app, ipcMain } from 'electron';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { firstRunFlagPath, dataDir, logsDir } from './paths';
 import { log } from './logger';
@@ -65,6 +66,27 @@ const OVERLAY_HTML = `
 </body>
 </html>
 `;
+
+/**
+ * 2026-09-16 (Phase 3): 首启**事实**来自 SetupStore 的状态文件 (setup-state.json),
+ * first-run flag 只决定"要不要自动弹窗"。Electron 不能用 flag 当初始化事实。
+ */
+export function readSetupFact(): { ready: boolean; stage: string; gate: string } {
+  try {
+    const p = path.join(os.homedir(), '.bolloon', 'setup-state.json');
+    const js = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const stage = String(js?.stage || 'uninitialized');
+    const ready = stage === 'ready';
+    return { ready, stage, gate: ready ? 'ready' : (stage === 'needs_repair' ? 'repair' : stage === 'blocked' ? 'blocked' : 'setup') };
+  } catch {
+    return { ready: false, stage: 'uninitialized', gate: 'setup' };
+  }
+}
+
+/** 未 ready → 显示 Onboard (无论 flag 是否已看过) */
+export function shouldShowOnboard(): boolean {
+  return !readSetupFact().ready;
+}
 
 export function hasSeenFirstRun(): boolean {
   try {
@@ -127,9 +149,18 @@ export function registerFirstRunIpc(): void {
 }
 
 /** 包装 — 决定要不要弹 overlay */
+/**
+ * 2026-09-16 (Phase 3): 是否弹引导 —— **事实来自 SetupStore** (setup-state.json), flag 只控制"已 ready 后是否还提示"。
+ * 未 ready 时无论 flag 有没有都弹 (初始化没完成的机器不能装作已配置)。
+ */
 export async function maybeShowFirstRun(parent: BrowserWindow): Promise<void> {
-  if (hasSeenFirstRun()) return;
-  log('首启 — 弹出引导');
+  const fact = readSetupFact();
+  if (fact.ready && hasSeenFirstRun()) return;
+  if (!fact.ready) {
+    log(`初始化未就绪 (stage=${fact.stage}, gate=${fact.gate}) — 弹出引导 (flag=${hasSeenFirstRun() ? '已看过' : '未看过'})`);
+  } else {
+    log('首启 — 弹出引导');
+  }
   await showFirstRunOverlay(parent);
   app.addRecentDocument(firstRunFlagPath()); // 跟踪最近文档, 让 user 知道有这文件
 }

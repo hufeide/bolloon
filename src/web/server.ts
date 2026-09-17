@@ -2983,6 +2983,106 @@ ${goalDesc}
   });
 
   // 2026-09-16: 运行记录 (持久化 harness) — 当前 + 历史 agent 运行。跨重载可读。
+  // 2026-09-16 (Phase 4): Onboard API —— 与 CLI 共用同一条执行器 (src/setup/onboard.ts)
+  //   页面只负责"提交本步输入", 阶段判定/校验/真实验证/原子提交/门禁全在服务端同一份事实里。
+  const setupState = async () => {
+    const { evaluateSetup } = await import('../setup/setup-store.js');
+    const { nextStepInfo } = await import('../setup/onboard.js');
+    const ev = await evaluateSetup();
+    const next = ev.gate === 'ready' ? null : await nextStepInfo(ev.state).catch(() => null);
+    return { gate: ev.gate, stage: ev.state.stage, readiness: ev.state.readiness, readinessWhy: ev.state.readinessWhy,
+      allow: ev.state.allow, completed: ev.state.completed, inputs: ev.state.inputs, checks: ev.state.checks,
+      lastError: ev.state.lastError || null, actions: ev.state.actions, reasons: ev.reasons, nextStep: next };
+  };
+
+  app.get('/api/setup', async (_req, res) => {
+    try { res.json(await setupState()); }
+    catch (err) { res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200), gate: 'blocked' }); }
+  });
+
+  // 跑一步 (answers 按顺序喂给执行器; oneShot: 一步失败就返回, 不阻塞)
+  const runSetupStep = async (req: any, res: any, mode: 'resume' | 'test' | 'repair' | 'reconfigure') => {
+    try {
+      const { runOnboard, ScriptedIO } = await import('../setup/onboard.js');
+      const answers: string[] = Array.isArray(req.body?.answers) ? req.body.answers.map((x: any) => String(x ?? '')) : [];
+      const io = new ScriptedIO(answers);
+      const r = await runOnboard({ mode, io, oneShot: true, targets: req.body?.targets });
+      res.json({ ...(await setupState()), ok: r.ok, failedStage: r.failedStage || null, errorClass: r.errorClass || null,
+        message: r.message || null, steps: r.steps, stepLog: io.log.slice(-40), summary: r.summary });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String((err as Error)?.message || err).slice(0, 200), gate: 'blocked' });
+    }
+  };
+
+  app.post('/api/setup/start', async (_req, res) => { try { res.json(await setupState()); } catch (err) { res.status(500).json({ error: String(err) }); } });
+  app.post('/api/setup/step', async (req, res) => runSetupStep(req, res, 'resume'));
+  app.post('/api/setup/resume', async (req, res) => runSetupStep(req, res, 'resume'));
+  app.post('/api/setup/test', async (req, res) => runSetupStep(req, res, 'test'));
+  app.post('/api/setup/repair', async (req, res) => runSetupStep(req, res, 'repair'));
+  app.post('/api/setup/reconfigure', async (req, res) => runSetupStep(req, res, 'reconfigure'));
+  app.post('/api/setup/commit', async (_req, res) => {
+    try {
+      const { refreshSetupState } = await import('../setup/setup-store.js');
+      const ev = await refreshSetupState({});
+      const { describeSetup } = await import('../setup/setup-store.js');
+      res.json({ ...(await setupState()), ok: ev.gate === 'ready', summary: describeSetup(ev) });
+    } catch (err) { res.status(500).json({ ok: false, error: String(err) }); }
+  });
+  app.post('/api/setup/identity', async (req, res) => runSetupStep({ body: { answers: [req.body?.name] } }, res, 'resume'));
+  app.post('/api/setup/provider', async (req, res) => runSetupStep({ body: { answers: [req.body?.provider] } }, res, 'resume'));
+
+  // 首启页面 (零依赖, 直接打这些 API; 未 ready 时所有对话路由都是 503)
+  app.get('/setup', (_req, res) => {
+    res.type('html').send(`<!doctype html><meta charset="utf-8"><title>Bolloon 初始化</title>
+<style>body{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;max-width:760px;margin:40px auto;padding:0 16px;line-height:1.6}
+h1{font-size:20px}pre{background:#f6f6f6;padding:12px;border-radius:8px;white-space:pre-wrap}
+.ok{color:#0a7d32}.bad{color:#b00020}input,select,button{font-size:15px;padding:8px;margin:4px 0}
+.row{margin:10px 0}small{color:#666}</style>
+<h1>Bolloon 初始化</h1>
+<div id="state">加载中…</div>
+<div class="row" id="form"></div>
+<div class="row"><button onclick="run('step')">提交这一步</button>
+<button onclick="run('test')">重新测试连通性/运行时</button>
+<button onclick="run('repair')">修复/迁移配置</button>
+<button onclick="fetchState()">刷新</button></div>
+<pre id="log"></pre>
+<script>
+async function fetchState(){
+  const r = await fetch('/api/setup'); const s = await r.json();
+  const ready = s.gate==='ready';
+  document.getElementById('state').innerHTML =
+    '<b>阶段</b>: '+s.stage+' &nbsp; <b>门禁</b>: <span class="'+(ready?'ok':'bad')+'">'+s.gate+'</span><br>'+
+    '<b>就绪度</b>: basic '+s.readiness.basic+' · agent '+s.readiness.agent+' · durable '+s.readiness.durable+' · network '+s.readiness.network+'<br>'+
+    '<small>已完成: '+(s.completed.join(' → ')||'(无)')+'</small><br>'+
+    '<small>下一步: '+(s.actions[0]||'')+'</small>'+
+    (s.lastError?'<br><small class="bad">上次错误 ['+s.lastError.errorClass+'] '+s.lastError.message+'</small>':'');
+  const f = document.getElementById('form');
+  const n = s.nextStep;
+  if(!n){ f.innerHTML='<b class="ok">✅ 已就绪, 可以进入对话</b>'; window.currentNeeds=null; return; }
+  window.currentNeeds=n.needs;
+  if(n.needs==='provider'){
+    f.innerHTML='<div>'+n.question+'</div><select id="v">'+ (n.choices||[]).map(c=>'<option value="'+c.value+'">'+c.label+(c.hint?' — '+c.hint:'')+'</option>').join('') +'</select>';
+  } else if(n.needs==='credential'){
+    f.innerHTML='<div>'+n.question+'</div><input id="v" type="password" placeholder="API key (不会回显)" autocomplete="off">';
+  } else if(n.needs==='none'){
+    f.innerHTML='<div>'+n.question+' (点上面按钮执行)</div>';
+  } else {
+    f.innerHTML='<div>'+n.question+'</div><input id="v" value="'+(n.defaultValue||'')+'">';
+  }
+}
+async function run(ep){
+  const v=document.getElementById('v'); const n=window.currentNeeds;
+  const answers = (n==='credential'||n==='name'||n==='model'||n==='provider') && v ? [v.value] : [];
+  if(v) v.value='';                       // key 立即从 DOM 里清掉
+  const r = await fetch('/api/setup/'+ep,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({answers})});
+  const j = await r.json();
+  document.getElementById('log').textContent = (j.log||[]).join('\n') + '\n' + (j.summary||'');
+  fetchState();
+}
+fetchState();
+</script>`);
+  });
+
   // 2026-09-16 (M1/M3): 初始化状态 —— CLI 与 Web 读同一份事实 (setup-state.json + 各领域 store)
   app.get('/api/setup', async (_req, res) => {
     try {

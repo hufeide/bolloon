@@ -6,6 +6,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
+import * as fsSync from 'fs';
 
 export type ModelProvider = 'openai' | 'anthropic' | 'ollama' | 'openrouter' | 'gemini' | 'minimax' | 'deepseek' | 'kimi' | 'glm' | 'qwen' | 'mimo' | 'grok' | 'local';
 
@@ -254,6 +255,10 @@ function getDefaultConfig(): LLMConfig {
 class LLMConfigStore {
   private config: LLMConfig | null = null;
   private initialized: boolean = false;
+  /** 2026-09-16: 记住加载时用的配置目录 —— 目录变了必须丢弃缓存, 否则会把 A 目录的配置写到 B 目录 */
+  private loadedDir: string | null = null;
+  /** 2026-09-16: 记住加载时的文件签名 —— 外部改了配置 (repair/agent 工具/用户手改) 必须重新读, 不能一直用旧值 */
+  private loadedSig: string | null = null;
   // v0.2.15: single-flight lock around read-modify-write of `~/.bolloon/llm-config.json`.
   // Prevents concurrent save() calls from clobbering each other when the user
   // configures two providers back-to-back (e.g. saving gemini, then anthropic, in
@@ -269,7 +274,16 @@ class LLMConfigStore {
   }
 
   async initialize(): Promise<void> {
+    // 目录变了 (换 HOME / 独立宿主 / 测试注入): 内存缓存作废, 重新读盘
+    const dir = configDir();
+    const sig = this.fileSignature();
+    if (this.initialized && (this.loadedDir !== dir || this.loadedSig !== sig)) {
+      this.initialized = false;
+      this.config = null;
+    }
     if (this.initialized) return;
+    this.loadedDir = dir;
+    this.loadedSig = sig;
 
     try {
       await fs.mkdir(configDir(), { recursive: true });
@@ -314,6 +328,14 @@ class LLMConfigStore {
     this.config.updatedAt = new Date().toISOString();
     // 2026-08-07: mode 0o600 — 仅当前用户可读写 (含 API key 的敏感配置); Bolloon 自身进程可写
     await fs.writeFile(CONFIG_PATH, JSON.stringify(this.config, null, 2), { mode: 0o600 });
+  }
+
+  /** 配置文件签名 (mtime+size); 不存在时返回 'missing' */
+  private fileSignature(): string {
+    try {
+      const st = fsSync.statSync(configDir() + '/bolloon-config.json');
+      return `${st.mtimeMs}:${st.size}`;
+    } catch { return 'missing'; }
   }
 
   async getConfig(): Promise<LLMConfig> {

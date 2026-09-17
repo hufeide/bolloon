@@ -1,6 +1,6 @@
 ---
 title: Bolloon 初始化协议 (Setup Protocol)
-source: session (leo 2026-09-16 指令 + Hermes 初次配置对照)
+source: session (leo 2026-09-16 Onboard 计划 + Hermes 初次配置对照)
 created: 2026-09-16
 last_confirmed: 2026-09-16
 schema_version: 2
@@ -9,140 +9,135 @@ stage: current
 status: current
 confidence: high
 entity_type: chapter
-tags: [setup, onboarding, first-run, setup-store, readiness, gate, fail-closed, state-machine, hermes, cli, web, supervisor]
+tags: [setup, onboarding, first-run, setup-store, onboard, readiness, gate, fail-closed, state-machine, migration, repair, reconfigure, hermes, cli, web, electron, supervisor]
 ---
 
 # Bolloon 初始化协议 (Setup Protocol)
 
-> 状态: **M0 协议冻结 + M1 SetupStore 已落地 / M2–M6 待做** (2026-09-16)
-> 事实来源: `~/.bolloon/setup-state.json`(本页定义的唯一初始化状态), 由 `src/setup/setup-store.ts` 读写。
+> 状态: **Phase 1–7 已落地并真跑验收 (51/51)** / 上一批 M0–M6 中的 M2–M6 已随之完成。
+> 唯一状态文件: `~/.bolloon/setup-state.json` (由 `src/setup/setup-store.ts` 读写);
+> 唯一执行器: `src/setup/onboard.ts` (CLI / Web / Electron 全部走它)。
 
 ## 0. 为什么要有这页
 
-Bolloon 的初始化此前是「向导脚本」而不是「可恢复的初始化状态机」, 由此产生三个真实故障:
+初始化此前是「向导脚本」而不是「可恢复的初始化状态机」, 由此产生真实故障:
 
 | 故障 | 旧行为 | 后果 |
 |---|---|---|
-| 判定失败当成"不需要初始化" | `isFirstRun()` 的 catch **返回 false** | 读配置失败 → 直接进正常模式, 半成品配置被当成"已配置" |
-| 启动 fail-open | 向导抛错只 `console.warn('不阻塞启动')` | 初始化没完成也能进对话, 用户看到「启动成功、实际不可执行」 |
-| 无统一 readiness | 身份/LLM/模型/运行时/技能各由不同模块判断, 没有"ready 事实" | Web 没有首启流程; 没有一处能回答"初始化到哪一步、为什么停" |
+| 判定失败当成"不需要初始化" | `isFirstRun()` 的 catch **返回 false** | 读配置失败 → 直接进正常模式 |
+| 启动 fail-open | 向导抛错只 `console.warn('不阻塞启动')` | 半成品配置也能进对话 ("启动成功、实际不可执行") |
+| 事实来源不一致 | 状态层读 `llm-config.json` / `user.json`, 真实写入却是 `bolloon-config.json` / `identity/user.json` | 明明配好了却判"未配置" |
+| 状态不可达 | 缺 key 被归类成 `provider_pending` | `credential_pending` 永远进不去 |
+| 无统一入口 | CLI 有向导, Web 没有;Electron 用 flag 当事实 | 三端看到的初始化状态可能不同 |
 
-**这一页的目标**: 让 Bolloon 任何时候都能回答 —— *现在初始化到哪一步、为什么停、下一步是什么、重启后从哪里继续*。
-
-## 1. 状态机 (M0 冻结)
+## 1. 状态机与四条不可混淆 (Phase 1)
 
 ```
-uninitialized
-  → identity_pending        (身份: 姓名/DID)
-  → provider_pending        (模型供应商)
-  → credential_pending      (供应商密钥)
-  → model_pending           (模型名)
-  → connectivity_pending    (连通性实测)
-  → runtime_pending         (运行时: LLM 层初始化)
-  → ready
-异常:
-  needs_repair   配置损坏/写盘失败 → 就地修, **不回退成默认配置假装正常**
-  blocked        唯一"不能自动继续"的情形: 配置根目录不可写
+uninitialized → identity_pending → provider_pending → credential_pending
+              → model_pending → connectivity_pending → runtime_pending → ready
+异常: needs_repair (配置损坏/写盘失败 → 就地修, 不回退默认假装正常)
+      blocked     (唯一"不能自动继续": 配置根目录不可写)
 ```
 
-**阶段单调推进**: 任一时刻停在「第一个未满足的阶段」, 不做跳跃。
-「缺供应商/缺密钥/模型没测过」都是**可修**的 → 结论是 `setup`(继续向导), 不是 `blocked`。
+```
+Provider 已选择 ≠ 凭证已可用       (缺 key 停在 credential_pending)
+凭证存在     ≠ 模型可用             (缺模型名停在 model_pending)
+模型可用     ≠ 运行时已初始化       (停在 runtime_pending)
+runtime ready ≠ 长期执行 ready      (durable 另算)
+```
 
-## 2. 唯一事实与分层 readiness
+## 2. 事实来源 (只汇总, 不新增配置库)
 
-`SetupStore` **只汇总, 不新增重复配置库**:
-
-| 领域事实 | 仍然在这些地方 | SetupStore 只做 |
+| 领域 | 真实文件 | 说明 |
 |---|---|---|
-| 身份 | `~/.bolloon/user.json` / `identity.json` | 读 + 校验存在 |
-| LLM/密钥/模型 | `~/.bolloon/llm-config.json` | 读结构 + **只判"有没有 key", 不读密钥值** |
-| 技能 | `~/.bolloon/skills-registry.json` (SkillsManager) | 健康度汇总 (不合格数) |
-| 长期执行 | `~/.bolloon/supervisor.json` + Goal/Run store | 是否可解析执行器 |
-| 初始化 | `~/.bolloon/setup-state.json` | 阶段/已完成/输入/错误分类/可恢复动作/门禁 |
+| 身份 | `~/.bolloon/identity/user.json` | **修正**: 之前状态层读 `user.json`/`identity.json`, 与真实写入路径不一致 |
+| LLM | `~/.bolloon/bolloon-config.json` | **唯一正式文件**;`llm-config.json` 只作迁移输入 (来源标 `legacy`) |
+| 技能 | `~/.bolloon/skills-registry.json` | SkillsManager 健康度 (不合格数) |
+| 长期执行 | `~/.bolloon/supervisor.json` + `runs/` `goals/` | 最近一次 `lastResolution` 决定 runner 是否可解析 |
+| 初始化 | `~/.bolloon/setup-state.json` | 只存进度/校验/readiness; **永不存 apiKey 明文** |
 
-**readiness 分层** (不允许被"普通聊天能跑"掩盖):
+路径统一: `resolveBolloonHome()` = `BOLLOON_HOME` > `$HOME/.bolloon`, **不在模块顶层缓存**;
+`config-store` 也不再用加载时固定的 `CONFIG_DIR`, 且 **目录变化或文件外部改动都会让内存缓存失效** (否则 A 目录的配置会被写进 B 目录)。
 
-```
-basicReady     身份 + LLM + session 可用        → 能对话
-agentReady     basicReady + Harness/Skills 可用  → agent 能力完整
-durableReady   basicReady (+ RunStore/GoalStore/Supervisor) → 长期执行
-networkReady   P2P / Kubo (可选, 不阻塞基础对话)
-```
-
-## 3. 启动硬门禁 (M4)
+## 3. readiness 四层是真实检查 (Phase 5)
 
 ```
-加载 SetupStore → validate
-  ├─ ready   → 启动运行时
-  ├─ setup   → 先初始化 (向导/续办)
-  ├─ repair  → 就地修复 (不重置身份/不清 key)
-  └─ blocked → 只允许诊断与修复
+basic   = identity + provider + credential + model + connectivity(24h 内) + runtime(真实 initMinimax/session/最小调用)
+agent   = basic + PiAgentHarness + 技能健康   (skillsOk 未知 **不算通过**)
+durable = agent + runs/goals 目录可写 + lease 可写 + Supervisor runner 可解析
+network = P2P / Kubo (optional, 不阻塞基础对话)
 ```
 
-行为规则:
+每条 readiness 都带 **`readinessWhy`**: 缺什么、怎么修 (直接展示给用户)。
 
-- **ready 之前不能执行 Agent**。CLI 进入前先评估: 未就绪 → 跑向导 → 仍不就绪则**非零退出**(不再"warn 后继续")。
-- Web 可以启动, 但 agent 执行路由 (`POST /message`、`/api/supervisor/tick` 等) 返回 **503 + 结构化初始化状态**; `GET /api/setup` 给出 gate/stage/readiness/下一步。
-- Supervisor 未 ready **只诊断**: 不注入 runnerResolver, 不建 Run, 不改 Goal 状态 (与 §15 的"解析不到执行器只诊断"同一原则)。
-- `BOLLOON_SKIP_SETUP=1` **只进诊断模式**, 不绕过执行门禁。
-- 初始化失败必须**非零退出**, 并留下结构化错误 (`lastError.stage/errorClass/message`)。
+## 4. 启动硬门禁 (Phase 3)
 
-**fail-closed 三处**: 首次运行判定失败 → 需要初始化; 初始化评估自身抛错 → 进门前置检查失败; 门禁缓存读不到 → `blocked`。
-（Agent 侧另有一道生产门禁: `PiAgentSession.prompt` 在非测试环境下会读门禁缓存, 未 ready 直接拒绝执行并如实回话。）
+- **CLI**: 进对话前先评估; 未就绪 → 跑 Onboard → 仍不就绪 → **非零退出**; 评估抛错也 fail-closed 退出。
+  `BOLLOON_SKIP_SETUP=1` 只进诊断模式, **不绕过硬门禁**。
+- **Agent**: `PiAgentSession.prompt` 在非测试环境读 30s 门禁缓存, 未 ready 直接拒绝执行并如实回话。
+- **Goal**: `createGoal` 未 ready **拒绝创建长期 Goal** (生产路径, fail-closed)。
+- **Web**: `POST /message` / `POST /api/supervisor/tick` 未就绪返回 503 + 结构化状态; `GET /api/setup` 给出 gate/stage/readiness/下一步。
+- **Supervisor**: 未ready 只诊断 —— 不注入 runnerResolver、不建 Run、不改 Goal。
+- **Electron**: 首启**事实来自 setup-state.json** (`readSetupFact()`),first-run flag 只控制"是否自动弹窗"; 未 ready 时无论 flag 都弹。
 
-## 4. 路径统一 (M1)
-
-- `resolveBolloonHome()` 是**唯一**路径解析: `BOLLOON_HOME` > `$HOME/.bolloon`。
-- **禁止在模块顶层永久缓存 HOME**(`config-store` 原先 `const CONFIG_DIR = ...` 在加载时固定,
-  长期运行/测试注入/独立 Supervisor 宿主都会拿到过期路径 —— 已改为惰性解析)。
-- 优先级必须可解释并写进诊断: env > 文件 > 默认。
-
-## 5. 可恢复事务向导 (M2, 待做)
-
-向导不再"边问边写": 输入 → draft → 校验 → 真实测试 → 初始化运行时 → **全部成功才一次性提交**。
-任何阶段失败: 保留已完成阶段、不覆盖可用配置、记明确分类 (`config/auth/network/timeout/io/model/runtime`)、下次从失败阶段继续、**禁止显示"配置完成"**。
-
-特殊处理 (照抄 Hermes 的经验):
-
-- 身份已生成但模型失败 → 下次**复用 DID**, 不重新生成。
-- key 已存在但测试失败 → 标 `connectivity_pending`, **不清空 key**。
-- provider 切换失败 → 保留旧 active provider。
-- 连通性超时 → 可重试, 但**不能当作成功**。
-- 写盘失败 → **不更新 ready 状态**。
-
-Hermes 对照 (`/Users/apple/Downloads/hermes`): `hermes_cli/setup.py` 的分段 step + **回退重放**(左箭头回到上一步并重放已选值)、
-`--reconfigure` **只补缺失项**、`hermes_cli/setup_summary.py` 的分层 readiness 摘要(逐能力行 + managed/provider 区分)。
-
-## 6. CLI / Web 统一入口 (M3, 部分已通)
+## 5. 可恢复阶段执行器 (Phase 2)
 
 ```
-bolloon setup              # 交互向导 (可续办)
-bolloon setup --status     # 结构化状态 + 下一步
-bolloon setup --resume     # 从失败阶段继续
-bolloon setup --repair     # 只修坏掉的部分 (不重置身份)
-bolloon setup --reset      # 显式重置 (需二次确认)
-Web: GET /api/setup        # 与 CLI 同一份事实
-     POST /api/setup/{identity,provider,test,commit,resume,repair}
+env → identity → provider → credential → model → connectivity → runtime → final commit
 ```
 
-**验收 (M6)**: 全新 HOME 进入初始化页 · 只填身份后杀进程重启从 Provider 继续 · key 错误停在 connectivity 不进 ready ·
-超时可重试 · 保存中 SIGKILL 不留半份配置 · 旧版 llm-config 迁移后状态一致 · env/文件优先级可解释 ·
-CLI 完成一半 Web 接着做(反之亦然) · LLM 不可用时不建空 Run · 未 ready 时 Supervisor 只诊断 ·
-已配置再跑 setup 只进修复模式不重置身份 · 配置损坏进 `needs_repair` 不假装正常 · Supervisor 重启读同一初始化事实。
+每一步: `load state → 显示已有输入 → 收集本次修改 → 本地校验 → 必要时真实验证 → 原子提交该阶段 → 重新评估推进`。
 
-## 7. 当前实现清单
+- 失败: 保留已完成步骤 · 不清配置 · 记 `{stage, errorClass, message}` · 给 **重试 / 修改 / 返回上一步 / 修复 / 停止** 菜单 · **不显示"配置完成"** · agent 不执行。
+- `--no-test` / `skipSteps`: 跳过 = `skipped` (明确标注), **跳过 ≠ 通过**, 门禁仍不会 ready。
+- 连通性用**最终保存的** provider/key/baseUrl/model 真测; 超时/401/404/限流/网络错误分别分类。
+- 运行时真跑: `initMinimax()` + 建 session + 最小模型调用 (只检查 singleton **不算通过**)。
 
-| 项 | 位置 | 状态 |
-|---|---|---|
-| 状态机 + 落盘 (原子写) | `src/setup/setup-store.ts` | ✅ M0/M1 |
-| 分层 readiness + 门禁 (ready/setup/repair/blocked) | 同上 | ✅ |
-| 路径统一 `resolveBolloonHome()` | 同上 + `src/llm/config-store.ts` 惰性化 | ✅ |
-| `isFirstRun()` fail-closed | `src/cli/setup-wizard.ts` | ✅ (P0) |
-| CLI 启动硬门禁 + 非零退出 | `src/index.ts` | ✅ (P0/M4) |
-| Web `GET /api/setup` + 执行路由 503 门禁 | `src/web/server.ts` | ✅ (M4 部分) |
-| Supervisor 未 ready 只诊断 | `src/web/server.ts` | ✅ |
-| Agent 侧门禁 (非测试环境) | `src/agents/pi-sdk.ts` | ✅ |
-| 可恢复事务向导 (draft/commit) | — | ⏳ M2 |
-| `bolloon setup --status/--resume/--repair/--reset` | 仅 `--status` 待接 | ⏳ M3 |
-| Web 首启 Setup 页 | — | ⏳ M3 |
-| Skills/Supervisor readiness 接入启动检查 | `readiness.agent/durable` 已汇总 | 🔶 M5 部分 |
+## 6. CLI / Web / Electron 统一入口 (Phase 4)
+
+```
+bolloon setup                      # 交互向导 (可中断, 下次从失败阶段继续)
+bolloon setup --status             # 只读: 阶段/门禁/四层 readiness/缺什么/下一步 (未 ready 退出码 1)
+bolloon setup --resume             # 从失败阶段继续
+bolloon setup --repair             # 迁移旧文件 / 备份坏文件后就地修
+bolloon setup --reconfigure        # 只改选中项 (默认 provider/凭证/模型; 新配置测通才切 active)
+bolloon setup --test               # 重跑连通性 + 运行时
+
+Web: GET /api/setup · POST /api/setup/{start,step,resume,test,repair,reconfigure,commit,identity,provider}
+     GET /setup                    # 首启页面: 显示阶段/已完成/配置来源/最近错误/readiness/下一步; 提交单步输入
+Electron: readSetupFact() / shouldShowOnboard() / maybeShowFirstRun()
+```
+
+## 7. 修复 / 重配置 / 迁移 (Phase 6)
+
+- **迁移**: 旧 `llm-config.json` → `bolloon-config.json` (直接文件迁移, 旧文件保留; 目录里同时存在时以正式文件为准并提示 `--repair`)。
+- **修复**: 正式文件损坏 → **备份成 `bolloon-config.json.corrupt-<ts>`** 后按默认重建, 并如实标注"配置被重置为默认" (不静默丢弃)。
+- **重配置**: 默认保留当前可用 provider; 新 provider **测通后**才切 active; 新配置失败不破坏旧配置; key 只替换不存明文; 改完重新验证 runtime 并重算 configHash + readiness。
+
+## 8. 验收 (Phase 7)
+
+`scripts/verify-onboard.ts` —— **51 passed / 0 failed**, 覆盖: 全新 HOME 进 Onboard · 只完成身份即中断后从供应商继续且 **DID 不重复生成** · 缺 key 停 `credential_pending` · 错 key/网络不可达→分类 auth/network 且不进 ready · 中断写盘不留半份 · 旧 `llm-config.json` 迁移 (来源从 `legacy` 变 `canonical`, 内容一致, 旧文件保留) · **CLI 半程 → Web 续办 (同一阶段)** 且未 ready 时对话路由不执行 agent (Run 数不增) · 首启页面可访问 · **未 ready 时 `createGoal` 被拒绝且无 Run;已 ready 时可建 (正例)** · 配置损坏→`repair` 且坏文件被备份, 输入保留 · `--reconfigure` 只改 model (key/provider 不动) · 坏技能被 `readinessWhy` 指出 · **真 deepseek 跑通**: 连通性真通过 + 运行时真初始化 → `gate=ready`, 四层 readiness 与 allow 正确, 配置指纹已算, 重复评估稳定。
+
+单测: `src/test/setup-store.test.ts` (23) + `src/test/onboard.test.ts` (8)。
+门禁: `tsc --noEmit` 0 错 · 全量 vitest **170 文件 / 1900 测试全绿**。
+
+## 9. 本批真跑抓到的真 bug (都已修 + 有断言)
+
+1. **身份路径读错** —— 状态层读 `~/.bolloon/user.json`, 真实文件是 `identity/user.json` → 明明配好身份却判"未配置"(与配置文件名问题同源)。
+2. **`credential_pending` 不可达** —— 缺 key 被归到 `provider_pending` → 阶段现在按"provider 已选 / 凭证可用 / 模型可用"分开判定。
+3. **config-store 缓存跨目录串配置** —— 切换 HOME (独立宿主/测试) 后仍用旧内存配置, 会把 A 的 key 写进 B。
+4. **config-store 不感知外部改动** —— repair / agent 工具 / 用户手改配置文件后进程仍用旧值 → 现在按目录 + 文件签名 (mtime/size) 失效。
+5. **未选供应商时没有可读原因** —— 只写了 why, 缺 `reasons` 文案 → 现在明确"配置里没有 activeProvider"。
+6. **ScriptedIO 静默回退到第一个选项** —— Web 传入未知供应商会被悄悄改成 deepseek → 改为原样返回并由阶段校验 (未知供应商明确报错)。
+
+## 10. 尚未完成 (如实)
+
+| 项 | 状态 |
+|---|---|
+| 2-C.4 真 P2P / delegate 事件唤醒 Goal | 未做 (API/`notifyExternal` 已通, 真实事件源未接) |
+| 2-G.2 Goal 级 skill snapshot | 未做 (readiness 汇总已做, Goal 绑定的 requiredSkills 快照未做) |
+| 2-G.3 事务型 skill import | 未做 (统一入口已做, 临时目录+原子替换未做) |
+| 2-G.4 skill 与 Supervisor 长期联动 | 未做 |
+| 2-F 判据自动生成与长期证据汇总 | 未做 |
+| 2-H Web 长期执行面板 (Goal/Run) | 未做 (首启 Onboard 页已做) |
+| Electron 打包后的 Onboard 页面路由 | 事实层已接, 打包侧调用待确认 |

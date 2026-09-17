@@ -13,6 +13,11 @@
  */
 
 import * as readline from 'readline';
+import {
+  evaluateSetup, providerUsable, readConfigFacts, refreshSetupState, resolveBolloonHome,
+  type ErrorClass as SetupErrorClass,
+} from '../setup/setup-store.js';
+import { runOnboard, type OnboardIO, type OnboardMode } from '../setup/onboard.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -127,25 +132,17 @@ export async function writeUserIdentity(
 
 // ---------------------------------------------------------------- 首次运行判断
 
-function providerUsable(p: { enabled?: boolean; apiKey?: string; requiresApiKey?: boolean }): boolean {
-  if (!p?.enabled) return false;
-  if (p.apiKey) return true;
-  return p.requiresApiKey === false;   // 本地模型 (ollama/local) 不需要 key
-}
+// providerUsable 只有一份实现 (setup-store)
 
 /** 首次运行: 没有可用供应商, 或还没有用户身份 */
 export async function isFirstRun(home: string = os.homedir()): Promise<boolean> {
+  // 2026-09-16 (Phase 1/3): 不再有独立判断 —— 是否"需要引导"由 setup-store 唯一决定。
+  //   fail-closed: 评估不出来 → 视为"需要引导"。
   try {
-    await llmConfigStore.initialize();
-    const cfg = await llmConfigStore.getConfig();
-    const usable = Object.values(cfg.providers || {}).some((p: any) => providerUsable(p));
-    if (!usable) return true;
-    const user = await readUserIdentity(home);
-    return !user;
+    const ev = await evaluateSetup({ bolloonHome: resolveBolloonHome(process.env, home), light: true });
+    return ev.gate !== 'ready';
   } catch (e: any) {
-    // 2026-09-16 (M0/M4): **fail-closed** —— 判断失败必须按"需要初始化"处理。
-    //   旧行为 `return false` 会把"读取配置失败"当成"不需要初始化", 半成品配置因此蒙混进入运行态。
-    console.warn('[setup] 首次运行判定失败, 按"需要初始化"处理 (fail-closed):', String(e?.message || e).slice(0, 160));
+    console.warn('[setup] 初始化状态评估失败, 按"需要引导"处理 (fail-closed):', String(e?.message || e).slice(0, 160));
     return true;
   }
 }
@@ -175,127 +172,99 @@ export interface SetupResult {
   error?: string;
 }
 
-/** 运行初始化向导 (交互式或参数式) */
-export async function runSetupWizard(opts: SetupOptions = {}): Promise<SetupResult> {
-  const io = opts.io ?? defaultWizardIO();
-  const home = opts.home ?? os.homedir();
-  const interactive = opts.interactive !== false;
-  const P = (s: string) => io.print(s);
-
-  try {
-    await llmConfigStore.initialize();
-  } catch (e: any) {
-    return { ok: false, error: `读取配置失败: ${String(e?.message || e).slice(0, 200)}` };
-  }
-
-  P('');
-  P('╭─ Bolloon 初始化 ─────────────────────────────╮');
-  P('│ 三步: 你的称呼 → 模型供应商 → API key + 模型 │');
-  P('╰──────────────────────────────────────────────╯');
-
-  // ---- 1) 用户称呼 ----
-  const existingUser = await readUserIdentity(home);
-  let name = String(opts.name || '').trim();
-  if (!name && interactive) {
-    name = await io.ask('① 我该怎么称呼你?', { default: existingUser?.name || os.userInfo().username });
-  }
-  if (!name) name = existingUser?.name || os.userInfo().username;
-  const idWrite = await writeUserIdentity(name, home);
-  P(`   身份: ${idWrite.identity.name}${idWrite.created ? ' (已生成新 DID)' : ' (复用已有 DID)'}`);
-  P(`   DID:  ${idWrite.identity.did.slice(0, 42)}...`);
-  P(`   文件: ${idWrite.file}`);
-
-  // ---- 2) 供应商 ----
-  const cfg = await llmConfigStore.getConfig();
-  const providers = cfg.providers as unknown as Record<string, any>;
-  let provider = String(opts.provider || '').toLowerCase().trim();
-  if (!provider && interactive) {
-    P('');
-    P('② 选一个模型供应商:');
-    RECOMMENDED_PROVIDERS.forEach((p, i) => {
-      const info = (PROVIDER_INFO as any)[p] || {};
-      const st = providers[p];
-      const mark = providerUsable(st) ? '🔑 已配置' : (st?.requiresApiKey === false ? '免 key' : '');
-      P(`   ${String(i + 1).padStart(2)}. ${p.padEnd(11)} ${String(info.name || '').padEnd(16)} ${mark}`);
-    });
-    const ans = await io.ask('   序号或名字', { default: cfg.activeProvider });
-    const idx = Number(ans);
-    provider = Number.isFinite(idx) && idx >= 1 && idx <= RECOMMENDED_PROVIDERS.length
-      ? RECOMMENDED_PROVIDERS[idx - 1]
-      : ans.trim().toLowerCase();
-  }
-  if (!provider) provider = cfg.activeProvider;
-  if (!providers[provider]) {
-    return { ok: false, error: `未知供应商 '${provider}'. 可用: ${Object.keys(providers).join(', ')}` };
-  }
-  const info = (PROVIDER_INFO as any)[provider] || {};
-  const current = providers[provider];
-  const needsKey = current?.requiresApiKey !== false;
-
-  // ---- 3) API key ----
-  let apiKey = String(opts.apiKey || '').trim();
-  if (!apiKey) apiKey = String(current?.apiKey || '').trim();     // 已配置的沿用
-  if (!apiKey && needsKey && interactive) {
-    P('');
-    P(`③ ${info.name || provider} 需要 API key (输入不回显, 只写本地 ~/.bolloon/bolloon-config.json)`);
-    apiKey = await io.ask(`   粘贴 ${provider} API key`, { hidden: true });
-    if (!apiKey) P('   ⚠ 未输入 key — 该供应商会保持不可用 (可用 bolloon model key <provider> 之后再补)');
-  }
-
-  // ---- 4) 模型 ----
-  const models: string[] = Array.isArray(info.models) ? info.models : [];
-  let model = String(opts.model || '').trim();
-  if (!model && interactive) {
-    if (models.length > 0) P(`   可选模型: ${models.slice(0, 8).join(' / ')}`);
-    model = await io.ask('④ 用哪个模型?', { default: current?.model || models[0] || '' });
-  }
-  if (!model) model = current?.model || models[0] || '';
-
-  // ---- 5) 落盘 ----
-  const patch: Record<string, any> = { enabled: true };
-  if (apiKey) patch.apiKey = apiKey;
-  if (model) patch.model = model;
-  if (!current?.baseUrl) patch.baseUrl = (DEFAULT_PROVIDER_CONFIGS as any)[provider]?.baseUrl;
-  await llmConfigStore.updateProvider(provider as ModelProvider, patch);
-  const usableNow = apiKey || !needsKey;
-  if (usableNow) {
-    await llmConfigStore.setActiveProvider(provider as ModelProvider);
-  }
-
-  // ---- 6) 连通性测试 ----
-  let test: SetupResult['test'];
-  if (!opts.skipTest && usableNow) {
-    P('');
-    P('⑤ 测试连通性...');
-    try {
-      const r = await llmConfigStore.testProvider(provider as ModelProvider);
-      test = { success: !!r.success, latency: r.latency, error: r.error };
-      P(r.success ? `   ✅ 连通 (${r.latency ?? '?'} ms)` : `   ⚠ 未通过: ${String(r.error || '').slice(0, 160)}`);
-    } catch (e: any) {
-      test = { success: false, error: String(e?.message || e).slice(0, 200) };
-      P(`   ⚠ 测试失败: ${test.error}`);
-    }
-  }
-
-  P('');
-  P(`✅ 配置完成 — 当前供应商: ${provider}${model ? `, 模型: ${model}` : ''}`);
-  P(`   配置文件: ${path.join(home, '.bolloon', 'bolloon-config.json')}`);
-  P('   开始对话: bolloon --cli');
-  P('');
+/** WizardIO → OnboardIO 适配 (select/confirm 用编号或值回答) */
+function onboardIO(io: WizardIO): OnboardIO {
   return {
-    ok: true,
-    userName: idWrite.identity.name,
-    provider,
-    model,
-    identityFile: idWrite.file,
-    identityCreated: idWrite.created,
-    test,
+    print: (m: string) => io.print(m),
+    ask: async (q, opts) => {
+      for (let i = 0; i < 3; i++) {
+        const v = await io.ask(q, opts?.defaultValue ? { default: opts.defaultValue } : undefined);
+        const val = String(v ?? '').trim() || String(opts?.defaultValue ?? '');
+        if (!opts?.validate) return val;
+        const r = opts.validate(val);
+        if (r.ok) return val;
+        io.print(`  ✗ ${r.error || '输入无效'}`);
+      }
+      return String(opts?.defaultValue ?? '');
+    },
+    askHidden: async (q) => {
+      const { askHiddenLine } = await import('./setup-wizard.js').catch(() => ({ askHiddenLine: null })) as any;
+      return io.ask(q, { hidden: true });   // WizardIO 已支持 hidden (不回显)
+    },
+    confirm: async (q, d = true) => {
+      const a = String(await io.ask(`${q} (y/n)`, { default: d ? 'y' : 'n' })).trim().toLowerCase();
+      return a === '' ? d : /^(y|yes|1|true|是)$/.test(a);
+    },
+    select: async (q, choices) => {
+      io.print(q);
+      choices.forEach((c, i) => io.print(`  ${i + 1}) ${c.label}${c.hint ? ` — ${c.hint}` : ''}`));
+      const a = String(await io.ask(`选择 (序号或名称)`, { default: '1' })).trim();
+      if (!a) return choices[0]?.value || '';
+      if (/^\d+$/.test(a) && choices[Number(a) - 1]) return choices[Number(a) - 1].value;
+      const hit = choices.find((c) => c.value === a) || choices.find((c) => a && c.value.startsWith(a)) || choices.find((c) => a && c.label.includes(a));
+      return hit?.value || a;
+    },
   };
 }
 
-// ---------------------------------------------------------------- /model 命令
+/**
+ * 运行初始化向导 —— 现在是**可恢复阶段执行器**的薄包装 (Phase 2):
+ *   load state → 显示已有 → 收集修改 → 校验 → 真实验证 → 原子提交阶段 → 推进
+ * 失败: 保留已完成步骤 · 不清配置 · 标失败分类 · 给重试/修改/回退入口 · **不显示配置完成**
+ */
+export async function runSetupWizard(opts: SetupOptions = {}): Promise<SetupResult> {
+  const io = opts.io ?? defaultWizardIO();
+  const home = opts.home ?? os.homedir();
+  const bolloonHome = resolveBolloonHome(process.env, home);
+  const P = (s: string) => io.print(s);
+  const mode: OnboardMode = (opts as any).mode || 'setup';
 
-/** 配置状态一览 (供 CLI 会话内 /model 与 bolloon model 共用) */
+  P('');
+  P('╭─ Bolloon 初始化 (可中断, 下次从失败阶段继续) ─────╮');
+  P('│ 身份 → 供应商 → 凭证 → 模型 → 连通性 → 运行时   │');
+  P('╰──────────────────────────────────────────────────╯');
+
+  // 参数式输入 (非交互/脚本): 先落盘再跑阶段, 保证"输入已保存"
+  try {
+    if (opts.name) await writeUserIdentity(opts.name, home);
+    const prov = (opts as any).provider;
+    if (prov) {
+      const store: any = llmConfigStore;
+      await store.initialize();
+      await store.updateProvider(prov, { enabled: true });
+      if ((opts as any).apiKey) await store.updateProvider(prov, { apiKey: (opts as any).apiKey });
+      if ((opts as any).model) await store.updateProvider(prov, { model: (opts as any).model });
+      if (mode !== 'reconfigure') await store.setActiveProvider(prov);
+    }
+  } catch (e: any) {
+    return { ok: false, error: `参数落盘失败: ${String(e?.message || e).slice(0, 160)}` };
+  }
+
+  const res = await runOnboard({
+    mode,
+    io: onboardIO(io),
+    home,
+    bolloonHome,
+    targets: (opts as any).targets,
+    skipSteps: opts.skipTest ? ['connectivity'] : undefined,
+    oneShot: opts.interactive === false,
+  });
+
+  const cfg = await readConfigFacts(bolloonHome).catch(() => null);
+  return {
+    ok: res.ok,
+    userName: res.state.inputs.name,
+    provider: res.state.inputs.provider,
+    model: res.state.inputs.model,
+    identityFile: getUserIdentityFile(home),
+    identityCreated: !!res.state.inputs.identityDid,
+    test: res.state.checks.connectivityOk ? { success: true } : { success: false, error: res.state.lastError?.message },
+    error: res.ok ? undefined : (res.message || res.actions[0]),
+    // 新增: 结构化状态 (旧调用方看不到也不影响)
+    ...( { gate: res.gate, stage: res.state.stage, summary: res.summary } as any ),
+  };
+}
+
 export async function formatProviderStatus(): Promise<string> {
   await llmConfigStore.initialize();
   const cfg = await llmConfigStore.getConfig();

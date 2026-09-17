@@ -141,6 +141,21 @@ export function newGoalId(): string {
 }
 
 export async function createGoal(opts: CreateGoalOptions): Promise<GoalRecord> {
+  // 2026-09-16 (Phase 3 硬门禁): 初始化未就绪时**不允许创建长期 Goal**。
+  //   生产环境生效; 测试环境跳过 (用例跑在隔离 HOME, 本来就没有真实配置)。
+  if (!process.env.VITEST && process.env.BOLLOON_SETUP_IN_PROGRESS !== '1') {
+    try {
+      const { getSetupGateCached } = await import('../setup/setup-store.js');
+      const { gate, state } = await getSetupGateCached();
+      if (gate !== 'ready') {
+        throw new Error(`初始化未就绪 (${gate}, 阶段 ${state.stage}) — 不允许创建 Goal; 先 \`bolloon setup\``);
+      }
+    } catch (err: any) {
+      if (/初始化未就绪/.test(String(err?.message || ''))) throw err;
+      // 门禁自身不可读 → fail-closed (不放行)
+      throw new Error(`初始化状态不可读, 拒绝创建 Goal (fail-closed): ${String(err?.message || err).slice(0, 120)}`);
+    }
+  }
   const now = new Date().toISOString();
   const rec: GoalRecord = {
     goalId: newGoalId(),
