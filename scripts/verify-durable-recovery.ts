@@ -25,6 +25,12 @@ process.env.BOLLOON_CRON = '0';
 // 恢复跑会真的调用 LLM 继续工作: 给小预算让它在预算边界如实收尾 (避免长时间游走影响验收时长)
 process.env.BOLLOON_RUN_MAX_STEPS = process.env.BOLLOON_RUN_MAX_STEPS || '12';
 fs.mkdirSync(path.join(HOME, '.bolloon'), { recursive: true });
+// 2026-09-16: 初始化硬门禁生效后, 验收 HOME 必须是"真的 ready" (复制真实 LLM 配置 + 身份 + 引导状态)
+try {
+  const { makeSetupReady } = await import('./lib/make-setup-ready.js');
+  const r = makeSetupReady(path.join(HOME, '.bolloon'), { realHome: REAL_HOME });
+  console.log(`[setup-ready] ${r.ok ? 'LLM 配置已就绪' : '⚠ 无可用 LLM 配置'} · ${r.notes.length} 步`);
+} catch (e) { console.log('[setup-ready] 失败:', (e as Error)?.message); }
 
 const PROBE = path.join(tmpRoot, 'recovery-probe.txt');
 const PORT = 41731 + Math.floor(Math.random() * 200);

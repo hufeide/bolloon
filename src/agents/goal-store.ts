@@ -55,6 +55,24 @@ export interface GoalContinuation {
   attempts?: number;
   /** 最近一次执行的 runId */
   lastRunId?: string;
+  /** 2026-09-16 (2-C.4): 正在等待的外部事件 (来源/关联/过期) —— 事件处理器只认这份事实 */
+  external?: {
+    requestId: string;
+    continuationId: string;
+    expectedSource: 'p2p' | 'delegate' | 'http' | 'any';
+    expectedEvent?: string;
+    createdAt: string;
+    expiresAt: string;
+    note?: string;
+  };
+  /** 最近一次外部事件结果 (事实) */
+  externalResult?: { eventId: string; source: string; fromDid?: string; at: string; payload?: unknown };
+  /** 已处理过的 eventId (幂等去重, 最多留 20 条) */
+  deliveredEventIds?: string[];
+  /** 2026-09-16 (2-G.2): 技能就绪事实 (最近一次门禁结论) */
+  skillReadiness?: { ok: boolean; at: string; reason?: string; missing?: string[]; drift?: { name: string; expected?: string; actual: string }[]; degradations?: string[] };
+  /** 外部等待超时的原因 (转人工时写) */
+  lastExternalTimeout?: string;
   updatedAt?: string;
 }
 
@@ -91,6 +109,10 @@ export interface GoalRecord {
   unresolvedItems: string[];
   /** 目标级证据 (成功步骤的事实摘要) */
   evidence: string[];
+  /** 2026-09-16 (2-G.2): 这个目标依赖的技能 (前缀 '?' = 可选) —— 首次执行时冻结版本+hash */
+  requiredSkills?: string[];
+  /** 冻结的技能快照 (后续 Run 不重新随意扫目录; 漂移要人工批准) */
+  skillSnapshot?: { name: string; version: string; contentHash: string; source?: string; resolvedAt: string }[];
   resolution?: { reason: string; at: string };
   /** 长期执行调度元数据 (M2-A) */
   continuation?: GoalContinuation;
@@ -100,6 +122,8 @@ export interface GoalRecord {
 
 export interface CreateGoalOptions {
   objective: string;
+  /** 2026-09-16 (2-G.2): 依赖的技能 (前缀 '?' = 可选) */
+  requiredSkills?: string[];
   successCriteria?: string[];
   constraints?: string[];
   budget?: GoalRecord['budget'];
@@ -162,6 +186,7 @@ export async function createGoal(opts: CreateGoalOptions): Promise<GoalRecord> {
     objective: String(opts.objective || '').slice(0, 500),
     successCriteria: (opts.successCriteria || []).map((c) => String(c).slice(0, 200)).slice(0, 20),
     constraints: (opts.constraints || []).map((c) => String(c).slice(0, 200)).slice(0, 20),
+    requiredSkills: (opts.requiredSkills || []).map((c) => String(c).slice(0, 120)).slice(0, 20),
     budget: opts.budget,
     status: 'open',
     channelId: opts.channelId,
@@ -522,7 +547,10 @@ export async function wakeReport(now = Date.now()): Promise<{ goalId: string; st
       const left = Math.round((Date.parse(c.wakeAt) - now) / 1000);
       wake = `等时间 (${c.wakeAt}, 还剩 ${left}s${c.attempts ? `, 已自动继续 ${c.attempts} 次` : ''})`;
     }
-    else if (c?.wakeReason === 'awaiting_external') wake = `等外部事件${c.needsExternal ? ` (${c.needsExternal})` : ''}`;
+    else if (g.status === 'awaiting_external' || c?.wakeReason === 'awaiting_external' || c?.external) {
+      const what = c?.needsExternal || (c?.external ? `${c.external.expectedSource}${c.external.expectedEvent ? `:${c.external.expectedEvent}` : ''} (requestId=${c.external.requestId}, 过期 ${c.external.expiresAt})` : '');
+      wake = `等外部事件${what ? ` (${what})` : ''}`;
+    }
     else if (live) wake = `已被 ${lease!.owner} 认领`;
     out.push({ goalId: g.goalId, status: g.status, wake, autoContinue: c?.autoContinue !== false, lease: live ? lease!.owner : undefined });
   }

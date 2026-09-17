@@ -1332,6 +1332,8 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
   /** 2026-09-16 (M2): 本次执行是"从 checkpoint 恢复"的 runId (非空 = 恢复模式, 不再新建 run) */
   private resumeRunId = '';
   private resumePlan: ResumePlan | null = null;
+  /** 2026-09-16 (2-C.4): 外部请求 id (工具层设; 回包必须带上才能精确匹配) */
+  pendingExternalRequestId?: string;
   /** 2026-09-16 (M3): 外部等待中 (awaiting_external) —— 收到成功步骤后回 running */
   private awaitingExternal = false;
   /** 2026-09-16 (M3): 熔断原因 (同一工具连续失败达上限 → needs_human) */
@@ -1402,6 +1404,24 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
     if (cls === 'external_no_reply') {
       this.awaitingExternal = true;
       await this.safeSetRunStatus(this.currentRunId, 'awaiting_external');
+      // 2026-09-16 (2-C.4): 把"在等什么"写成持久化事实 (来源/关联/过期), 否则真实回包到了也不知道该唤醒谁。
+      try {
+        if (this.currentGoalId) {
+          const { bindExternalWait, newContinuationId, defaultWaitExpiry } = await import('./external-events.js');
+          const isDelegate = /delegate/i.test(String(tool || ''));
+          await bindExternalWait(this.currentGoalId, {
+            requestId: this.pendingExternalRequestId || `${this.currentRunId}:${Date.now().toString(36)}`,
+            continuationId: newContinuationId(this.currentGoalId),
+            expectedSource: isDelegate ? 'delegate' : 'p2p',
+            expectedEvent: 'result',
+            createdAt: new Date().toISOString(),
+            expiresAt: defaultWaitExpiry(Date.now(), Number(process.env.BOLLOON_EXTERNAL_WAIT_MS || 30 * 60_000)),
+            note: `${isDelegate ? 'delegate 回包' : 'P2P 协作回复'} 等待中 (tool=${tool})`,
+          });
+        }
+      } catch (e) {
+        await recordDegradation({ kind: 'core', op: 'pi-sdk.bindExternalWait', runId: this.currentRunId, message: String((e as Error)?.message || e) }).catch(() => {});
+      }
       return;
     }
     // 鉴权类: 不重试, 直接交人

@@ -29,6 +29,12 @@ process.env.BOLLOON_CRON = '0';
 process.env.BOLLOON_SUPERVISOR = '0';                 // 验收自己控制 tick, 不靠后台定时器
 process.env.BOLLOON_RUN_MAX_STEPS = process.env.BOLLOON_RUN_MAX_STEPS || '3';   // 小预算 → 逼出"跨 Run 继续"
 fs.mkdirSync(path.join(HOME, '.bolloon'), { recursive: true });
+// 2026-09-16: 初始化硬门禁生效后, 验收 HOME 必须是"真的 ready" (复制真实 LLM 配置 + 身份 + 引导状态)
+try {
+  const { makeSetupReady } = await import('./lib/make-setup-ready.js');
+  const r = makeSetupReady(path.join(HOME, '.bolloon'), { realHome: REAL_HOME });
+  console.log(`[setup-ready] ${r.ok ? 'LLM 配置已就绪' : '⚠ 无可用 LLM 配置'} · ${r.notes.length} 步`);
+} catch (e) { console.log('[setup-ready] 失败:', (e as Error)?.message); }
 
 const PROBE = path.join(tmpRoot, 'sup-probe.txt');
 let passed = 0, failed = 0;

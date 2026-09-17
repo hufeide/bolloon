@@ -751,6 +751,16 @@ export class AgentMessaging {
         return false;
       }
 
+      // 2026-09-16 (2-C.4): 目标关联的真实外部事件 —— 签名已通过校验, 这里再按
+      //   来源 / correlation / 过期 / eventId 去重做一次严格匹配, 只唤醒"正在等这个事件"的 Goal。
+      //   **不在这里启动 agent**: 只写事实 + 唤醒, 由 Supervisor 下一轮继续。
+      try {
+        const { tryDeliverGoalEvent } = await import('./goal-event-bridge.js');
+        await tryDeliverGoalEvent(signedMsg, fromPeerId);
+      } catch (e) {
+        console.warn(`[Messaging] goal event bridge 失败 (不影响普通消息):`, (e as Error)?.message);
+      }
+
       const handler = this.messageHandlers.get(signedMsg.type);
       if (handler) {
         handler(data, fromPeerId, signedMsg.from);

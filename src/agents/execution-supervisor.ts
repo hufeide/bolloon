@@ -335,6 +335,18 @@ export class ExecutionSupervisor {
       }
       report.supervised = await superviseRuns();
 
+      // 1.5 (2026-09-16, 2-C.4): 外部等待超时 → 明确转人工 (不允许无限等待)
+      try {
+        const { expireExternalWaits } = await import('./external-events.js');
+        const expired = await expireExternalWaits({ now: this.now() });
+        for (const e of expired) {
+          this.log(`[supervisor] 外部等待超时 → needs_human: ${e.goalId} (${e.wait.expectedSource})`);
+          this.emit({ kind: 'needs_human', goalId: e.goalId, message: e.reason });
+        }
+      } catch (err) {
+        this.log(`[supervisor] 外部等待超时检查失败: ${(err as Error)?.message}`);
+      }
+
       // 2. 扫描可执行 Goal
       const { runnable, skipped } = await listRunnableGoals({ now: this.now(), owner: this.owner });
       report.skipped = skipped;
@@ -435,6 +447,26 @@ export class ExecutionSupervisor {
     if (!runner) {
       report.skipped.push({ goalId: goal.goalId, reason: '无执行器 (Goal 状态未改动)' });
       return { goalId: goal.goalId, status: 'unresolved' };
+    }
+
+    // 2026-09-16 (2-G.2): 执行前技能就绪门禁 —— 缺/未启用/损坏/漂移 → 不启动 Run, Goal → needs_human
+    try {
+      const { ensureGoalSkillsReady, blockGoalOnSkills } = await import('./skill-readiness.js');
+      const ready = await ensureGoalSkillsReady(goal);
+      for (const d of ready.degradations) this.log(`[supervisor] goal=${goal.goalId} 技能降级: ${d}`);
+      if (!ready.ok) {
+        await blockGoalOnSkills(goal.goalId, ready);
+        report.skipped.push({ goalId: goal.goalId, reason: `技能未就绪: ${ready.reason}` });
+        this.emit({ kind: 'needs_human', goalId: goal.goalId, message: ready.reason || '技能未就绪' });
+        this.log(`[supervisor] goal=${goal.goalId} 技能门禁拦截 → needs_human (未启动 Run): ${ready.reason}`);
+        return { goalId: goal.goalId, runId: prevRunId, status: 'blocked_by_skills', error: ready.reason };
+      }
+    } catch (err) {
+      // 门禁自身失败 → fail-closed: 不执行 (宁可停, 不用未校验的技能跑)
+      const why = `技能门禁自身失败 (fail-closed, 未执行): ${String((err as Error)?.message || err).slice(0, 140)}`;
+      report.skipped.push({ goalId: goal.goalId, reason: why });
+      this.log(`[supervisor] ${why}`);
+      return { goalId: goal.goalId, runId: prevRunId, status: 'blocked_by_skills', error: why };
     }
 
     // 执行期间持续续租: 续租失败 = 已被别人接管 → 记录 (不掩盖)
