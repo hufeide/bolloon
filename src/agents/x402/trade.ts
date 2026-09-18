@@ -14,7 +14,8 @@ import {
   validatePaymentRequirements, evaluateTransactionSuccess, computeReceiptHash,
   type TransactionRecord, type InfoItemMetadata,
 } from './transaction-protocol.js';
-import { beginTransaction, updateTransaction, setTransactionStatus, readTransaction, findByRequestId, claimPayment, releasePaymentClaim } from './transaction-store.js';
+import { beginTransaction, updateTransaction, setTransactionStatus, setSettlementFact, readTransaction, findByRequestId, claimPayment, releasePaymentClaim } from './transaction-store.js';
+import { deriveResponsibility, writeDeliveryContent, type ResponsibilityEvidence } from './settlement-state.js';
 
 export interface TradeParams {
   /** 资源执行结果 (Phase 3/4): 是否被实际执行且符合契约; 是否命中 Goal 判据 */
@@ -103,6 +104,19 @@ export async function buyInfoAsTransaction(params: TradeParams): Promise<TradeRe
   }, home);
   let rec = record;
 
+  // ★ 幂等短路: 这个 requestId 已经有交易走过付款流程 (或已结束) → 直接返回既有事实,
+  //   绝不重放"报价→付款"流程 (重放会既重复非幂等操作, 又踩非法迁移)。
+  if (reused && ['paying', 'settled', 'delivered', 'verified', 'delivery_failed', 'verification_failed', 'policy_denied', 'failed'].includes(String(record.status))) {
+    return {
+      ok: record.status === 'verified' || record.status === 'delivered',
+      status: record.status,
+      transactionId: record.transactionId,
+      record,
+      reused: true,
+      error: `该 requestId 已有交易处于 ${record.status} → 复用既有交易, 不重放付款`,
+    } as any;
+  }
+
   if (status !== 402) {
     // 免费资源: 不算交易成功 (没有付款也就没有"结算")
     rec = (await updateTransaction(rec.transactionId, { status: 'delivered', event: { kind: 'free_resource', detail: `HTTP ${status}` } }, home))!;
@@ -162,7 +176,7 @@ export async function buyInfoAsTransaction(params: TradeParams): Promise<TradeRe
     rec = (await setTransactionStatus(rec.transactionId, 'failed', claim.reason, home))!;
     return { ok: false, status: rec.status, transactionId: rec.transactionId, record: rec, error: claim.reason };
   }
-  rec = (await updateTransaction(rec.transactionId, { status: 'paying', event: { kind: 'paying', detail: `已取得付款权 (holder=${rec.transactionId})` } }, home))!;
+  rec = (await updateTransaction(rec.transactionId, { status: 'paying', event: { kind: 'paying', detail: `已取得付款权 (holder=${rec.transactionId}); 结算事实仍是 unpaid (还没真发出付款凭据)` } }, home))!;
 
   // ④ 付款 + 交付 (仍然由 buyInfo 执行; 策略门已过才走到这里)
   const { buyInfo } = await import('./paid-info-store.js');
@@ -178,17 +192,38 @@ export async function buyInfoAsTransaction(params: TradeParams): Promise<TradeRe
     fetchImpl: params.fetchImpl,
     prePayGuard: async () => ({ ok: true }),          // 已在上一步过门 (这里不再重复打分)
     onEvent: async (e) => {
-      await updateTransaction(rec.transactionId, {
-        ...(e.patch || {}),
-        event: { kind: e.kind, detail: e.detail },
-      } as any, home);
+      const patch: any = { ...(e.patch || {}) };
+      // ★ 两层: 链上真的结算了 → 结算事实 payment_verified; 联调永远停 payment_submitted
+      if (patch.chainSettled === true && rec.paymentMode !== 'local-dev') patch.settlementFact = 'payment_verified';
+      else if (patch.paymentReceipt && patch.paymentMode === 'local-dev') patch.settlementFact = 'payment_submitted';
+      await updateTransaction(rec.transactionId, { ...patch, event: { kind: e.kind, detail: e.detail } } as any, home);
     },
   });
 
   rec = (await readTransaction(rec.transactionId, home))!;
 
   if (!res.ok) {
-    const next = res.policyDenied ? 'policy_denied' : 'failed';
+    // ★ 钱不能凭空消失: 只要**发起过支付尝试**, 就不许记成普通 failed
+    //   结算不确定 → payment_required + unknown (先对账, 不许自动重付)
+    //   facilitator 明确拒绝 → payment_required + unpaid (钱一定没动, 可安全重试)
+    //   完全没付款凭据 → failed (此时确定没付过钱)
+    const attempted = res.payment?.attempted === true || !!rec.txHash || !!rec.paymentReceipt;
+    const uncertain = res.payment?.settlementUncertain === true;
+    const paidDone = res.payment?.settled === true || (!!rec.txHash && !uncertain);
+    let next: string;
+    if (res.policyDenied) next = 'policy_denied';
+    else if (paidDone) next = 'delivery_failed';        // 钱付了, 资源没到手
+    else if (uncertain) next = 'payment_required';      // 可能付过 → 先对账, 不许自动重付
+    else if (attempted) next = 'payment_required';      // 明确没付成 → 可安全重试
+    else next = 'failed';
+    rec = (await updateTransaction(rec.transactionId, {
+      ...(uncertain ? { settlementFact: 'unknown' } : {}),
+      ...(paidDone ? { settlementFact: rec.chainSettled === true ? 'payment_verified' : 'payment_submitted' } : {}),
+      event: {
+        kind: 'payment_outcome',
+        detail: `attempted=${attempted} paidDone=${paidDone} uncertain=${uncertain} verifyRejected=${res.payment?.verifyRejected === true} → 状态 ${next}${uncertain ? ' (先对账, 不许自动重付)' : ''}`,
+      },
+    } as any, home))!;
     rec = (await setTransactionStatus(rec.transactionId, next as any, res.error, home))!;
     return { ok: false, status: rec.status, transactionId: rec.transactionId, record: rec, error: res.error };
   }
@@ -202,28 +237,46 @@ export async function buyInfoAsTransaction(params: TradeParams): Promise<TradeRe
   const { computeContentHash } = await import('./paid-info-protocol.js');
   const deliveryHash = computeContentHash(content);
   const receiptStr = res.payment?.receipt || '';
+  // ★ 正文落盘: 让"资源正文存在 + 哈希正确"可以在事后**重新计算**验证, 而不是信记录里的自述
+  let deliveryBytes: { hash: string; bytes: number } | null = null;
+  if (content) {
+    try {
+      const w = writeDeliveryContent(rec.transactionId, content, home);
+      deliveryBytes = { hash: w.hash, bytes: w.bytes };
+    } catch { deliveryBytes = null; }
+  }
   rec = (await updateTransaction(rec.transactionId, {
     deliveryHash,
     contentHash: envelope?.contentHash || envelope?.proof?.payload?.contentHash || envelope?.proof?.contentHash || rec.contentHash,
     receiptHash: receiptStr ? computeReceiptHash(receiptStr) : undefined,
     verificationTrust: (res.verify?.trust as any) || 'unverified',
     protocolVerified: res.verify?.trust === 'verified',
+    ...(deliveryBytes ? { deliveryBytesHash: deliveryBytes.hash } : {}),
     event: { kind: 'delivery_hash', detail: `deliveryHash=${deliveryHash.slice(0, 12)}… trust=${res.verify?.trust || 'unverified'}` },
   }, home))!;
 
   if (!content) {
+    const resp = deriveResponsibility({ deliveryMissing: true });
+    rec = (await updateTransaction(rec.transactionId, { responsibility: resp, event: { kind: 'responsibility_candidate', detail: `${resp.type}: ${resp.reason}` } }, home))!;
     rec = (await setTransactionStatus(rec.transactionId, 'delivery_failed', '付了钱但没拿到正文', home))!;
     return { ok: false, status: 'delivery_failed', transactionId: rec.transactionId, record: rec, verify: res.verify, error: '付了钱但没拿到正文' };
   }
   if (rec.contentHash && deliveryHash !== rec.contentHash) {
+    const resp = deriveResponsibility({ deliveryHashMismatch: true });
+    rec = (await updateTransaction(rec.transactionId, { responsibility: resp, event: { kind: 'responsibility_candidate', detail: `${resp.type}: ${resp.reason}` } }, home))!;
     rec = (await setTransactionStatus(rec.transactionId, 'verification_failed', '内容哈希不匹配 (内容被换过)', home))!;
     return { ok: false, status: 'verification_failed', transactionId: rec.transactionId, record: rec, verify: res.verify, error: '内容哈希不匹配' };
   }
   if (!rec.receiptHash) {
+    const resp = deriveResponsibility({ receiptMissing: true });
+    rec = (await updateTransaction(rec.transactionId, { responsibility: resp, event: { kind: 'responsibility_candidate', detail: `${resp.type}: ${resp.reason}` } }, home))!;
     rec = (await setTransactionStatus(rec.transactionId, 'verification_failed', '缺少支付回执 (回执与信封未绑定)', home))!;
     return { ok: false, status: 'verification_failed', transactionId: rec.transactionId, record: rec, verify: res.verify, error: '缺少支付回执' };
   }
   if ((rec.verificationTrust || 'unverified') === 'unverified') {
+    const ev: ResponsibilityEvidence = { signatureInvalid: true };
+    const resp = deriveResponsibility(ev);
+    rec = (await updateTransaction(rec.transactionId, { responsibility: resp, event: { kind: 'responsibility_candidate', detail: `${resp.type}: ${resp.reason}` } }, home))!;
     rec = (await setTransactionStatus(rec.transactionId, 'verification_failed', `验真不通过 (${res.verify?.trust})`, home))!;
     return { ok: false, status: 'verification_failed', transactionId: rec.transactionId, record: rec, verify: res.verify, error: `验真不通过: ${res.verify?.trust}` };
   }
@@ -232,6 +285,9 @@ export async function buyInfoAsTransaction(params: TradeParams): Promise<TradeRe
   const verdict = evaluateTransactionSuccess({ ...rec, status: 'delivered' });
   const finalStatus: TransactionRecord['status'] = verdict.success ? 'verified' : 'delivered';
   rec = (await setTransactionStatus(rec.transactionId, finalStatus, verdict.reason, home))!;
+  if (finalStatus === 'verified') {
+    rec = (await setSettlementFact(rec.transactionId, 'fully_settled', '链上结算 + 交付与验真全通过', home))!;
+  }
 
   // Phase 3: 交易证据写进 Run (step + evidence) 与 Goal (仅在 verified + 执行成功 + 命中判据时计入成功证据)
   let bridge: any = null;

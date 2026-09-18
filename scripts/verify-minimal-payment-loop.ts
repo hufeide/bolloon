@@ -297,6 +297,8 @@ async function main() {
 
     // 重启对账: 造一条"付到一半"的记录 → 必须先对账再决定
     const stuck = await TXS.beginTransaction({ requestId: `verify-${MODE}-stuck-1`, metadata: { itemId: item.id }, buyerDid: BUYER_DID }, HOME);
+    // 走真实路径到 paying (Phase 0 起: discovered 不能直接跳 paying, 跳过报价就是非法迁移)
+    await TXS.updateTransaction(stuck.record.transactionId, { status: 'quoted', event: { kind: 'quoted', detail: '模拟: 已拿到 402 报价' } }, HOME);
     await TXS.setTransactionStatus(stuck.record.transactionId, 'paying', '模拟付到一半被杀', HOME);
     const rec4 = await TXS.reconcilePendingTransactions(HOME);
     const stuckAfter = await TXS.readTransaction(stuck.record.transactionId, HOME);

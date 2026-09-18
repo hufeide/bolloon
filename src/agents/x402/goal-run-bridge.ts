@@ -44,11 +44,15 @@ export function transactionEvidenceLines(rec: TransactionRecord): string[] {
     `itemId=${rec.itemId}`,
     `paymentMode=${rec.paymentMode}`,
     `chainSettled=${rec.chainSettled}`,
+    `settlementFact=${rec.settlementFact || '(legacy-未记)'}`,     // 两层状态: 钱到底动没动, 审计一眼可见
+    `protocolVerified=${rec.protocolVerified === true}`,
     `txHash=${rec.txHash || '(none)'}`,
     `receiptHash=${rec.receiptHash || '(none)'}`,
     `contentHash=${rec.contentHash || '(none)'}`,
     `verificationTrust=${rec.verificationTrust || 'unverified'}`,
     `transactionStatus=${rec.status}`,
+    ...(rec.responsibility ? [`responsibility=${rec.responsibility.type}(${rec.responsibility.reason})`] : []),
+    ...(rec.execution ? [`executionOk=${rec.execution.ok === true} schemaOk=${rec.execution.schemaOk === true}`] : []),
   ];
 }
 
@@ -72,7 +76,7 @@ export async function bridgeTransactionToRunGoal(
       const step = {
         tool: 'x402_transaction',
         ok,
-        summary: `${bridgeEventFor(rec.status)} · ${opts.summary || rec.itemId} (${rec.amount || rec.price || '?'} ${rec.currency || ''} via ${rec.paymentMode})`,
+        summary: `${bridgeEventFor(rec.status)} · ${opts.summary || rec.itemId} (${rec.amount || rec.price || '?'} ${rec.currency || ''} via ${rec.paymentMode} · 结算 ${rec.settlementFact || '?'})`,
         error: ok ? undefined : (rec.failureReason || rec.status),
         args: { itemId: rec.itemId, amount: rec.amount, currency: rec.currency, network: rec.network, requestId: rec.requestId },
       };
@@ -85,7 +89,8 @@ export async function bridgeTransactionToRunGoal(
 
   // Goal 侧: 只有 verified + 执行成功 + 命中判据 才计入成功证据
   if (opts.goalId) {
-    const eligible = rec.status === 'verified' && opts.executionOk === true && opts.goalCriteriaHit === true;
+    // 纵深防御: 就算有人绕过门写成 verified, 没有链上结算事实也不许进 Goal 成功证据
+    const eligible = rec.status === 'verified' && rec.chainSettled === true && opts.executionOk === true && opts.goalCriteriaHit === true;
     try {
       if (eligible) {
         await addGoalEvidenceViaStore(opts.goalId, [

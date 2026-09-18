@@ -10,10 +10,34 @@
 
 import * as os from 'os';
 import * as path from 'path';
+import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import {
   newTransactionId, event, type TransactionRecord, type TransactionStatus, type InfoItemMetadata,
 } from './transaction-protocol.js';
+import {
+  migrateTransactionRecord, deriveSettlementFact, checkLifecycleMove, canTransitionSettlement, isSettlementFact,
+  CURRENT_SCHEMA_VERSION, type SettlementFact,
+} from './settlement-state.js';
+import { sha256Hex } from './paid-info-protocol.js';
+
+/**
+ * 由 requestId **确定性派生** 交易 id。
+ * 为什么必须确定: 并发两个进程用同一 requestId 时, 随机 id + "标记已创建但内容未写入"的窗口
+ * 会让两边各建一条记录 (真跑抓到过: 同一 requestId 落了两条交易)。确定性 id 让"同一 requestId"
+ * 物理上只能指向同一个文件, 再用独占创建决定谁写第一份。
+ */
+export function transactionIdForRequest(requestId: string): string {
+  return `tx-${sha256Hex(String(requestId)).slice(0, 12)}`;
+}
+
+/** 非法状态迁移 (拒绝写入, 不静默修正) */
+export class IllegalTransactionTransition extends Error {
+  constructor(public readonly reason: string, public readonly transactionId: string, public readonly target: string) {
+    super(`拒绝迁移 ${transactionId} → ${target}: ${reason}`);
+    this.name = 'IllegalTransactionTransition';
+  }
+}
 
 export function transactionsDir(home: string = os.homedir()): string {
   return path.join(home, '.bolloon', 'transactions');
@@ -33,6 +57,21 @@ export async function saveTransaction(rec: TransactionRecord, home: string = os.
 }
 
 export async function readTransaction(id: string, home: string = os.homedir()): Promise<TransactionRecord | null> {
+  const raw = await readTransactionRaw(id, home);
+  if (!raw) return null;
+  const migrated = migrateTransactionRecord(raw);
+  if (migrated.changed) {
+    // 迁移必须可回放: 事件全保留 + 追加一条 migrate-v2; 写回时保留原文件备份
+    try {
+      const p = txPath(id, home);
+      if (fs.existsSync(p)) fs.copyFileSync(p, `${p}.bak-v1`);
+      await saveTransaction(migrated.record, home);
+    } catch { /* 写不回不影响本次读取结果 */ }
+  }
+  return migrated.record;
+}
+
+async function readTransactionRaw(id: string, home: string = os.homedir()): Promise<TransactionRecord | null> {
   try { return JSON.parse(await fsp.readFile(txPath(id, home), 'utf8')) as TransactionRecord; } catch { return null; }
 }
 
@@ -76,28 +115,23 @@ function reqMarkerPath(requestId: string, home: string): string {
  */
 export async function beginTransaction(input: BeginInput, home: string = os.homedir()): Promise<{ record: TransactionRecord; reused: boolean }> {
   await fsp.mkdir(transactionsDir(home), { recursive: true });
-  const existing = await findByRequestId(input.requestId, home);
+  const id = transactionIdForRequest(input.requestId);
+
+  // ① 确定性 id 已经指向一份记录 → 直接复用 (文件可能正在被写 → 短暂轮询)
+  let existing = await readTransaction(id, home);
+  for (let i = 0; i < 20 && !existing && fs.existsSync(txPath(id, home)); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    existing = await readTransaction(id, home);
+  }
   if (existing) return { record: existing, reused: true };
 
-  const marker = reqMarkerPath(input.requestId, home);
-  const candidateId = newTransactionId();
-  let winnerId: string | null = null;
-  try {
-    const fh = await fsp.open(marker, 'wx');                 // ★ 独占认领
-    await fh.writeFile(candidateId, 'utf8');
-    await fh.close();
-    winnerId = candidateId;
-  } catch {
-    // 别人先认领了 → 用它的 transactionId (不再新建)
-    try { winnerId = (await fsp.readFile(marker, 'utf8')).trim() || null; } catch { winnerId = null; }
-  }
-  if (winnerId && winnerId !== candidateId) {
-    const other = await readTransaction(winnerId, home);
-    if (other) return { record: other, reused: true };
-  }
+  // ② 兼容历史上用随机 id 落盘的记录: 同一 requestId 有过交易就复用
+  const legacy = await findByRequestId(input.requestId, home);
+  if (legacy) return { record: legacy, reused: true };
 
+  // ③ 真正没有 → 独占创建 (并发下只有一个能成功; 另一个回到 ①/② 复用)
   const rec: TransactionRecord = {
-    transactionId: winnerId || candidateId,
+    transactionId: id,
     requestId: input.requestId,
     itemId: String(input.metadata.itemId || ''),
     buyerDid: input.buyerDid,
@@ -109,12 +143,30 @@ export async function beginTransaction(input: BeginInput, home: string = os.home
     paymentMode: 'none',
     chainSettled: false,
     status: 'discovered',
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    settlementFact: 'unpaid',
     goalId: input.goalId,
     runId: input.runId,
     startedAt: new Date().toISOString(),
     events: [event('discovered', `item=${input.metadata.itemId || '?'} requestId=${input.requestId}`)],
   };
-  return { record: await saveTransaction(rec, home), reused: false };
+  try {
+    const fh = await fsp.open(txPath(id, home), 'wx');           // ★ 独占: 并发只有一个成功
+    await fh.writeFile(JSON.stringify(rec, null, 2), 'utf8');
+    await fh.close();
+    return { record: rec, reused: false };
+  } catch {
+    // 别人抢先创建了 → 等它写完再复用 (绝不覆盖对方已经推进的状态)
+    let other = await readTransaction(id, home);
+    for (let i = 0; i < 20 && !other; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      other = await readTransaction(id, home);
+    }
+    if (other) return { record: other, reused: true };
+    const byReq = await findByRequestId(input.requestId, home);
+    if (byReq) return { record: byReq, reused: true };
+    return { record: await saveTransaction(rec, home), reused: false };
+  }
 }
 
 /** 追加事件 + 更新状态 (唯一写路径, 保证 events 有序可回放) */
@@ -126,16 +178,48 @@ export async function updateTransaction(
   const rec = await readTransaction(transactionId, home);
   if (!rec) return null;
   const { event: ev, ...rest } = patch;
+
+  // ★ Phase 0: 结算事实变化**无条件留痕** (调用方忘了给 event 也不许丢审计)
+  const factChanged = rest.settlementFact && String(rest.settlementFact) !== String(rec.settlementFact || '');
+  const ev2 = ev || (factChanged ? { kind: `settlement:${rest.settlementFact}`, detail: '结算事实变更 (自动留痕)' } : undefined);
+
+  // ★ Phase 0: 状态迁移必须合法 —— 非法就拒绝 (抛错), 不静默修正
+  if (rest.status && String(rest.status) !== String(rec.status)) {
+    const chk = checkLifecycleMove(rec, String(rest.status));
+    if (!chk.ok) throw new IllegalTransactionTransition(chk.reason || '非法迁移', transactionId, String(rest.status));
+  }
+  if (rest.settlementFact && String(rest.settlementFact) !== String(rec.settlementFact || '')) {
+    const from = isSettlementFact(rec.settlementFact) ? String(rec.settlementFact) : deriveSettlementFact(rec);
+    const chk = canTransitionSettlement(from, String(rest.settlementFact), {
+      paymentMode: rec.paymentMode,
+      chainSettled: rec.chainSettled === true || (rest as any).chainSettled === true,
+      txHash: String(rec.txHash || (rest as any).txHash || ''),
+    });
+    if (!chk.ok) throw new IllegalTransactionTransition(chk.reason || '非法结算迁移', transactionId, `fact:${rest.settlementFact}`);
+  }
   const next: TransactionRecord = {
     ...rec,
     ...rest,
-    events: ev ? [...(rec.events || []), event(ev.kind, ev.detail)] : (rec.events || []),
+    events: ev2 ? [...(rec.events || []), event(ev2.kind, ev2.detail)] : (rec.events || []),
   };
   return await saveTransaction(next, home);
 }
 
 export async function setTransactionStatus(transactionId: string, status: TransactionStatus, detail?: string, home: string = os.homedir()): Promise<TransactionRecord | null> {
   return updateTransaction(transactionId, { status, ...(status === 'settled' ? { settledAt: new Date().toISOString() } : {}), ...(status === 'delivered' ? { deliveredAt: new Date().toISOString() } : {}), ...(status === 'verified' ? { verifiedAt: new Date().toISOString() } : {}), event: { kind: `status:${status}`, detail } }, home);
+}
+
+/**
+ * 结算事实的专用写路径 (钱动没动与生命周期分开记; 非法迁移一律拒绝)。
+ * `local-dev` 想写 payment_verified/fully_settled 会被这里挡下。
+ */
+export async function setSettlementFact(
+  transactionId: string,
+  fact: SettlementFact,
+  detail?: string,
+  home: string = os.homedir(),
+): Promise<TransactionRecord | null> {
+  return updateTransaction(transactionId, { settlementFact: fact, event: { kind: `settlement:${fact}`, detail } } as any, home);
 }
 
 /** 审计回放 (CLI/Web 用): 一笔交易按时间顺序的完整事件链 */

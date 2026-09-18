@@ -77,14 +77,26 @@ export interface TransactionRecord {
   receiptHash?: string;
   /** 卖方声明的正文哈希 (来自元数据/信封) */
   contentHash?: string;
-  /** 买方实际收到的正文字节哈希 (交付校验用) */
+  /** 买方实际收到的正文字节哈希 (交付校验用; 协议规范化哈希) */
   deliveryHash?: string;
+  /** 交付正文字节的 sha256 (盘上正文重算可比; 与协议层规范化哈希分开) */
+  deliveryBytesHash?: string;
   verificationTrust?: TrustLevel;
   /** 链上是否真的结算过 (local-dev 永远 false) */
   chainSettled: boolean;
   /** 协议层验真是否通过 (与 chainSettled 分开记, 不许混为一谈) */
   protocolVerified?: boolean;
   status: TransactionStatus;
+  /** 记录 schema 版本 (v2 = 两层状态: status + settlementFact, 见 settlement-state.ts) */
+  schemaVersion?: number;
+  /** 结算事实 (钱到底动没动): unpaid / payment_submitted / payment_verified / partially_settled / fully_settled / refund_pending / refunded / unknown */
+  settlementFact?: string;
+  /** 责任候选 (机器只给候选, 不做赔偿判决) */
+  responsibility?: { type: string; reason: string; evidence: string[] };
+  /** 资源执行证据 (Phase 2: 买到的是可执行资源时才可能有) */
+  execution?: { ok: boolean; tool?: string; startedAt?: string; durationMs?: number; outputHash?: string; schemaOk?: boolean; sourceDeclared?: boolean; reason?: string };
+  /** Goal 判据是否命中 (verified 门的一项) */
+  goalCriteriaMet?: boolean;
   policyDecision?: { allowed: boolean; reason?: string; dailySpent?: number };
   failureReason?: string;
   /** 与长期执行挂钩 (支付必须成为可审计的 Run 步骤) */

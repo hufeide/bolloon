@@ -196,6 +196,12 @@ export interface PaymentOutcome {
   payer?: string;
   network?: string;
   error?: string;
+  /** ★ 这次调用是否**真的发起过支付尝试** (有凭据 + 走到校验/结算) —— 有尝试就不能当"没付过钱" */
+  attempted?: boolean;
+  /** ★ 结算结果**不确定** (settle 失败/facilitator 不可达): 可能钱已经动了 → 必须先对账, 不许自动重付 */
+  settlementUncertain?: boolean;
+  /** ★ facilitator **明确拒绝**了这笔凭据 → 钱一定没动 (可安全重试) */
+  verifyRejected?: boolean;
 }
 
 export interface CheckPaymentOptions {
@@ -216,9 +222,9 @@ export interface CheckPaymentOptions {
 export async function checkAndSettlePayment(opts: CheckPaymentOptions): Promise<PaymentOutcome> {
   const req = opts.requirements.accepts[0];
   const network = String(req.network);
-  if (!opts.paymentHeader) return { ok: false, mode: 'none', error: '缺少 X-PAYMENT 头 (未付款)' };
+  if (!opts.paymentHeader) return { ok: false, mode: 'none', error: '缺少 X-PAYMENT 头 (未付款)', attempted: false };
   const payload = decodePaymentHeader(opts.paymentHeader);
-  if (!payload) return { ok: false, mode: 'none', error: 'X-PAYMENT 不是合法 base64 JSON' };
+  if (!payload) return { ok: false, mode: 'none', error: 'X-PAYMENT 不是合法 base64 JSON', attempted: false };
 
   const facilitatorUrl = opts.facilitatorUrl ?? process.env.BOLLOON_X402_FACILITATOR ?? '';
   const allowLocalDev = opts.allowLocalDev ?? (process.env.BOLLOON_X402_LOCAL_VERIFY === '1');
@@ -232,19 +238,20 @@ export async function checkAndSettlePayment(opts: CheckPaymentOptions): Promise<
       });
       const v = await vres.json() as any;
       if (!v?.isValid) {
-        return { ok: false, mode: 'facilitator', error: `facilitator 校验未通过: ${v?.invalidReason || v?.invalidMessage || 'unknown'}` };
+        return { ok: false, mode: 'facilitator', attempted: true, verifyRejected: true, settlementUncertain: false, error: `facilitator 校验未通过: ${v?.invalidReason || v?.invalidMessage || 'unknown'}` };
       }
       const sres = await f(`${facilitatorUrl.replace(/\/$/, '')}/settle`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
       const s = await sres.json() as any;
       if (!s?.success) {
-        return { ok: false, mode: 'facilitator', error: `结算失败: ${s?.errorReason || s?.errorMessage || 'unknown'}` };
+        // settle 失败: 链上可能已经动了钱 → 不确定 (不是"没付过")
+        return { ok: false, mode: 'facilitator', attempted: true, verifyRejected: false, settlementUncertain: true, error: `结算失败: ${s?.errorReason || s?.errorMessage || 'unknown'}` };
       }
       const receipt = encodePaymentResponse(s);
       return { ok: true, mode: 'facilitator', receipt, txHash: s.transaction, payer: s.payer || v.payer, network };
     } catch (e: any) {
-      return { ok: false, mode: 'facilitator', error: `facilitator 不可达: ${String(e?.message || e).slice(0, 160)}` };
+      return { ok: false, mode: 'facilitator', attempted: true, verifyRejected: false, settlementUncertain: true, error: `facilitator 不可达: ${String(e?.message || e).slice(0, 160)}` };
     }
   }
 
@@ -252,6 +259,7 @@ export async function checkAndSettlePayment(opts: CheckPaymentOptions): Promise<
     return {
       ok: false,
       mode: 'none',
+      attempted: false,
       error: '未配置 facilitator (BOLLOON_X402_FACILITATOR), 也未开启本机联调模式 (BOLLOON_X402_LOCAL_VERIFY=1) — 无法校验真实付款',
     };
   }
@@ -299,7 +307,17 @@ export interface BuyInfoResult {
   /** 已验真的信封 (直接给智能体用) */
   envelope?: any;
   verify?: import('./paid-info-protocol.js').VerifyReport;
-  payment?: { mode: string; txHash?: string; receipt?: string };
+  payment?: {
+    mode: string; txHash?: string; receipt?: string;
+    /** 发起过支付尝试 (有凭据 / 走到校验结算) */
+    attempted?: boolean;
+    /** 付款这一步**已经完成** (回执/链上事实在手), 后面失败的是资源侧 */
+    settled?: boolean;
+    /** 结算结果不确定 (可能已付) → 先对账 */
+    settlementUncertain?: boolean;
+    /** facilitator 明确拒绝 → 钱一定没动 */
+    verifyRejected?: boolean;
+  };
   raw?: string;
   error?: string;
 }
@@ -377,12 +395,19 @@ export async function buyInfo(params: {
       maxPaymentAmount: params.maxPaymentAmount,
       rpcUrl: params.rpcUrl,
     });
+    // ★ 真把付款凭据发出去了 → 结算事实 payment_submitted (这一步之后失败都不能当"没付过钱")
+    await trackEvent({ kind: 'payment_sending', detail: 'facilitator 模式: 已发出 x402 付款请求', patch: { settlementFact: 'payment_submitted' } as any });
     const retry = await paymentFetch(params.url, { method: 'GET' });
     const text = await retry.text();
     const parsed = safeJson(text);
     const receipt = retry.headers.get('x-payment-response') || parsed?.payment?.receipt || '';
     if (retry.status < 200 || retry.status >= 300) {
-      return { ok: false, status: retry.status, error: `付款后重试失败 ${retry.status}: ${text.slice(0, 200)}` };
+      // 付款这一步已经发出去了 (可能已上链), 只是拿资源失败 → 绝不许当"没付过钱"
+      return {
+        ok: false, status: retry.status,
+        payment: { mode: 'facilitator', receipt: receipt || undefined, attempted: true, settled: true, settlementUncertain: !receipt },
+        error: `付款后重试失败 ${retry.status}: ${text.slice(0, 200)}`,
+      };
     }
     mode = 'facilitator';
     await trackEvent({ kind: 'settled', detail: `mode=facilitator receipt=${receipt.slice(0, 24)}…`, patch: { paymentMode: 'facilitator', paymentReceipt: receipt, chainSettled: true } });
@@ -400,11 +425,16 @@ export async function buyInfo(params: {
     payload: { localDev: true, at: new Date().toISOString() },
     payer: 'local-dev',
   }), 'utf-8').toString('base64');
+  await trackEvent({ kind: 'payment_sending', detail: 'local-dev 模式: 已发出 X-PAYMENT 请求 (非链上)', patch: { settlementFact: 'payment_submitted' } as any });
   const retry = await doFetch(params.url, { method: 'GET', headers: { 'X-PAYMENT': paymentHeader } });
   const text = await retry.text();
   const parsed = safeJson(text);
   if (retry.status < 200 || retry.status >= 300) {
-    return { ok: false, status: retry.status, error: `本机联调付款被拒 ${retry.status}: ${text.slice(0, 200)}` };
+    return {
+      ok: false, status: retry.status,
+      payment: { mode: 'local-dev', attempted: true, settled: false, settlementUncertain: false },
+      error: `本机联调付款被拒 ${retry.status}: ${text.slice(0, 200)}`,
+    };
   }
   mode = 'local-dev';
   const receiptLd = retry.headers.get('x-payment-response') || parsed?.payment?.receipt || '';

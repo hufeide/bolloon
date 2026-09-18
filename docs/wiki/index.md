@@ -22,6 +22,7 @@
 | [android-agent-runtime.md](./android-agent-runtime.md) | v2 | Android Agent Runtime 架构 (Phase 1-4: Accessibility/Shizuku/本地LLM/Agent OS) |
 | [agent-economic-protocol.md](./agent-economic-protocol.md) | v2 | Agent Economic Protocol 设计 (7 协议 + bolloon 映射 + Registry/x402/Policy MVP) |
 | [durable-run-protocol.md](./durable-run-protocol.md) | v2 | Durable Run 协议 (Goal→Run→Checkpoint→Recovery 状态机 + 字段协议 + 现状盘点 + 六阶段完成度台账) |
+| [transaction-two-layer-state.md](./transaction-two-layer-state.md) | v1 | 交易两层状态协议 (生命周期 ⊗ 结算事实 + 责任候选 + 迁移 + verified 八项门 + 写路径拒绝非法迁移) |
 | [agent-trace-sharing.md](./agent-trace-sharing.md) | v1 | 智能体工具执行轨迹与 P2P 连接信息出口 (文本/JSON 跨边界契约 + CLI/Web 接口 + 小工具边界) |
 | [setup-protocol.md](./setup-protocol.md) | v2 | 初始化协议 M0/M1/M4 (初始化状态机 + SetupStore 唯一事实 + 分层 readiness + 启动硬门禁 + M2–M6 计划) |
 | [copyright-registration.md](./copyright-registration.md) | v2 | 软著登记材料 (500 字主要功能 + 源程序前/后各 30 页 · 生成器/口径/自检/未闭合项) |
