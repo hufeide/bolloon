@@ -2333,3 +2333,9 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
 - **真跑逼出的 2 个真漏洞 (已修 + 有断言)**: ① **facilitator 模式下凭据绑定校验根本没执行** —— 那段校验原先只在 local-dev 分支里, 而 facilitator 分支提前 `return` → 拿 A 资源的回执去买 B 资源不会被拦 (正是 leo Phase 1 清单里「itemId 与支付凭据一致」那一条) → 把绑定校验**提到分模式之前**, 两种模式都查。② **402 自带的 `itemId` 不参与自洽校验** (原来只比 `metadata.itemId`, 与 payTo/network 不对称) → 402 的 `itemId`(顶层或 `extra`) 与 metadata/预期不一致一律拒。
 - **验证**: `verify-facilitator-paths.ts` **26/26** · 既有 local-dev 闭环与全量套件见提交统计 · `tsc --noEmit` 0 错 · wiki 四门禁 OK。
 - **未覆盖 (等真链, 不装作验过)**: 余额不足 / gas 不足 / 真 RPC 对账 / 真 txHash 可查买卖双方与金额 / Base Sepolia 至少一笔 `verified`。
+
+## [2026-09-18] release | npm 0.4.27 上线 (交易闭环 Phase 0-4 + facilitator 路径准备) + 暂存发布教训
+
+- **发布**: `@bolloon/bolloon-agent@0.4.27` (commit `9d5dca5`)。registry 复核: `dist-tags.latest = 0.4.27` · `versions` 尾三 `[0.4.25, 0.4.26, 0.4.27]` · tarball **HTTP 200 / 17,391,802 bytes / 977 files** · `dist/` 967 文件含本批 6 个新模块 (`x402/{settlement-state,payment-recovery,resource-contract,milestone-settlement}.js` · `agents/{trace-export,p2p-info}.js`) · 全新目录安装 `npm install @bolloon/bolloon-agent@0.4.27` → 949 包, `version = 0.4.27`。shasum `feb2168dfbf633dbd34f80d71997be95def64267`。
+- **教训 (已写进 skill `npm-publish-and-deps`)**: npm 收紧了绕过 2FA 的粒度 token —— 这类 token 的 `npm publish` **只暂存 (staged)**, 退出码 0、日志打 `+ pkg@ver`, 但版本**不公开**(版本直连 404, `dist-tags.latest` 仍旧值); 同版本再发必得 `E409 Cannot publish over previously staged version "<ver>"` —— 那句 409 是「已被收下、等放行」的证据, **不是失败, 别改版本号重发**。本次实测约 5-7 分钟后自己放行翻到 latest。
+- **另一条坑**: **暂存按 token/actor 隔离** —— 中途把 `~/.npmrc` 换成新 token 后, 新 token 看不到旧 token 暂存的版本 (`npm@12 stage list` 空、`GET /-/stage` 回 `{items:[],total:0}`) → **待放行期间不要轮换 token**。本地 npm 11.6.2/11.10.1 没有 `stage` 子命令, **npm 12.0.2 有** (`stage list|view|approve|reject|download`) 且在 Node 24.13.0 上只报 EBADENGINE 警告照常运行 → `npx -y npm@12 stage list/approve <pkg>|<stage-id>` 即可, 不必升级全局 npm。
