@@ -78,6 +78,23 @@ async function main() {
   check('三个视图 + 三个 tab', ready.value?.tabs === 3 && ready.value?.views === 3, ready.value);
   check('页面加载无 JS 异常', consoleErrors.filter((e) => e.includes('exception')).length === 0, consoleErrors.slice(0, 3));
 
+  // 回归: 头像槽必须是「img + 占位字」两个兄弟节点
+  //   (真浏览器里抓到过: 用 slot.textContent 写占位字会把 <img> 删掉, 之后选图就崩)
+  const avatarNodes = await evaluate(`(function(){
+    var slot = document.getElementById('avatar-slot');
+    var img = document.getElementById('avatar-img');
+    var ph = document.getElementById('avatar-ph');
+    return {
+      slot: !!slot, img: !!img, ph: !!ph,
+      imgDisplay: img ? getComputedStyle(img).display : '(无)',
+      phText: ph ? ph.textContent : '(无)',
+      slotClass: slot ? slot.className : '(无)'
+    };
+  })()`);
+  check('头像槽两个节点都在 (img + 占位字)', !!(avatarNodes.value?.img && avatarNodes.value?.ph), avatarNodes.value);
+  check('无头像时不显示 img (不出现"裂图")', avatarNodes.value?.imgDisplay === 'none', avatarNodes.value?.imgDisplay);
+  check('无身份时占位字是默认字', avatarNodes.value?.phText === '智', avatarNodes.value?.phText);
+
   console.log('\n[2] 真填表 + 保存 (走真实 DOM 事件)');
   const saved = await evaluate(`(function(){
     function set(id, v){ var el = document.getElementById(id); el.value = v; return el.value; }
@@ -95,6 +112,8 @@ async function main() {
   check('自动生成智能体标识', /^local-/.test(String(saved.value?.id || '')), saved.value?.id);
   check('接入点已存 (key 仅本机)', prof?.endpoint?.model === 'deepseek-chat' && !!prof?.endpoint?.key, prof?.endpoint);
   check('保存反馈是"已保存"而非报错', /已保存/.test(String(saved.value?.msg || '')), saved.value?.msg);
+  const phAfter = await evaluate(`(function(){ return { ph: document.getElementById('avatar-ph').textContent, slot: document.getElementById('avatar-slot').className }; })()`);
+  check('保存后占位字跟随昵称首字', phAfter.value?.ph === '小', phAfter.value);
 
   console.log('\n[3] 名片 Canvas 真的画出内容');
   const canvasInfo = await evaluate(`(function(){

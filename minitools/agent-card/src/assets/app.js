@@ -90,7 +90,24 @@
     $('in-baseurl').value = profile.endpoint.baseUrl;
     $('in-model').value = profile.endpoint.model;
     $('in-key').value = profile.endpoint.key;
-    $('avatar-img').src = profile.avatar || '';
+    renderAvatarSlot();
+  }
+
+  /** 头像槽: 有图显示图 (避免空 src 出现"裂图"占位), 无图显示昵称首字。
+   *  占位字写在独立的 #avatar-ph —— 不要用 slot.textContent, 那会删掉 <img> 节点。 */
+  function renderAvatarSlot() {
+    var slot = $('avatar-slot');
+    var img = $('avatar-img');
+    var ph = $('avatar-ph');
+    if (!slot || !img || !ph) return;
+    if (profile.avatar) {
+      slot.className = 'avatar-slot has-img';
+      img.src = profile.avatar;
+    } else {
+      slot.className = 'avatar-slot';
+      img.removeAttribute('src');
+      ph.textContent = String(profile.name || '智').slice(0, 1);
+    }
   }
 
   function readForm() {
@@ -115,6 +132,7 @@
     var res = S.saveProfile(next);
     profile = res.profile;
     $('in-agentid').value = profile.agentId;
+    renderAvatarSlot();
     if (!silent) {
       msg('msg-profile', res.persisted
         ? '已保存 · 标识 ' + profile.agentId
@@ -152,7 +170,7 @@
         var kb = Math.round(data.length / 1024);
         if (data) {
           profile.avatar = data;
-          $('avatar-img').src = data;
+          renderAvatarSlot();
           var res = S.saveProfile(profile);
           profile = res.profile;
           msg('msg-profile', '头像已本地压缩并保存 (约 ' + kb + ' KB)', kb > 120 ? 'warn' : 'ok');

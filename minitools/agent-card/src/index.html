@@ -85,7 +85,16 @@
     .item .n { font-size: 14px; }
     .item .m { font-size: 12px; color: #8a8a93; word-break: break-all; }
     .msg { margin-top: 10px; font-size: 12px; min-height: 18px; }
-    .avatar { width: 64px; height: 64px; border-radius: 50%; background: #22232a; display: block; }
+    .avatar-slot {
+      width: 64px; height: 64px; border-radius: 50%; background: #22232a;
+      color: #6f6f78; font-size: 22px; text-align: center; line-height: 64px; overflow: hidden;
+    }
+    .avatar-slot { position: relative; }
+    .avatar-ph { display: block; }
+    .avatar-slot.has-img { background: transparent; }
+    .avatar-slot.has-img .avatar-ph { display: none; }
+    .avatar { display: none; width: 64px; height: 64px; border-radius: 50%; }
+    .avatar-slot.has-img .avatar { display: block; }
     .avatar-row { display: flex; }
     .avatar-row .col { margin-left: 12px; flex: 1 1 auto; }
     .tiny { font-size: 11px; color: #77777f; }
@@ -111,7 +120,7 @@
       <div class="card">
         <h2>身份</h2>
         <div class="avatar-row">
-          <img class="avatar" id="avatar-img" alt="" />
+          <div class="avatar-slot" id="avatar-slot"><img class="avatar" id="avatar-img" alt="" /><span class="avatar-ph" id="avatar-ph">智</span></div>
           <div class="col">
             <label class="f" style="margin-top:0">头像 (选图后在本地缩放保存)</label>
             <label class="btn line" id="avatar-btn" for="avatar-input" style="text-align:center;margin-top:6px">选择图片</label>
