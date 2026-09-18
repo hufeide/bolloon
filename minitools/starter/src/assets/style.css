@@ -1,0 +1,28 @@
+/* style.css — Chrome 61 基线层 (能力检测增强另加, 不维护两套完整 CSS)
+ * 写法约定: 只放基线可用的规则; 现代 CSS (gap/方面比/has 等) 必须局部回退。
+ */
+
+:root { --brand: #ff2e4d; }
+
+body { overflow-x: hidden; }
+
+h1 { font-weight: 600; letter-spacing: .2px; }
+
+.btn {
+  background: #1a1a1a; color: #fff;
+  transition: opacity .15s ease, transform .15s ease;
+  cursor: pointer;
+}
+.btn.ghost { background: #fff; color: #1a1a1a; }
+.btn:active { transform: scale(.99); }
+
+.card { box-shadow: 0 1px 2px rgba(0, 0, 0, .04); }
+
+/* 可滚动区域 (Chrome 61 需要 -webkit-overflow-scrolling) */
+.scroll-y {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 品牌色示例 */
+.brand { color: var(--brand); }

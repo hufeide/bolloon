@@ -1,0 +1,23 @@
+/* style.css — Chrome 61 基线层 (增强另加, 不维护两套完整 CSS)
+ * 只放基线可用的规则; 现代 CSS 一律局部回退。
+ */
+
+/* 可滚动容器 (Chrome 61 需要 -webkit-overflow-scrolling) */
+.scroll-y {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;   /* Chrome 63+; 旧内核忽略 → 不影响可用性 */
+}
+
+/* 可选中文本: 容器禁用了剪贴板 API, 复制靠"长按选中"这条路 */
+.copyable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* 品牌色 (自定义属性 Chrome 49+ 可用) */
+:root { --brand: #ff2e4d; }
+.accent { color: var(--brand); }
+
+/* 图片自适应 */
+img { max-width: 100%; }

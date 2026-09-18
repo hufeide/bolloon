@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>小工具骨架</title>
+  <style>
+    /* Chrome 61 基线层: 只用 61 已有的能力 (flex/grid/自定义属性/过渡) */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                   "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-user-select: none;
+      user-select: none;
+      background: #f7f7f8;
+      color: #1a1a1a;
+    }
+    .page { display: none; min-height: 100%; padding: 16px; }
+    .page.active { display: block; }
+    .card { background: #fff; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+    .btn {
+      display: block; width: 100%; padding: 13px 16px; margin-bottom: 10px;
+      font-size: 16px; border: 0; border-radius: 10px;
+      background: #1a1a1a; color: #fff;
+    }
+    .btn.ghost { background: #fff; color: #1a1a1a; border: 1px solid #e3e3e5; }
+    .btn:active { opacity: .85; }
+    .hint { font-size: 12px; line-height: 1.6; color: #8a8a8e; }
+    .big { font-size: 40px; font-variant-numeric: tabular-nums; }
+    img.preview { display: block; width: 100%; border-radius: 10px; margin-top: 10px; }
+    /* 安全区: 未知环境丢弃这两行, 保留上面的 padding (基线 + 增强, 不维护两套 CSS) */
+    .page { padding-bottom: 16px; padding-bottom: calc(16px + constant(safe-area-inset-bottom)); padding-bottom: calc(16px + env(safe-area-inset-bottom)); }
+  </style>
+  <link rel="stylesheet" href="./assets/style.css" />
+</head>
+<body>
+  <!-- 视图 1: 首页 (核心功能放这里) -->
+  <section class="page active" id="page-home">
+    <div class="card">
+      <h1 style="font-size:18px;margin-bottom:8px;">小工具骨架</h1>
+      <p class="hint">
+        这是符合容器规范的骨架: 单页 + JS 切视图、脚本外置、无联网、无内联事件。<br />
+        核心功能请替换 <b>assets/app.js</b> 里标记了 <b>TODO</b> 的部分。
+      </p>
+    </div>
+    <div class="card">
+      <p class="hint">本地存储演示 (localStorage, 按小工具隔离)</p>
+      <p class="big" id="counter">0</p>
+      <button class="btn" id="btn-inc" type="button">+1</button>
+      <button class="btn ghost" id="btn-reset" type="button">清零</button>
+    </div>
+    <div class="card">
+      <p class="hint">选图预览演示 (blob: 对象 URL, 用完释放)</p>
+      <label class="btn ghost" for="file-input" style="text-align:center;">选择图片</label>
+      <input id="file-input" type="file" accept="image/*" style="display:none" />
+      <img class="preview" id="preview" alt="" style="display:none" />
+    </div>
+    <div class="card">
+      <button class="btn" id="btn-goto-about" type="button">打开第二个视图</button>
+      <p class="hint" id="bridge-hint"></p>
+    </div>
+  </section>
+
+  <!-- 视图 2: JS 切视图, 不新建页面/不跳转 -->
+  <section class="page" id="page-about">
+    <div class="card">
+      <h1 style="font-size:18px;margin-bottom:8px;">第二个视图</h1>
+      <p class="hint">单页内切换 DOM, 不 window.open、不 location.href 跳转。</p>
+    </div>
+    <button class="btn" id="btn-back" type="button">返回</button>
+  </section>
+
+  <!-- 脚本全部外置; 不写内联 <script>; 事件用 addEventListener 绑定 -->
+  <script src="./assets/app.js"></script>
+</body>
+</html>

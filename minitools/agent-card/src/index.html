@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>智能体名片</title>
+  <style>
+    /* ── Chrome 61 基线层: 只用 61 已有的能力 ───────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { touch-action: manipulation; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                   "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+      background: #0f1012;
+      color: #f2f2f4;
+      font-size: 15px;
+      line-height: 1.6;
+    }
+    .app { max-width: 560px; margin: 0 auto; }
+    .topbar { padding: 14px 16px 6px; }
+    .topbar h1 { font-size: 17px; font-weight: 600; }
+    .topbar p { font-size: 12px; color: #8a8a93; margin-top: 4px; }
+    .tabs { display: flex; padding: 8px 16px 0; }
+    .tab {
+      flex: 1 1 auto; text-align: center; padding: 9px 0; font-size: 13px;
+      color: #9a9aa3; border-bottom: 2px solid transparent;
+    }
+    .tab.on { color: #fff; border-bottom-color: #ff2e4d; }
+    .wrap {
+      padding: 14px 16px 18px;
+      /* 安全区: PC 模拟器注入 --safe-area-inset-*, 真机 env() 为真值 —— 组合写法两端都生效 */
+      padding-bottom: calc(24px + var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)));
+    }
+    .view { display: none; }
+    .view.on { display: block; }
+    .card { background: #17181b; border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+    .card h2 { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+    .hint { font-size: 12px; color: #8a8a93; line-height: 1.65; }
+    .hint b { color: #c9c9d1; font-weight: 600; }
+    .warn { color: #ffb020; }
+    .ok { color: #35d07f; }
+    .bad { color: #ff5c72; }
+    label.f { display: block; font-size: 12px; color: #9a9aa3; margin: 10px 0 4px; }
+    input[type="text"], textarea {
+      display: block; width: 100%; padding: 11px 12px; font-size: 15px;
+      color: #f2f2f4; background: #0f1012; border: 1px solid #2a2b30; border-radius: 10px;
+      -webkit-user-select: text; user-select: text; font-family: inherit;
+    }
+    textarea { min-height: 84px; resize: none; line-height: 1.6; }
+    .btn {
+      display: block; width: 100%; padding: 13px 14px; margin-top: 10px;
+      font-size: 15px; font-family: inherit; border: 0; border-radius: 10px;
+      background: #ff2e4d; color: #fff;
+    }
+    .btn.ghost { background: #fff; color: #17181b; }
+    .btn.line { background: transparent; color: #f2f2f4; border: 1px solid #33343a; }
+    .btn.off { opacity: .45; }
+    .btn:active { opacity: .78; }
+    .row { display: flex; margin-top: 10px; }
+    .row .btn { margin-top: 0; margin-right: 8px; }
+    .row .btn:last-child { margin-right: 0; }
+    .chips { margin-top: 6px; }
+    .chip {
+      display: inline-block; padding: 4px 10px; margin: 0 6px 6px 0;
+      font-size: 12px; border-radius: 999px; background: #22232a; color: #c9c9d1;
+    }
+    canvas { display: block; width: 100%; height: auto; border-radius: 12px; background: #17181b; }
+    .sel {
+      display: block; width: 100%; margin-top: 8px; padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px; line-height: 1.55; word-break: break-all;
+      background: #0f1012; border: 1px solid #2a2b30; border-radius: 10px;
+      -webkit-user-select: text; user-select: text; color: #c9c9d1;
+      max-height: 150px; overflow-y: auto;
+    }
+    .item { border-top: 1px solid #24252b; padding: 10px 0; }
+    .item:first-child { border-top: 0; }
+    .item .n { font-size: 14px; }
+    .item .m { font-size: 12px; color: #8a8a93; word-break: break-all; }
+    .msg { margin-top: 10px; font-size: 12px; min-height: 18px; }
+    .avatar { width: 64px; height: 64px; border-radius: 50%; background: #22232a; display: block; }
+    .avatar-row { display: flex; }
+    .avatar-row .col { margin-left: 12px; flex: 1 1 auto; }
+    .tiny { font-size: 11px; color: #77777f; }
+  </style>
+  <link rel="stylesheet" href="./assets/style.css" />
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <h1>智能体名片</h1>
+    <p>纯本地生成 · 不联网 · 名片/交接串交给 App 里的智能体去建联</p>
+  </div>
+
+  <div class="tabs">
+    <div class="tab on" id="tab-profile">身份</div>
+    <div class="tab" id="tab-card">名片</div>
+    <div class="tab" id="tab-social">社交</div>
+  </div>
+
+  <div class="wrap">
+    <!-- ── 视图 1: 身份 ─────────────────────────────────────────────── -->
+    <section class="view on" id="view-profile">
+      <div class="card">
+        <h2>身份</h2>
+        <div class="avatar-row">
+          <img class="avatar" id="avatar-img" alt="" />
+          <div class="col">
+            <label class="f" style="margin-top:0">头像 (选图后在本地缩放保存)</label>
+            <label class="btn line" id="avatar-btn" for="avatar-input" style="text-align:center;margin-top:6px">选择图片</label>
+            <input id="avatar-input" type="file" accept="image/*" style="display:none" />
+          </div>
+        </div>
+        <label class="f">昵称 (最多 20 字) *</label>
+        <input id="in-name" type="text" maxlength="20" placeholder="例如: 小星" />
+        <label class="f">一句话简介 (最多 60 字)</label>
+        <input id="in-bio" type="text" maxlength="60" placeholder="例如: 做数学形式化与长期执行的智能体" />
+        <label class="f">标签 (逗号分隔, 最多 5 个)</label>
+        <input id="in-tags" type="text" placeholder="数学, 形式化, 自动化" />
+        <label class="f">智能体标识 (从 App 里复制过来; 留空则用本地短码)</label>
+        <input id="in-agentid" type="text" maxlength="80" placeholder="did:key:… 或 App 里显示的 ID" />
+        <p class="msg hint" id="msg-profile"></p>
+        <button class="btn" id="btn-save-profile" type="button">保存身份</button>
+      </div>
+
+      <div class="card">
+        <h2>接入点 (你自己的 API)</h2>
+        <p class="hint">
+          小工具<b>不联网</b>,所以这里填的信息只用于<b>生成名片与交接串</b>;真正的调用发生在你 App 里的智能体。
+          Key 只保存在本机 (localStorage),不上传、不显示在名片正面。
+        </p>
+        <label class="f">接口地址 baseUrl</label>
+        <input id="in-baseurl" type="text" maxlength="200" placeholder="https://你的网关或供应商/v1" />
+        <label class="f">模型</label>
+        <input id="in-model" type="text" maxlength="60" placeholder="例如: deepseek-chat" />
+        <label class="f">API Key (只在本机; 名片上只显示尾 4 位)</label>
+        <input id="in-key" type="text" maxlength="200" placeholder="sk-…" />
+        <p class="msg hint" id="msg-endpoint"></p>
+        <button class="btn line" id="btn-save-endpoint" type="button">保存接入点</button>
+      </div>
+    </section>
+
+    <!-- ── 视图 2: 名片 ─────────────────────────────────────────────── -->
+    <section class="view" id="view-card">
+      <div class="card">
+        <h2>名片预览</h2>
+        <canvas id="card-canvas" width="750" height="1000"></canvas>
+        <p class="msg hint" id="msg-card"></p>
+        <div class="row">
+          <button class="btn" id="btn-save-album" type="button">存到相册</button>
+          <button class="btn ghost" id="btn-post-note" type="button">发布笔记</button>
+        </div>
+        <label class="f">跳转 App 页 · type (必须命中客户端规则表; 常见: search / user / note)</label>
+        <input id="in-open-type" type="text" maxlength="24" value="search" />
+        <label class="f">params.keyword (留空则用第一个标签或昵称)</label>
+        <input id="in-open-keyword" type="text" maxlength="40" placeholder="例如: 数学" />
+        <button class="btn line" id="btn-open-app" type="button">跳转 App 页</button>
+        <p class="hint tiny" id="bridge-state" style="margin-top:8px"></p>
+      </div>
+    </section>
+
+    <!-- ── 视图 3: 社交 ─────────────────────────────────────────────── -->
+    <section class="view" id="view-social">
+      <div class="card">
+        <h2>交接串 (递给对方的智能体)</h2>
+        <p class="hint">
+          复制这一段发给朋友(长按选中 → 复制)。对方在自己的智能体里<b>粘贴</b>就能读到你的身份与接入点。
+          界面不能直接调剪贴板 API(容器禁用),所以这里只提供可选中文本。
+        </p>
+        <div class="sel" id="handover">(先保存身份)</div>
+        <button class="btn line" id="btn-refresh-handover" type="button">重新生成</button>
+      </div>
+
+      <div class="card">
+        <h2>导入别人的交接串</h2>
+        <textarea id="in-import" placeholder="把对方给的 BOLLOONCARD1:… 粘贴到这里"></textarea>
+        <button class="btn" id="btn-import" type="button">解析并加入联系人</button>
+        <p class="msg hint" id="msg-import"></p>
+      </div>
+
+      <div class="card">
+        <h2>联系人 <span class="tiny" id="contact-count"></span></h2>
+        <div id="contact-list"></div>
+      </div>
+
+      <div class="card">
+        <h2>边界说明</h2>
+        <p class="hint">
+          · 小工具<b>不能联网</b>: 容器禁用 fetch / WebSocket 等,也没有网络类原生接口。<br />
+          · 原生只开放 4 个能力: 发布笔记 / 存相册 / 跳转 App 页 / base64 转临时文件 —— 没有"入网"或"发消息"接口。<br />
+          · 所以<b>真正的入网与交流由 App 侧智能体完成</b>: 这个工具负责采集身份、生成名片、把入口递出去。<br />
+          · 本地数据不保证永久保留 (容器可清理),重要内容请自己备份交接串。
+        </p>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- 经典脚本 + 依赖顺序 (无 type="module", 无 import/export) -->
+<script src="./assets/store.js"></script>
+<script src="./assets/card.js"></script>
+<script src="./assets/app.js"></script>
+</body>
+</html>

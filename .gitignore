@@ -73,3 +73,7 @@ build/
 
 # 软著登记: 生成物 (PDF/HTML/TXT + 报告, 可由 scripts/gen-copyright-*.ts 重出)
 docs/copyright/out/
+
+# 小工具打包产物 (由 minitools/build.mjs 生成)
+minitools/dist/
+.skill/
