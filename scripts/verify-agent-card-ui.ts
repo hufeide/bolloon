@@ -64,7 +64,12 @@ async function main() {
   });
   const evaluate = async (expr: string) => {
     const r = await send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
-    if (r.result?.exceptionDetails) return { error: String(r.result.exceptionDetails.text || '').slice(0, 200) };
+    const ex = r.result?.exceptionDetails;
+    if (ex) {
+      const desc = String(ex.exception?.description || ex.text || '').slice(0, 300);
+      console.log(`  [harness] evaluate 抛错: ${desc.split('\n')[0]}`);
+      return { error: desc };
+    }
     return { value: r.result?.result?.value };
   };
 
@@ -75,7 +80,7 @@ async function main() {
   console.log('[1] 页面加载与初始化');
   const ready = await evaluate(`(function(){ return { hasStore: !!window.BCardStore, hasRender: !!window.BCardRender, tabs: document.querySelectorAll('.tab').length, views: document.querySelectorAll('.view').length }; })()`);
   check('store.js / card.js 均已加载', !!(ready.value?.hasStore && ready.value?.hasRender), ready);
-  check('三个视图 + 三个 tab', ready.value?.tabs === 3 && ready.value?.views === 3, ready.value);
+  check('四个视图 + 四个 tab (身份/名片/社交/轨迹)', ready.value?.tabs === 4 && ready.value?.views === 4, ready.value);
   check('页面加载无 JS 异常', consoleErrors.filter((e) => e.includes('exception')).length === 0, consoleErrors.slice(0, 3));
 
   // 回归: 头像槽必须是「img + 占位字」两个兄弟节点
@@ -185,7 +190,81 @@ async function main() {
   check('坏 profile JSON → 退回空档案 (不抛)', dirty.value?.isEmpty === true, dirty.value);
   check('非交接串 → 明确拒绝并给原因', dirty.value?.badOk === false && /开头/.test(String(dirty.value?.badErr || '')), dirty.value?.badErr);
 
-  console.log('\n[7] 静态门禁与产物');
+  console.log('\n[7] agent trace (执行轨迹)');
+  const traceInit = await evaluate(`(function(){
+    var t = window.BCardStore.loadTrace();
+    return { n: t.length, kinds: t.map(function(e){ return e.kind; }), max: window.BCardStore.TRACE_MAX };
+  })()`);
+  check('初始化即留下轨迹', (traceInit.value?.n || 0) >= 1, traceInit.value?.kinds);
+  check('轨迹有环形上限 (不写爆本地存储)', traceInit.value?.max === 200, traceInit.value?.max);
+
+  const traceActions = await evaluate(`(async function(){
+    function tick(){ return new Promise(function(r){ setTimeout(r, 90); }); }
+    document.getElementById('tab-profile').click();
+    document.getElementById('in-name').value = '小星';
+    document.getElementById('btn-save-profile').click(); await tick();
+    // 非法 P2P → 必须拒绝且记失败轨迹
+    document.getElementById('in-peerid').value = 'bad-peer';
+    document.getElementById('in-multiaddr').value = 'http://x';
+    document.getElementById('btn-save-p2p').click(); await tick();
+    var afterFail = window.BCardStore.loadTrace().slice(-1)[0];
+    // 合法 P2P → 通过
+    document.getElementById('in-peerid').value = '12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN';
+    document.getElementById('in-multiaddr').value = '/ip4/127.0.0.1/tcp/4001/ws/p2p/12D3KooWRelayAAA/p2p-circuit/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN';
+    document.getElementById('btn-save-p2p').click(); await tick();
+    var afterOk = window.BCardStore.loadTrace().slice(-1)[0];
+    return { afterFail: afterFail, afterOk: afterOk, stored: window.BCardStore.loadProfile().p2p };
+  })()`);
+  check('保存身份写进轨迹', String(traceActions.value?.afterFail?.kind || '').includes('P2P'), traceActions.value?.afterFail);
+  check('非法 P2P 被拒绝且记失败轨迹', traceActions.value?.afterFail?.ok === false && /校验失败/.test(String(traceActions.value?.afterFail?.detail || '')), traceActions.value?.afterFail);
+  check('合法 P2P 通过并记成功轨迹', traceActions.value?.afterOk?.ok === true, traceActions.value?.afterOk);
+  check('P2P 落盘 (peerId + multiaddr + relay)', !!traceActions.value?.stored?.peerId && String(traceActions.value?.stored?.multiaddr || '').includes('p2p-circuit'), traceActions.value?.stored);
+
+  console.log('\n[8] P2P 连接信息 (校验 + 交接串往返)');
+  const p2pChecks = await evaluate(`(function(){
+    var S = window.BCardStore;
+    var prof = S.loadProfile();
+    var h = S.toHandover(prof);
+    var parsed = S.parseHandover(h);
+    return {
+      peerOk: S.checkPeerId('12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN'),
+      peerBad: S.checkPeerId('hello'),
+      addrRelay: S.checkMultiaddr('/ip4/1.2.3.4/tcp/4001/ws/p2p/12D3KooWX/p2p-circuit/p2p/12D3KooWY'),
+      addrBad: S.checkMultiaddr('example.com'),
+      handoverV: parsed.ok ? parsed.card.v : null,
+      handoverP2p: parsed.ok ? parsed.card.p2p : null,
+      len: h.length
+    };
+  })()`);
+  check('peerId 校验: 合法通过 / 非法拒绝', p2pChecks.value?.peerOk?.ok === true && p2pChecks.value?.peerBad?.ok === false, p2pChecks.value);
+  check('multiaddr 校验: 含 p2p-circuit 识别为中继形式', /中继/.test(String(p2pChecks.value?.addrRelay?.msg || '')) && p2pChecks.value?.addrBad?.ok === false, p2pChecks.value);
+  check('交接串是 v2 且带 p2p', p2pChecks.value?.handoverV === 2 && !!p2pChecks.value?.handoverP2p?.peerId, p2pChecks.value?.handoverP2p);
+
+  const traceView = await evaluate(`(async function(){
+    function tick(){ return new Promise(function(r){ setTimeout(r, 90); }); }
+    document.getElementById('tab-trace').click(); await tick();
+    var rows = document.querySelectorAll('#trace-list .item').length;
+    var text = document.getElementById('trace-text').textContent;
+    var NL = String.fromCharCode(10);
+    var foreign = [
+      '# Bolloon 智能体名片 · 执行轨迹 (2 步)',
+      '1. [ok] 2026-09-18T16:00:00.000Z 打开工具 — 初始化完成',
+      '2. [fail] 2026-09-18T16:01:00.000Z 存相册 — 失败: 未授权'
+    ].join(NL);
+    document.getElementById('in-trace-import').value = foreign;
+    document.getElementById('btn-trace-import').click(); await tick();
+    return {
+      rows: rows, count: document.getElementById('trace-count').textContent,
+      textHead: text.slice(0, 60),   // 取整行: 断言表头里的步数需要完整 ("(11 步)")
+      importMsg: document.getElementById('msg-trace-import').textContent,
+      imported: document.querySelectorAll('#trace-import-view .item').length
+    };
+  })()`);
+  check('轨迹视图渲染出条目', (traceView.value?.rows || 0) >= 3, traceView.value);
+  check('轨迹文本可导出 (带标题与步数)', /^# Bolloon 智能体名片 · 执行轨迹 \(\d+ 步\)/.test(String(traceView.value?.textHead || '')), traceView.value?.textHead);
+  check('导入别人的轨迹文本: 解析出 2 步', /解析到 2 步/.test(String(traceView.value?.importMsg || '')) && traceView.value?.imported === 2, traceView.value);
+
+  console.log('\n[9] 静态门禁与产物');
   const json = JSON.parse(fs.readFileSync('minitools/agent-card/src/assets/store.js', 'utf8').length ? '{}' : '{}');
   void json;
   check('源码里没有联网 API / 内联脚本违规', true);

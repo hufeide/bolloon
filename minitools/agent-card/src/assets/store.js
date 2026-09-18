@@ -10,7 +10,9 @@
 
   var PROFILE_KEY = 'agentcard.profile.v1';
   var CONTACTS_KEY = 'agentcard.contacts.v1';
+  var TRACE_KEY = 'agentcard.trace.v1';
   var PREFIX = 'BOLLOONCARD1:';
+  var TRACE_MAX = 200;          // 环形上限, 防本地存储被写爆
 
   function safeGet(key) {
     try { return global.localStorage.getItem(key); } catch (e) { return null; }
@@ -63,6 +65,7 @@
     return {
       name: '', bio: '', tags: [], avatar: '', agentId: '',
       endpoint: { baseUrl: '', model: '', key: '' },
+      p2p: { peerId: '', multiaddr: '', relay: '' },
       updatedAt: ''
     };
   }
@@ -82,6 +85,11 @@
         model: String((p.endpoint && p.endpoint.model) || ''),
         key: String((p.endpoint && p.endpoint.key) || '')
       },
+      p2p: {
+        peerId: String((p.p2p && p.p2p.peerId) || ''),
+        multiaddr: String((p.p2p && p.p2p.multiaddr) || ''),
+        relay: String((p.p2p && p.p2p.relay) || '')
+      },
       updatedAt: String(p.updatedAt || '')
     };
   }
@@ -99,6 +107,11 @@
       baseUrl: String((p.endpoint && p.endpoint.baseUrl) || '').slice(0, 200),
       model: String((p.endpoint && p.endpoint.model) || '').slice(0, 60),
       key: String((p.endpoint && p.endpoint.key) || '').slice(0, 200)
+    };
+    next.p2p = {
+      peerId: String((p.p2p && p.p2p.peerId) || '').trim().slice(0, 80),
+      multiaddr: String((p.p2p && p.p2p.multiaddr) || '').trim().slice(0, 300),
+      relay: String((p.p2p && p.p2p.relay) || '').trim().slice(0, 80)
     };
     if (!next.agentId && next.name) next.agentId = localCode(next.name);   // 没填就用本地码
     next.updatedAt = new Date().toISOString();
@@ -137,10 +150,64 @@
     return list;
   }
 
+  // ── P2P 连接信息校验 (无网络, 只做格式判断, 不假装"能连上") ──────────────
+  function checkPeerId(v) {
+    var s = String(v || '').trim();
+    if (!s) return { ok: false, level: 'empty', msg: '未填 peerId' };
+    if (/^12D3KooW[1-9A-HJ-NP-Za-km-z]{20,60}$/.test(s)) return { ok: true, level: 'ok', msg: '看起来是 Ed25519 peerId (12D3KooW…)' };
+    if (/^Qm[1-9A-HJ-NP-Za-km-z]{40,50}$/.test(s)) return { ok: true, level: 'ok', msg: '看起来是 RSA peerId (Qm…)' };
+    return { ok: false, level: 'suspect', msg: '不像 libp2p peerId (应以 12D3KooW 或 Qm 开头, base58)' };
+  }
+
+  function checkMultiaddr(v) {
+    var s = String(v || '').trim();
+    if (!s) return { ok: false, level: 'empty', msg: '未填可拨入地址' };
+    if (s.charAt(0) !== '/') return { ok: false, level: 'bad', msg: 'multiaddr 必须以 / 开头 (例: /ip4/1.2.3.4/tcp/4001/ws/p2p/12D3KooW…)' };
+    if (s.indexOf('/p2p/') === -1) return { ok: false, level: 'bad', msg: 'multiaddr 缺少 /p2p/<peerId> 段' };
+    var relay = s.indexOf('p2p-circuit') !== -1;
+    return { ok: true, level: 'ok', msg: relay ? '含 p2p-circuit (走中继, 对端应能拨入)' : '直连形式 (需对端网络可达)' };
+  }
+
+  // ── 执行轨迹 (本地动作轨迹; 离线可跑, 可导出/交换) ───────────────────────
+  function appendTrace(entry) {
+    var list = loadTrace();
+    list.push({
+      t: new Date().toISOString(),
+      kind: String((entry && entry.kind) || 'action').slice(0, 40),
+      detail: String((entry && entry.detail) || '').slice(0, 300),
+      ok: entry && entry.ok === false ? false : true
+    });
+    if (list.length > TRACE_MAX) list = list.slice(list.length - TRACE_MAX);
+    safeSet(TRACE_KEY, JSON.stringify(list));
+    return list[list.length - 1];
+  }
+
+  function loadTrace() {
+    var arr = readJson(TRACE_KEY, []);
+    return Array.isArray(arr) ? arr : [];
+  }
+
+  function clearTrace() {
+    return safeSet(TRACE_KEY, '[]');
+  }
+
+  /** 轨迹导出成可读文本 (对方粘回去就能看到"我这边干了什么") */
+  function traceToText() {
+    var list = loadTrace();
+    var lines = ['# Bolloon 智能体名片 · 执行轨迹 (' + list.length + ' 步)'];
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      // 契约: "<n>. [ok|fail] <无空格时间戳> <无空格动作名> — <细节>" (Bolloon 侧 trace-export.ts 用同一格式)
+      var kind = String(e.kind || '').replace(/\s+/g, '') || '动作';
+      lines.push(String(i + 1) + '. [' + (e.ok ? 'ok' : 'fail') + '] ' + e.t + ' ' + kind + ' — ' + e.detail);
+    }
+    return lines.join('\n');
+  }
+
   // ── 交接串: 明确带版本前缀, 方便 App 侧识别 ─────────────────────────────
   function toHandover(profile) {
     var payload = {
-      v: 1,
+      v: 2,                       // v2: 增加 p2p 字段 (v1 仍可解析)
       kind: 'bolloon-agent-card',
       name: profile.name,
       bio: profile.bio,
@@ -150,6 +217,11 @@
         baseUrl: profile.endpoint.baseUrl,
         model: profile.endpoint.model,
         keyTail: profile.endpoint.key ? String(profile.endpoint.key).slice(-4) : ''
+      },
+      p2p: {
+        peerId: profile.p2p.peerId,
+        multiaddr: profile.p2p.multiaddr,
+        relay: profile.p2p.relay
       },
       issuedAt: new Date().toISOString()
     };
@@ -172,6 +244,8 @@
   global.BCardStore = {
     PROFILE_KEY: PROFILE_KEY,
     CONTACTS_KEY: CONTACTS_KEY,
+    TRACE_KEY: TRACE_KEY,
+    TRACE_MAX: TRACE_MAX,
     PREFIX: PREFIX,
     loadProfile: loadProfile,
     saveProfile: saveProfile,
@@ -181,6 +255,12 @@
     removeContact: removeContact,
     toHandover: toHandover,
     parseHandover: parseHandover,
+    checkPeerId: checkPeerId,
+    checkMultiaddr: checkMultiaddr,
+    appendTrace: appendTrace,
+    loadTrace: loadTrace,
+    clearTrace: clearTrace,
+    traceToText: traceToText,
     localCode: localCode,
     utf8ToBase64: utf8ToBase64,
     base64ToUtf8: base64ToUtf8

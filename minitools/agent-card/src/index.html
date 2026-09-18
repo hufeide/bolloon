@@ -112,6 +112,7 @@
     <div class="tab on" id="tab-profile">身份</div>
     <div class="tab" id="tab-card">名片</div>
     <div class="tab" id="tab-social">社交</div>
+    <div class="tab" id="tab-trace">轨迹</div>
   </div>
 
   <div class="wrap">
@@ -153,6 +154,23 @@
         <input id="in-key" type="text" maxlength="200" placeholder="sk-…" />
         <p class="msg hint" id="msg-endpoint"></p>
         <button class="btn line" id="btn-save-endpoint" type="button">保存接入点</button>
+      </div>
+
+      <div class="card">
+        <h2>P2P 连接信息</h2>
+        <p class="hint">
+          小工具<b>不能联网</b>,所以 P2P 在这里的作用是<b>交换连接信息</b>:填上你 App 里智能体的
+          peerId 与可拨入地址,它会被写进名片与交接串;对方拿到后交给自己的智能体去 <b>真连接</b>。
+          本工具不会、也无法替你建立连接。
+        </p>
+        <label class="f">peerId</label>
+        <input id="in-peerid" type="text" maxlength="80" placeholder="12D3KooW… 或 Qm…" />
+        <label class="f">可拨入地址 (multiaddr)</label>
+        <input id="in-multiaddr" type="text" maxlength="300" placeholder="/ip4/1.2.3.4/tcp/4001/ws/p2p/12D3KooW…/p2p-circuit/p2p/12D3KooW…" />
+        <label class="f">中继 relay (可留空)</label>
+        <input id="in-relay" type="text" maxlength="80" placeholder="中继节点 peerId 或备注" />
+        <p class="msg hint" id="msg-p2p"></p>
+        <button class="btn line" id="btn-save-p2p" type="button">保存 P2P 信息</button>
       </div>
     </section>
 
@@ -207,6 +225,41 @@
           · 所以<b>真正的入网与交流由 App 侧智能体完成</b>: 这个工具负责采集身份、生成名片、把入口递出去。<br />
           · 本地数据不保证永久保留 (容器可清理),重要内容请自己备份交接串。
         </p>
+      </div>
+    </section>
+    <!-- ── 视图 4: 执行轨迹 ─────────────────────────────────────────── -->
+    <section class="view" id="view-trace">
+      <div class="card">
+        <h2>本机执行轨迹 <span class="tiny" id="trace-count"></span></h2>
+        <p class="hint">
+          记录<b>这个工具里真实发生过的动作与结果</b>(保存身份 / 生成名片 / 存相册 / 发笔记 / 跳转 /
+          导入联系人 / P2P 校验…),包括失败原因。它只写在本机,不上传 —— 因为小工具不能联网。
+        </p>
+        <p class="hint">
+          <b>要智能体"真执行工具、操作本机"的轨迹?</b> 那一端在 App / 电脑上的智能体里(小工具不能联网、也没有文件与命令能力)。
+          在 Bolloon 里跑 <b>bolloon trace &lt;runId&gt;</b>(或对话里 <b>/trace &lt;runId&gt;</b>),把输出粘到下面
+          「导入轨迹文本」,就能看到对方智能体在哪台机器上执行了哪些工具、结果与耗时。
+        </p>
+        <div id="trace-list"></div>
+        <div class="row">
+          <button class="btn line" id="btn-trace-refresh" type="button">刷新</button>
+          <button class="btn line" id="btn-trace-clear" type="button">清空</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>轨迹文本 (可交换)</h2>
+        <p class="hint">长按选中复制发给对方;对方在自己的智能体里粘上,就能看到你这边真实跑过什么。</p>
+        <div class="sel" id="trace-text">(还没有轨迹)</div>
+        <button class="btn line" id="btn-trace-export" type="button">重新生成轨迹文本</button>
+      </div>
+
+      <div class="card">
+        <h2>导入别人的轨迹文本</h2>
+        <textarea id="in-trace-import" placeholder="把轨迹文本粘到这里 (两种都认):&#10;# Bolloon 智能体名片 · 执行轨迹 …&#10;# Bolloon 执行轨迹 · run <runId> …"></textarea>
+        <button class="btn" id="btn-trace-import" type="button">解析并预览</button>
+        <p class="msg hint" id="msg-trace-import"></p>
+        <div id="trace-import-view"></div>
       </div>
     </section>
   </div>

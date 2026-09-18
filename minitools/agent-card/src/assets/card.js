@@ -45,6 +45,15 @@
     return lines;
   }
 
+  /** 最多保留 max 行; 被截断时在最后一行加 "…" —— 不要静默截断(读卡人无法知道内容不完整) */
+  function clampLines(lines, max) {
+    var arr = lines || [];
+    if (arr.length <= max) return arr.slice(0, max);
+    var kept = arr.slice(0, max);
+    kept[max - 1] = String(kept[max - 1]) + '…';
+    return kept;
+  }
+
   function drawAvatarPlaceholder(ctx, cx, cy, r, name) {
     ctx.save();
     ctx.beginPath();
@@ -119,8 +128,8 @@
     // 简介
     ctx.font = '26px sans-serif';
     ctx.fillStyle = '#9a9aa3';
-    var bioLines = wrapText(ctx, profile.bio || '（还没有简介）', W - 80 - 190);
-    for (var i = 0; i < Math.min(bioLines.length, 2); i++) {
+    var bioLines = clampLines(wrapText(ctx, profile.bio || '（还没有简介）', W - 80 - 190), 2);
+    for (var i = 0; i < bioLines.length; i++) {
       ctx.fillText(bioLines[i], 230, 40 + 60 + 76 + i * 36);
     }
 
@@ -163,12 +172,11 @@
     y += 40;
     ctx.fillStyle = '#e6e6ea';
     ctx.font = '26px ui-monospace, Menlo, monospace';
-    var idLines = wrapText(ctx, String(profile.agentId || '（未填）'), W - 160);
-    for (var k = 0; k < Math.min(idLines.length, 2); k++) {
+    var idLines = clampLines(wrapText(ctx, String(profile.agentId || '（未填）'), W - 160), 2);
+    for (var k = 0; k < idLines.length; k++) {
       ctx.fillText(idLines[k], 80, y);
       y += 36;
     }
-    if (idLines.length > 2) y += 4;
     y += 28;
 
     // 接入点 (只显示 host 与模型, 不显示 key)
@@ -197,6 +205,42 @@
       ctx.font = '24px sans-serif';
       ctx.fillText('Key: ****' + String(ep.key).slice(-4), 80, y);
       y += 40;
+    }
+
+    // P2P 连接信息 (只显示 peerId 前 12 位与实际地址段, 便于对端识别)
+    var p2p = profile.p2p || {};
+    if (p2p.peerId || p2p.multiaddr) {
+      ctx.fillStyle = '#77777f';
+      ctx.font = '22px sans-serif';
+      ctx.fillText('P2P', 80, y);
+      y += 40;
+      ctx.fillStyle = '#e6e6ea';
+      ctx.font = '26px ui-monospace, Menlo, monospace';
+      var pid = String(p2p.peerId || '');
+      ctx.fillText(pid ? ('peerId ' + pid.slice(0, 12) + '…') : 'peerId (在 App 里接入)', 80, y);
+      y += 40;
+      if (p2p.multiaddr) {
+        ctx.font = '22px ui-monospace, Menlo, monospace';
+        ctx.fillStyle = '#9a9aa3';
+        var addrLines = clampLines(wrapText(ctx, String(p2p.multiaddr), W - 160), 2);
+        for (var q = 0; q < addrLines.length; q++) {
+          ctx.fillText(addrLines[q], 80, y);
+          y += 32;
+        }
+        if (addrLines.length && addrLines[addrLines.length - 1].indexOf('…') === addrLines[addrLines.length - 1].length - 1) {
+          ctx.fillStyle = '#77777f';
+          ctx.font = '20px sans-serif';
+          ctx.fillText('(完整地址见交接串)', 80, y);
+          y += 30;
+        }
+        if (p2p.multiaddr.indexOf('p2p-circuit') !== -1) {
+          ctx.fillStyle = '#35d07f';
+          ctx.font = '22px sans-serif';
+          ctx.fillText('· 含中继 (对端可拨入)', 80, y);
+          y += 34;
+        }
+      }
+      y += 16;
     }
 
     // 底部说明
@@ -242,6 +286,7 @@
     render: render,
     toDataUri: toDataUri,
     downscaleImage: downscaleImage,
-    wrapText: wrapText
+    wrapText: wrapText,
+    clampLines: clampLines
   };
 })(window);
