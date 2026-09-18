@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { planTransactionRecovery, runTransactionRecovery, reconciliationIsChainBacked, reconcileInterruptedPayments } from '../agents/x402/payment-recovery.js';
+import { createGoal } from '../agents/goal-store.js';
 import { beginTransaction, updateTransaction, readTransaction } from '../agents/x402/transaction-store.js';
 import type { TransactionRecord } from '../agents/x402/transaction-protocol.js';
 
@@ -214,5 +215,51 @@ describe('Phase 3 · Supervisor 对账入口 (只对账, 绝不代替付款方�
       expect(after?.status).toBe('payment_required');
       expect(report.payments.errors).toEqual([]);
     } finally { process.env.HOME = prevHome; }
+  });
+
+  it('awaitingPayment → 唤醒对应 Goal (写 continuation.nextAction)', async () => {
+    const goal = await createGoal({ title: '买资源把事做完', channelId: 'verify', requiredSkills: [], criteria: ['拿到并验真资源'], criteriaSource: 'user', criteriaConfirmed: true } as any);
+    const goalId = goal.goalId || goal.id;
+    const { record } = await beginTransaction({ requestId: 'r-wake-1', metadata: { itemId: 'i' }, buyerDid: 'b', providerDid: 'p', goalId } as any, HOME);
+    await updateTransaction(record.transactionId, { status: 'quoted', paymentMode: 'facilitator' }, HOME);
+
+    const woken: any[] = [];
+    const rep = await reconcileInterruptedPayments({
+      home: HOME,
+      reconcile: async () => ({ fact: 'unpaid' as const, note: 'x' }),
+      persist: async (id, patch, ev) => { await updateTransaction(id, { ...patch, event: ev } as any, HOME); },
+      wakeGoal: async (gid, nextAction) => { woken.push({ gid, nextAction }); return 'ok'; },
+      needsHuman: async () => 'ok',
+    });
+    expect(rep.awaitingPayment.map((x) => x.transactionId)).toContain(record.transactionId);
+    expect(rep.goalsWoken.map((g) => g.goalId)).toContain(goalId);
+    const nextAction = rep.goalsWoken.find((g) => g.goalId === goalId)?.nextAction || '';
+    expect(nextAction).toContain(record.transactionId);
+    expect(nextAction).toContain('payment_retry');
+    expect(woken.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('争议中的交易 → Goal 转人工 (不唤醒去付款)', async () => {
+    const goal = await createGoal({ title: '争议中的目标', channelId: 'verify', requiredSkills: [], criteria: ['x'], criteriaSource: 'user', criteriaConfirmed: true } as any);
+    const goalId = goal.goalId || goal.id;
+    const { record } = await beginTransaction({ requestId: 'r-wake-2', metadata: { itemId: 'i' }, buyerDid: 'b', providerDid: 'p', goalId } as any, HOME);
+    await updateTransaction(record.transactionId, { status: 'quoted', paymentMode: 'facilitator' }, HOME);
+    await updateTransaction(record.transactionId, { status: 'paying' }, HOME);
+    await updateTransaction(record.transactionId, { settlementFact: 'payment_submitted', paymentReceipt: 'r', txHash: '0xw' } as any, HOME);
+    await updateTransaction(record.transactionId, { chainSettled: true, settlementFact: 'payment_verified' } as any, HOME);
+    await updateTransaction(record.transactionId, { status: 'delivery_failed' }, HOME);
+    await updateTransaction(record.transactionId, { status: 'disputed', dispute: { openedAt: new Date().toISOString(), reason: '未交付', evidence: {}, missingEvidence: ['txHash'], mustNotRepay: true } } as any, HOME);
+
+    const flagged: any[] = [];
+    const rep = await reconcileInterruptedPayments({
+      home: HOME,
+      reconcile: async () => ({ fact: 'payment_verified' as const, txHash: '0xw' }),
+      persist: async (id, patch, ev) => { await updateTransaction(id, { ...patch, event: ev } as any, HOME); },
+      wakeGoal: async () => 'ok',
+      needsHuman: async (gid, why) => { flagged.push({ gid, why }); return 'ok'; },
+    });
+    expect(rep.goalsWoken.map((g) => g.goalId)).not.toContain(goalId);
+    expect(rep.goalsFlagged.map((g) => g.goalId)).toContain(goalId);
+    expect(flagged.length).toBeGreaterThanOrEqual(1);
   });
 });

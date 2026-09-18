@@ -353,8 +353,9 @@ export class ExecutionSupervisor {
               await updateTransaction(transactionId, { ...patch, event } as any, home);
             },
           });
-          if (report.payments.reconciled.length || report.payments.mustNotRepay.length) {
-            this.log(`[supervisor] 支付对账: ${report.payments.reconciled.length} 条已钉结算事实 · ${report.payments.mustNotRepay.length} 条绝不重付 · ${report.payments.awaitingPayment.length} 条等付款方决定`);
+          if (report.payments.reconciled.length || report.payments.mustNotRepay.length || report.payments.goalsWoken.length) {
+            this.log(`[supervisor] 支付对账: ${report.payments.reconciled.length} 条已钉结算事实 · ${report.payments.mustNotRepay.length} 条绝不重付 · `
+              + `${report.payments.awaitingPayment.length} 条等付款 · **唤醒 ${report.payments.goalsWoken.length} 个 Goal** · ${report.payments.goalsFlagged.length} 个转人工`);
           }
         } catch (err: any) {
           report.payments.errors.push(String(err?.message || err).slice(0, 120));
@@ -410,7 +411,7 @@ export class ExecutionSupervisor {
     return {
       at: new Date().toISOString(), owner: this.owner, tick: this.tickCount,
       reconciled: { interrupted: [], stillRunning: [], failed: [] },
-    payments: { scanned: 0, reconciled: [], awaitingPayment: [], mustNotRepay: [], closed: [], errors: [] },
+    payments: { scanned: 0, reconciled: [], awaitingPayment: [], mustNotRepay: [], closed: [], goalsWoken: [], goalsFlagged: [], errors: [] },
       supervised: { stalled: [], failed: [] },
       claimed: [], executed: [], skipped: [], errors: [], dryRun: !this.runner,
     };

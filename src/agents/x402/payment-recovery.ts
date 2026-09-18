@@ -233,34 +233,79 @@ export interface PaymentReconcileReport {
   awaitingPayment: { transactionId: string; reason: string }[];   // 可安全重试付款, 但付款由持有钱包的一方做
   mustNotRepay: string[];               // 有支付证据/结算事实 → 绝不重付
   closed: { transactionId: string; reason: string }[];
+  /** 已唤醒的 Goal (付款/交付/验真交回 Goal 的执行器去走幂等路径) */
+  goalsWoken: { goalId: string; transactionId: string; action: string; nextAction: string }[];
+  /** 需要人介入的 Goal (争议等) */
+  goalsFlagged: { goalId: string; why: string }[];
   errors: string[];
 }
 
 /**
  * 供 Supervisor 的 tick 调用: 扫描未完结交易, **只做对账** (安全、无副作用),
- * 把结论钉在结算事实上, 并把"可安全重试付款"的交易列出来交给持有付款能力的一方 (agent runner / 人)。
+ * 把结论钉在结算事实上, 并把"该继续做的事"交回**对应的 Goal** (挂在 `rec.goalId` 上的长期目标)。
  *
  * 为什么这里**不付款**: Supervisor 不持有钱包/私钥。让它替人花钱是把"恢复"变成"自己决定花第二笔钱",
  * 违反 `payment failed ≠ safe to retry` 的边界 —— 付款必须由能对账、能签名的那一方显式执行。
+ *
+ * 2026-09-18 补: `awaitingPayment` 不再只是"列出来", 而是**唤醒对应的 Goal** (写 continuation.nextAction +
+ * 立即可跑), 由 Goal 的执行器 (持有钱包/上下文的那一方) 去走幂等付款路径; 有争议或必须人等的, 一律不唤醒。
  */
 export async function reconcileInterruptedPayments(opts: {
   home: string;
   reconcile: (rec: TransactionRecord) => Promise<{ fact: SettlementFact; txHash?: string; note?: string }>;
   persist: (transactionId: string, patch: Record<string, unknown>, event: { kind: string; detail?: string }) => Promise<void>;
+  /** 注入点: 唤醒 Goal (默认写 continuation.nextAction + autoContinue) */
+  wakeGoal?: (goalId: string, nextAction: string, why: string) => Promise<string>;
+  /** 注入点: 转人工 (默认 continuation.wakeReason = needs_human) */
+  needsHuman?: (goalId: string, why: string) => Promise<string>;
   limit?: number;
 }): Promise<PaymentReconcileReport> {
-  const report: PaymentReconcileReport = { scanned: 0, reconciled: [], awaitingPayment: [], mustNotRepay: [], closed: [], errors: [] };
+  const report: PaymentReconcileReport = { scanned: 0, reconciled: [], awaitingPayment: [], mustNotRepay: [], closed: [], errors: [], goalsWoken: [], goalsFlagged: [] };
   const { pendingTransactions, listTransactions } = await import('./transaction-store.js');
   let all: TransactionRecord[] = [];
   try {
     const pending = await pendingTransactions(opts.home);
-    const unknownFact = (await listTransactions(opts.home)).filter((t) => t.settlementFact === 'unknown');
+    // 中途被杀的交易可能停在**任何非终态**: discovered(刚建) / quoted(拿到报价还没付) / delivered(该验真)…
+    // 只扫 pending 会漏掉场景 ①(付款前被杀) 与 ⑤ 之后的推进 (真跑抓到过: quoted 的交易根本没被扫到)
+    const IN_FLIGHT = ['discovered', 'quoted', 'payment_required', 'paying', 'settled', 'delivered', 'disputed'];
+    const inFlight = (await listTransactions(opts.home)).filter((t) => IN_FLIGHT.includes(String(t.status)) || t.settlementFact === 'unknown');
     const seen = new Set<string>();
-    all = [...pending, ...unknownFact].filter((t) => { if (seen.has(t.transactionId)) return false; seen.add(t.transactionId); return true; });
+    all = [...pending, ...inFlight].filter((t) => { if (seen.has(t.transactionId)) return false; seen.add(t.transactionId); return true; });
   } catch (err: any) {
     report.errors.push(`读取未完结交易失败: ${String(err?.message || err).slice(0, 120)}`);
     return report;
   }
+  const wakeGoal = opts.wakeGoal || (async (goalId: string, nextAction: string, why: string) => {
+    const { setContinuation } = await import('../goal-store.js');
+    await setContinuation(goalId, { nextAction, wakeReason: 'active', autoContinue: true, wakeAt: undefined, needsExternal: undefined });
+    return why;
+  });
+  const humanNeeded = opts.needsHuman || (async (goalId: string, why: string) => {
+    const { setContinuation } = await import('../goal-store.js');
+    await setContinuation(goalId, { nextAction: undefined, wakeReason: 'needs_human', autoContinue: false, needsExternal: why });
+    return why;
+  });
+
+  /** 有 Goal 且允许自动继续 → 唤醒它; 否则 (无 Goal / 已终态) 只报告 */
+  const wakeOrFlag = async (before: TransactionRecord, after: TransactionRecord, plan: RecoveryPlan) => {
+    const goalId = (before as any).goalId || (after as any).goalId;
+    if (!goalId) return;
+    if (after.dispute && !after.dispute.resolution) {
+      report.goalsFlagged.push({ goalId, why: `交易 ${before.transactionId} 在争议中 → 交人` });
+      try { await humanNeeded(goalId, `交易争议待处理: ${before.transactionId}`); } catch (e: any) { report.errors.push(`唤醒 Goal 失败: ${String(e?.message || e).slice(0, 100)}`); }
+      return;
+    }
+    const nextAction = plan.action === 'retry_payment'
+      ? `x402_payment_retry:${before.transactionId} (对账确认可安全付款, 走同一 requestId 的幂等路径)`
+      : `x402_continue:${before.transactionId} (${plan.action}: ${plan.reason})`;
+    try {
+      await wakeGoal(goalId, nextAction, plan.reason);
+      report.goalsWoken.push({ goalId, transactionId: before.transactionId, action: plan.action, nextAction });
+    } catch (e: any) {
+      report.errors.push(`唤醒 Goal ${goalId} 失败: ${String(e?.message || e).slice(0, 100)}`);
+    }
+  };
+
   for (const rec of all.slice(0, opts.limit ?? 50)) {
     report.scanned++;
     const plan = planTransactionRecovery(rec);
@@ -278,18 +323,28 @@ export async function reconcileInterruptedPayments(opts: {
         report.reconciled.push(rec.transactionId);
         const after = { ...rec, ...patch } as TransactionRecord;
         const nextPlan = planTransactionRecovery(after);
-        if (nextPlan.action === 'retry_payment') report.awaitingPayment.push({ transactionId: rec.transactionId, reason: nextPlan.reason });
-        else if (nextPlan.mustNotRepay) report.mustNotRepay.push(rec.transactionId);
+        if (nextPlan.action === 'retry_payment') {
+          report.awaitingPayment.push({ transactionId: rec.transactionId, reason: nextPlan.reason });
+          await wakeOrFlag(rec, after, nextPlan);
+        } else if (nextPlan.mustNotRepay) report.mustNotRepay.push(rec.transactionId);
         continue;
       }
       if (plan.action === 'retry_payment') {
-        // 不需要对账就能确认"没付过" → 列出来给付款方, 这里不动钱
+        // 不需要对账就能确认"没付过" → 列出来 + 唤醒对应 Goal 去走幂等付款路径 (这里不动钱)
         report.awaitingPayment.push({ transactionId: rec.transactionId, reason: plan.reason });
+        await wakeOrFlag(rec, rec, plan);
+        continue;
+      }
+      if (plan.action === 'deliver' || plan.action === 'verify') {
+        // 付款事实在手 → 唤醒 Goal 继续推进交付/验真 (同样不在这里动钱)
+        await wakeOrFlag(rec, rec, plan);
         continue;
       }
       if (plan.mustNotRepay) report.mustNotRepay.push(rec.transactionId);
       if (plan.action === 'closed' || plan.action === 'complete' || plan.action === 'wait') {
         report.closed.push({ transactionId: rec.transactionId, reason: plan.reason });
+        // 争议中的交易也要让对应 Goal **转人工** (不是让它继续跑, 而是明确交人)
+        await wakeOrFlag(rec, rec, plan);
       }
     } catch (err: any) {
       report.errors.push(`${rec.transactionId}: ${String(err?.reason || err?.message || err).slice(0, 120)}`);

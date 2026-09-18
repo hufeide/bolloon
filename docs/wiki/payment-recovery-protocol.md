@@ -83,12 +83,21 @@ unpaid + quoted/payment_required                → retry_payment (确认没付�
 (与孤儿 run 对账同一次), 结果进 `TickReport.payments`:
 
 ```text
-scanned          扫了多少条未完结交易
+scanned          扫了多少条未完结交易 (含 discovered/quoted/delivered/disputed 等所有非终态 + 结算事实 unknown)
 reconciled       钉死结算事实的 (含"确认没付过"退回 payment_required)
-awaitingPayment  可安全重试付款的 → 只列出来, 交给持钱包的一方 (agent runner / 人)
+awaitingPayment  可安全重试付款的 → 交给持钱包的一方 (agent runner / 人)
 mustNotRepay     有支付证据或结算事实 → 绝不重付
 closed           终态/无动作 (含"付了钱但没交付"→ 追责)
+goalsWoken       已**唤醒对应 Goal** 的 (付款/交付/验真交回 Goal 的执行器走幂等路径)
+goalsFlagged     需要人介入的 Goal (争议未收尾 → 写 needs_human, 不唤醒去付款)
 ```
+
+### `awaitingPayment → 唤醒 Goal` (2026-09-18 补)
+
+交易挂在 `rec.goalId` 上时, 对账不再只是"列出来", 而是**唤醒对应 Goal**: 写
+`continuation.nextAction = x402_payment_retry:<txId>` (或 `x402_continue:<txId>`) + `autoContinue=true`,
+由 Goal 的执行器 (持钱包/上下文的那一方) 去走**同一 requestId 的幂等付款路径** —— 这样"无人值守恢复"才闭环,
+而 Supervisor 依然一分钱没花。争议中的交易则相反: 写 `wakeReason=needs_human` + `needsExternal`, **不唤醒**。
 
 **设计取舍 (为什么 Supervisor 不自动付款)**: Supervisor 不持有钱包/私钥。让它替人花钱 = 把"恢复"变成
 "自己决定花第二笔钱", 直接违反 `payment failed ≠ safe to retry`。付款必须由**能对账、能签名**的那一方显式执行;
