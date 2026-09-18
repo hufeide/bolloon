@@ -205,6 +205,8 @@ export interface CheckPaymentOptions {
   /** 显式允许本机联调凭据 (默认 false) */
   allowLocalDev?: boolean;
   fetchImpl?: typeof fetch;
+  /** 这张凭据必须是为这条资源付的 (防跨资源复用) */
+  expectedItemId?: string;
 }
 
 /**
@@ -254,6 +256,17 @@ export async function checkAndSettlePayment(opts: CheckPaymentOptions): Promise<
     };
   }
 
+  // 凭据绑定校验 (两种模式都查): 拿旧回执去换另一条资源 → 一律拒绝
+  const boundItem = payload?.accepted?.extra?.itemId || payload?.accepted?.itemId || payload?.itemId;
+  if (opts.expectedItemId) {
+    if (!boundItem) {
+      return { ok: false, mode: 'none', error: '支付凭据没有绑定 itemId: 无法证明这笔钱是为这条资源付的' };
+    }
+    if (String(boundItem) !== String(opts.expectedItemId)) {
+      return { ok: false, mode: 'none', error: `支付凭据绑定的资源 (${boundItem}) 与本次请求 (${opts.expectedItemId}) 不一致 — 回执不能跨资源复用` };
+    }
+  }
+
   // 本机联调: 只检查 payload 声明的收款/金额与要求一致, 明确标记非链上
   const accepted = payload.accepted || {};
   if (accepted.payTo && String(accepted.payTo).toLowerCase() !== String(req.payTo).toLowerCase()) {
@@ -279,6 +292,10 @@ export async function checkAndSettlePayment(opts: CheckPaymentOptions): Promise<
 export interface BuyInfoResult {
   ok: boolean;
   status?: number;
+  /** 策略门拒绝 (Phase 2): 没有签名、没有链上交易、没有扣预算、没有交付 */
+  policyDenied?: boolean;
+  /** 卖方声明的元数据 (来自 402 / 免费元数据) */
+  metadata?: any;
   /** 已验真的信封 (直接给智能体用) */
   envelope?: any;
   verify?: import('./paid-info-protocol.js').VerifyReport;
@@ -291,6 +308,10 @@ export interface BuyInfoResult {
  * 购买一条信息: 未付款时服务端回 402, 这里用标准 x402 客户端 (402→签名→重试) 完成支付。
  * 无钱包私钥时, 只有显式 allowLocalDev 才走本机联调头。
  */
+function makeTracker(onEvent?: (e: { kind: string; detail?: string; patch?: Record<string, unknown> }) => Promise<void>) {
+  return async (e: { kind: string; detail?: string; patch?: Record<string, unknown> }) => { if (onEvent) await onEvent(e).catch(() => null); };
+}
+
 export async function buyInfo(params: {
   url: string;
   privateKey?: string;
@@ -301,9 +322,14 @@ export async function buyInfo(params: {
   resolveDid?: import('./paid-info-protocol.js').DidKeyResolver;
   expectItemId?: string;
   fetchImpl?: typeof fetch;
+  /** Phase 2 策略门: 在**任何签名/解密/付款之前**调用; 返回 ok:false 就必须原样停下 */
+  prePayGuard?: (info: { requirements: any; url: string }) => Promise<{ ok: boolean; reason?: string }>;
+  /** Phase 5 审计: 交易记录钩子 (每次状态推进都回调) */
+  onEvent?: (e: { kind: string; detail?: string; patch?: Record<string, unknown> }) => Promise<void>;
 }): Promise<BuyInfoResult> {
   const { verifyEnvelope } = await import('./paid-info-protocol.js');
   const doFetch = params.fetchImpl ?? fetch;
+  const trackEvent = makeTracker(params.onEvent);
 
   // ① 先探一次: 判断是否 402 (以及免费信息直接返回)
   let res: Response;
@@ -323,10 +349,22 @@ export async function buyInfo(params: {
     return { ok: false, status: res.status, error: `服务端返回 ${res.status}: ${text.slice(0, 200)}` };
   }
 
-  // ② 402 → 支付 → 重试
+  // ② 402 → (策略门) → 支付 → 重试
   const requirementBody = safeJson(await res.text());
   const requirements = requirementBody?.accepts?.[0];
   if (!requirements) return { ok: false, status: 402, error: '402 响应缺少 accepts' };
+  const metadata = requirementBody?.metadata || requirementBody?.item || null;
+  await trackEvent({ kind: 'payment_required', detail: `amount=${requirements.amount} network=${requirements.network}` });
+
+  // Phase 2: 策略门 —— 必须在解密钱包/签名/付款之前 (顺序不可颠倒)
+  if (params.prePayGuard) {
+    const gate = await params.prePayGuard({ requirements, url: params.url });
+    if (!gate.ok) {
+      await trackEvent({ kind: 'policy_denied', detail: gate.reason });
+      return { ok: false, status: 402, policyDenied: true, error: gate.reason || '策略拒绝', metadata, raw: JSON.stringify(requirementBody) };
+    }
+    await trackEvent({ kind: 'policy_allowed', detail: '策略通过, 允许进入付款' });
+  }
 
   let paymentHeader = '';
   let mode = '';
@@ -347,8 +385,10 @@ export async function buyInfo(params: {
       return { ok: false, status: retry.status, error: `付款后重试失败 ${retry.status}: ${text.slice(0, 200)}` };
     }
     mode = 'facilitator';
+    await trackEvent({ kind: 'settled', detail: `mode=facilitator receipt=${receipt.slice(0, 24)}…`, patch: { paymentMode: 'facilitator', paymentReceipt: receipt, chainSettled: true } });
     const report = parsed?.proof ? await verifyEnvelope(parsed, { resolveDid: params.resolveDid, expectItemId: params.expectItemId }) : undefined;
-    return { ok: true, status: retry.status, envelope: parsed, verify: report, payment: { mode, receipt }, raw: text };
+    if (report) await trackEvent({ kind: 'delivered', detail: `trust=${report.trust}`, patch: { verificationTrust: report.trust as any, contentHash: parsed?.contentHash, protocolVerified: report.trust === 'verified' } });
+    return { ok: true, status: retry.status, envelope: parsed, verify: report, payment: { mode, receipt }, metadata, raw: text };
   }
 
   if (!params.allowLocalDev) {
@@ -367,10 +407,13 @@ export async function buyInfo(params: {
     return { ok: false, status: retry.status, error: `本机联调付款被拒 ${retry.status}: ${text.slice(0, 200)}` };
   }
   mode = 'local-dev';
+  const receiptLd = retry.headers.get('x-payment-response') || parsed?.payment?.receipt || '';
+  await trackEvent({ kind: 'settled', detail: 'mode=local-dev (非链上)', patch: { paymentMode: 'local-dev', paymentReceipt: receiptLd, chainSettled: false } });
   const report = parsed?.proof ? await verifyEnvelope(parsed, { resolveDid: params.resolveDid, expectItemId: params.expectItemId }) : undefined;
+  if (report) await trackEvent({ kind: 'delivered', detail: `trust=${report.trust} (本机联调)`, patch: { verificationTrust: report.trust as any, contentHash: parsed?.contentHash, protocolVerified: report.trust !== 'unverified' } });
   return {
-    ok: true, status: retry.status, envelope: parsed, verify: report,
-    payment: { mode, receipt: retry.headers.get('x-payment-response') || parsed?.payment?.receipt }, raw: text,
+    ok: true, status: retry.status, envelope: parsed, verify: report, metadata,
+    payment: { mode, receipt: receiptLd }, raw: text,
   };
 }
 

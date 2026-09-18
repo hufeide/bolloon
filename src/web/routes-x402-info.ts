@@ -115,6 +115,7 @@ export function registerX402InfoRoutes(app: any): void {
       const pay = await checkAndSettlePayment({
         paymentHeader: String(paymentHeader),
         requirements,
+        expectedItemId: stored.item.id,   // 凭据必须绑定这条资源 (防跨资源复用)
       });
       if (!pay.ok) {
         return res.status(402).json({ ...requirements, error: pay.error });
