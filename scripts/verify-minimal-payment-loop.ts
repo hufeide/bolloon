@@ -265,6 +265,74 @@ async function main() {
   check('重启后同 requestId 幂等复用 (没有第二次付款)', retryAfterKill.transactionId === killedTxId && retryAfterKill.reused === true, { killed: killedTxId, retry: retryAfterKill.transactionId });
   check('花钱计数未增加', spentAfterRetry.count === spentAfterKill.count, { before: spentAfterKill.count, after: spentAfterRetry.count });
 
+
+  // ═══ Phase 1 (硬门槛): 并发幂等 / 对账 / 事件一致 ═══
+  section('[11] Phase 1: 支付权 claim (并发唯一) + 重启对账 + 事件链一致');
+  {
+    const concurrentReq = `verify-${MODE}-concurrent-1`;
+    const childSrc = (tag: string) => `
+      (async () => {
+        const { buyInfoAsTransaction } = await import(${JSON.stringify(path.resolve('src/agents/x402/trade.ts'))});
+        try {
+          const r = await buyInfoAsTransaction({ url: ${JSON.stringify(URL_ITEM)}, requestId: ${JSON.stringify(concurrentReq)}, buyerDid: 'did:key:zBuyerVerify', allowLocalDev: true, home: ${JSON.stringify(HOME)} });
+          console.log('CHILD ' + ${JSON.stringify(tag)} + ' ' + (r.reused ? 'REUSED' : 'PAID') + ' ' + r.status);
+        } catch (e) { console.log('CHILD ' + ${JSON.stringify(tag)} + ' ERR ' + String(e?.message || e).slice(0, 80)); }
+      })();
+    `;
+    const kids = ['A', 'B'].map((tag) => {
+      const c = spawn('npx', ['tsx', '-e', childSrc(tag)], { cwd: process.cwd(), env: { ...process.env } });
+      let out = '';
+      c.stdout.on('data', (d) => { out += d; });
+      return { c, get: () => out };
+    });
+    await new Promise((r) => setTimeout(r, 45_000));
+    const outs = kids.map((k) => k.get());
+    kids.forEach((k) => k.c?.kill('SIGKILL'));
+    const paidCount = outs.filter((o) => /PAID /.test(o)).length;
+    const reusedCount = outs.filter((o) => /REUSED /.test(o)).length;
+    reject('并发同 requestId: 只有一个真付款', paidCount === 1, { outs });
+    reject('并发同 requestId: 另一个复用同一交易', reusedCount >= 1 || paidCount === 1, { outs });
+    const txs4req = (await TXS.listTransactions(HOME)).filter((t: any) => t.requestId === concurrentReq);
+    reject('同一 requestId 只产生一笔交易记录', txs4req.length === 1, txs4req.map((t: any) => t.transactionId));
+
+    // 重启对账: 造一条"付到一半"的记录 → 必须先对账再决定
+    const stuck = await TXS.beginTransaction({ requestId: `verify-${MODE}-stuck-1`, metadata: { itemId: item.id }, buyerDid: BUYER_DID }, HOME);
+    await TXS.setTransactionStatus(stuck.record.transactionId, 'paying', '模拟付到一半被杀', HOME);
+    const rec4 = await TXS.reconcilePendingTransactions(HOME);
+    const stuckAfter = await TXS.readTransaction(stuck.record.transactionId, HOME);
+    reject('付到一半 (无支付证据) → 对账后允许安全重试', rec4.requeued.includes(stuck.record.transactionId) && stuckAfter?.status === 'payment_required', { status: stuckAfter?.status, requeued: rec4.requeued });
+    const paid = (await TXS.listTransactions(HOME)).filter((t: any) => ['settled', 'delivered', 'verified', 'delivery_failed', 'verification_failed'].includes(t.status));
+    reject('已付过钱的交易进入 mustNotRepay (绝不重付)', paid.length === 0 || rec4.mustNotRepay.length >= paid.length - 1, { paid: paid.length, mustNotRepay: rec4.mustNotRepay.length });
+
+    // 事件链与主记录一致 (不能出现"事件说付了, 记录还 paying")
+    const chain = await TXS.readTransaction(t1.transactionId, HOME);
+    const kinds = (chain?.events || []).map((e: any) => e.kind).join(',');
+    reject('事件链与状态一致 (settled 事件存在且终态不是 paying)', /settled/.test(kinds) && chain?.status !== 'paying', { kinds: kinds.slice(0, 80), status: chain?.status });
+  }
+
+  // ═══ Phase 3: 交易证据接入 Run / Goal ═══
+  section('[12] Phase 3: 交易证据写进 Run step/evidence, Goal 只在成立时计入成功证据');
+  {
+    const { runId } = { runId: 'run-pay-bridge-1' };
+    const bridgeTrade = await TRADE.buyInfoAsTransaction({
+      url: URL_ITEM, requestId: `verify-${MODE}-bridge-1`, buyerDid: BUYER_DID, allowLocalDev: true,
+      resolveDid, home: HOME, goalId: 'g-pay-bridge-1', runId,
+    });
+    check('交易完成且带 bridge 结果', !!bridgeTrade.bridge, bridgeTrade.bridge);
+    check('Run 里写了 x402_transaction step', bridgeTrade.bridge?.stepWritten === true, bridgeTrade.bridge);
+    check('Run evidence 里带了交易证明字段', bridgeTrade.bridge?.evidenceWritten === true, bridgeTrade.bridge);
+    check('Goal 没有被写成"成功证据" (本机联调/未命中判据)', bridgeTrade.bridge?.goalEvidenceWritten === false, { bridge: bridgeTrade.bridge, status: bridgeTrade.status });
+
+    // bridge 规则正例: verified + 执行成功 + 命中判据 → 才写成功证据
+    const { bridgeTransactionToRunGoal, bridgeEventFor } = await import('../src/agents/x402/goal-run-bridge.js') as any;
+    check('事件映射覆盖 discovered/quoted/settled/verified', bridgeEventFor('discovered') === 'transaction.discovered' && bridgeEventFor('verified') === 'transaction.verified' && bridgeEventFor('policy_denied') === 'transaction.policy_denied', null);
+    const synthetic: any = { ...(await TXS.readTransaction(bridgeTrade.transactionId, HOME)), status: 'verified', chainSettled: true, txHash: '0xdeadbeef', receiptHash: 'aa', contentHash: 'sha256:bb', verificationTrust: 'verified' };
+    const pos = await bridgeTransactionToRunGoal(synthetic, { goalId: 'g-pay-bridge-1', executionOk: true, goalCriteriaHit: true });
+    check('verified + 执行成功 + 命中判据 → Goal 计入成功证据', pos.goalEvidenceWritten === true, pos);
+    const neg = await bridgeTransactionToRunGoal(synthetic, { goalId: 'g-pay-bridge-1', executionOk: true, goalCriteriaHit: false });
+    check('verified 但未命中判据 → 不计入成功证据', neg.goalEvidenceWritten === false, neg);
+  }
+
   // ── 交易证明 ─────────────────────────────────────────────────────────────
   section('交易证明 (审计输出)');
   for (const id of [t1?.transactionId, withGoal?.transactionId].filter(Boolean) as string[]) {

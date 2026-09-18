@@ -625,6 +625,21 @@ export function argsDigestOf(v: unknown): string {
  * 追加一步 (工具调用后立即落盘) —— 崩在这里也能看到做到哪一步。
  * 锁内读改写: 并发调用不会互相覆盖步骤。
  */
+/**
+ * 追加证据到 Run (2026-09-16): 交易等"外部事实"要能进 Run 的 evidence,
+ * 而不是只留在工具内部 (支付必须可审计)。
+ */
+export async function addRunEvidence(runId: string, lines: string[]): Promise<RunRecord | null> {
+  return withRunLock(runId, () => coreWrite('addRunEvidence', runId, async () => {
+    const rec = await readRun(runId);
+    if (!rec) return null;
+    const merged = Array.from(new Set([...(rec.evidence || []), ...lines.map((l) => String(l).slice(0, 300))])).slice(-50);
+    rec.evidence = merged;
+    await writeRun(rec);
+    return rec;
+  }));
+}
+
 export async function recordStep(runId: string, step: { tool: string; ok: boolean; ms?: number; args?: unknown; summary?: string; error?: string }): Promise<RunRecord | null> {
   return withRunLock(runId, () => coreWrite('recordStep', runId, async () => {
     const rec = await readRun(runId);

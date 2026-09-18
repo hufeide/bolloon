@@ -14,9 +14,12 @@ import {
   validatePaymentRequirements, evaluateTransactionSuccess, computeReceiptHash,
   type TransactionRecord, type InfoItemMetadata,
 } from './transaction-protocol.js';
-import { beginTransaction, updateTransaction, setTransactionStatus, readTransaction, findByRequestId } from './transaction-store.js';
+import { beginTransaction, updateTransaction, setTransactionStatus, readTransaction, findByRequestId, claimPayment, releasePaymentClaim } from './transaction-store.js';
 
 export interface TradeParams {
+  /** 资源执行结果 (Phase 3/4): 是否被实际执行且符合契约; 是否命中 Goal 判据 */
+  executionOk?: boolean;
+  goalCriteriaHit?: boolean;
   url: string;
   requestId: string;
   buyerDid: string;
@@ -51,6 +54,7 @@ export interface TradeResult {
   error?: string;
   /** 是否复用了已有交易 (幂等命中, 没有再付一次钱) */
   reused?: boolean;
+  bridge?: { runId?: string; goalId?: string; stepWritten: boolean; evidenceWritten: boolean; goalEvidenceWritten: boolean } | null;
 }
 
 export async function buyInfoAsTransaction(params: TradeParams): Promise<TradeResult> {
@@ -147,6 +151,19 @@ export async function buyInfoAsTransaction(params: TradeParams): Promise<TradeRe
     return { ok: false, status: 'policy_denied', transactionId: rec.transactionId, record: rec, error: decision.reason || '策略拒绝' };
   }
 
+  // ③.5 Phase 1: 抢"这笔 requestId 的付款权" (O_EXCL 独占, 跨进程唯一) —— 并发时只有一个能真付
+  const claim = await claimPayment(params.requestId, rec.transactionId, home);
+  if (!claim.ok) {
+    const prior = claim.record;
+    if (prior) {
+      rec = prior;
+      return { ok: prior.status === 'verified' || prior.status === 'delivered', status: prior.status, transactionId: prior.transactionId, record: prior, reused: true, error: claim.reason };
+    }
+    rec = (await setTransactionStatus(rec.transactionId, 'failed', claim.reason, home))!;
+    return { ok: false, status: rec.status, transactionId: rec.transactionId, record: rec, error: claim.reason };
+  }
+  rec = (await updateTransaction(rec.transactionId, { status: 'paying', event: { kind: 'paying', detail: `已取得付款权 (holder=${rec.transactionId})` } }, home))!;
+
   // ④ 付款 + 交付 (仍然由 buyInfo 执行; 策略门已过才走到这里)
   const { buyInfo } = await import('./paid-info-store.js');
   const res = await buyInfo({
@@ -175,6 +192,8 @@ export async function buyInfoAsTransaction(params: TradeParams): Promise<TradeRe
     rec = (await setTransactionStatus(rec.transactionId, next as any, res.error, home))!;
     return { ok: false, status: rec.status, transactionId: rec.transactionId, record: rec, error: res.error };
   }
+
+  await releasePaymentClaim(params.requestId, home).catch(() => null);   // 付款完成 → 放锁 (事实已落盘)
 
   // ⑤ 交付与验真绑定 (支付成功 ≠ 交易成功)
   const envelope: any = res.envelope || null;
@@ -213,5 +232,18 @@ export async function buyInfoAsTransaction(params: TradeParams): Promise<TradeRe
   const verdict = evaluateTransactionSuccess({ ...rec, status: 'delivered' });
   const finalStatus: TransactionRecord['status'] = verdict.success ? 'verified' : 'delivered';
   rec = (await setTransactionStatus(rec.transactionId, finalStatus, verdict.reason, home))!;
-  return { ok: true, status: finalStatus, transactionId: rec.transactionId, record: rec, verify: res.verify, envelope, reused };
+
+  // Phase 3: 交易证据写进 Run (step + evidence) 与 Goal (仅在 verified + 执行成功 + 命中判据时计入成功证据)
+  let bridge: any = null;
+  if (params.runId || params.goalId) {
+    try {
+      const { bridgeTransactionToRunGoal } = await import('./goal-run-bridge.js');
+      bridge = await bridgeTransactionToRunGoal(rec, {
+        runId: params.runId, goalId: params.goalId,
+        executionOk: params.executionOk, goalCriteriaHit: params.goalCriteriaHit,
+        summary: rec.itemId,
+      });
+    } catch (e) { /* 记账失败不改变交易事实 */ }
+  }
+  return { ok: true, status: finalStatus, transactionId: rec.transactionId, record: rec, verify: res.verify, envelope, reused, bridge };
 }
