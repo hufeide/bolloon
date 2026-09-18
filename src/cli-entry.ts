@@ -392,9 +392,11 @@ async function handleTraceCommand(traceArgs: string[]): Promise<void> {
 async function handleP2pCommand(p2pArgs: string[]): Promise<void> {
   const { getLocalP2pInfo, formatP2pInfoText, formatP2pInfoJson } = await import('./agents/p2p-info.js');
   const info = await getLocalP2pInfo();
-  if (p2pArgs.includes('--json')) { console.log(formatP2pInfoJson(info)); return; }
-  console.log(formatP2pInfoText(info));
-  if (!info.ok) process.exitCode = 1;
+  if (p2pArgs.includes('--json')) console.log(formatP2pInfoJson(info));
+  else console.log(formatP2pInfoText(info));
+  // 一次性信息命令必须自己收尾: 读运行中节点会 import network/p2p (libp2p),
+  // 那是常驻模块, 句柄不会自己关 → 不显式退出会"输出完了还挂着"。
+  process.exit(info.ok ? 0 : 1);
 }
 
 async function handleModelCommand(modelArgs: string[]): Promise<void> {
