@@ -1413,6 +1413,41 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     return;
   }
 
+  // 2026-09-18: /trace [runId] [--json] —— 智能体工具执行轨迹 (真跑过什么工具/结果/耗时), 可复制交换
+  if (cmd === '/trace' || cmd.startsWith('/trace ')) {
+    const rest = trimmed.slice('/trace'.length).trim();
+    try {
+      const { listRuns, readRun } = await import('./agents/run-store.js');
+      const { runToTraceText, runToTraceJson, summarizeTrace } = await import('./agents/trace-export.js');
+      const wantJson = rest.includes('--json');
+      const runId = rest.split(/\s+/).find((a) => a && !a.startsWith('--'));
+      if (!runId) {
+        const runs = await listRuns({ limit: 12 });
+        if (!runs.length) { appendLine(`${C_DIM}还没有运行记录 (每次智能体运行都落盘 ~/.bolloon/runs/)${RESET}`); return; }
+        appendLine(`${C_DIM}最近 ${runs.length} 次运行的工具执行轨迹:${RESET}`);
+        for (const r of runs) appendLine(`  ${C_DIM}${r.runId} [${r.status}] ${RESET}${summarizeTrace(r)}`);
+        appendLine(`${C_DIM}/trace <runId> 看完整轨迹 (文本可复制交换) · /trace <runId> --json 机器可读${RESET}`);
+        return;
+      }
+      const run = await readRun(runId);
+      if (!run) { appendLine(`${C_ERROR}没有这个运行: ${runId}${RESET}`); return; }
+      if (wantJson) { appendLine(JSON.stringify(runToTraceJson(run), null, 2)); return; }
+      for (const line of runToTraceText(run).split('\n')) appendLine(`  ${C_DIM}${line}${RESET}`);
+    } catch (e: any) { appendLine(`${C_ERROR}/trace 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`); }
+    return;
+  }
+
+  // 2026-09-18: /p2p [--json] —— 本机 P2P 连接信息 (peerId + 可拨入地址), 抄进名片/小工具递给对方
+  if (cmd === '/p2p' || cmd.startsWith('/p2p ')) {
+    try {
+      const { getLocalP2pInfo, formatP2pInfoText, formatP2pInfoJson } = await import('./agents/p2p-info.js');
+      const info = await getLocalP2pInfo();
+      if (trimmed.includes('--json')) { appendLine(formatP2pInfoJson(info)); return; }
+      for (const line of formatP2pInfoText(info).split('\n')) appendLine(`  ${C_DIM}${line}${RESET}`);
+    } catch (e: any) { appendLine(`${C_ERROR}/p2p 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`); }
+    return;
+  }
+
   // 2026-09-16 (2-F): /criteria <goalId> [confirm|propose <text...>] —— 判据：看/确认/改/让 agent 提候选
   if (cmd === '/criteria' || cmd.startsWith('/criteria ')) {
     const rest = trimmed.slice('/criteria'.length).trim();

@@ -171,6 +171,11 @@ function parseArgs(): { mode: string; args: string[] } {
       return { mode: 'update', args: args.slice(1) };
     case 'model':
       return { mode: 'model', args: args.slice(1) };
+    // 2026-09-18: 智能体工具执行轨迹 + 本机 P2P 连接信息 (递给名片/小工具用)
+    case 'trace':
+      return { mode: 'trace', args: args.slice(1) };
+    case 'p2p':
+      return { mode: 'p2p', args: args.slice(1) };
     // 2026-09-13: 初始化向导 (用户身份 + 模型供应商 + API key)
     case 'setup':
     case 'init':
@@ -333,6 +338,65 @@ async function handleUpdateCommand(updateArgs: string[]): Promise<void> {
 }
 
 /** model 子命令: 列出 / 切换模型供应商 (bolloon model [name] [model]) */
+/**
+ * `bolloon trace [runId] [--json] [--last N]`
+ *   把 Run 的**工具执行轨迹**(真跑过什么工具、结果、耗时)导出来:
+ *   无参 → 列出最近几次运行 + 每步摘要;  带 runId → 输出完整轨迹 (文本或 JSON)。
+ *   文本格式与小工具/别的智能体对齐, 可直接复制粘贴交换。
+ */
+async function handleTraceCommand(traceArgs: string[]): Promise<void> {
+  const { listRuns, readRun } = await import('./agents/run-store.js');
+  const { runToTraceText, runToTraceJson, summarizeTrace } = await import('./agents/trace-export.js');
+  const wantJson = traceArgs.includes('--json');
+  const lastIdx = traceArgs.indexOf('--last');
+  const last = lastIdx >= 0 ? Number(traceArgs[lastIdx + 1]) : undefined;
+  const runId = traceArgs.find((a) => !a.startsWith('--') && a !== String(last));
+
+  if (!runId) {
+    const runs = await listRuns({ limit: 20 });
+    if (wantJson) { console.log(JSON.stringify(runs.map((r: any) => runToTraceJson(r)), null, 2)); return; }
+    console.log(`\n${BOLD}最近 ${runs.length} 次运行的执行轨迹${RESET}\n`);
+    if (!runs.length) {
+      console.log('  还没有运行记录 (落盘在 ~/.bolloon/runs/)');
+      console.log(`  ${CYAN}先让智能体干点活: bolloon --prompt "列出当前目录文件"${RESET}\n`);
+      return;
+    }
+    console.log('─'.repeat(72));
+    for (const r of runs) {
+      console.log(`  ${r.runId}  [${r.status}]  ${summarizeTrace(r)}`);
+    }
+    console.log('─'.repeat(72));
+    console.log(`  ${CYAN}bolloon trace <runId>            看完整轨迹 (文本, 可复制交换)`);
+    console.log(`  bolloon trace <runId> --json    机器可读${RESET}\n`);
+    return;
+  }
+
+  const run = await readRun(runId);
+  if (!run) {
+    console.error(`${MAGENTA}没有这个运行: ${runId}${RESET}`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(wantJson ? JSON.stringify(runToTraceJson(run), null, 2) : runToTraceText(run, { limit: last }));
+  if (!wantJson) {
+    const j = runToTraceJson(run);
+    console.error(`\n${CYAN}(${j.counts.total} 步 · ✓${j.counts.ok} / ✗${j.counts.fail} · ${j.counts.totalMs}ms · 状态 ${j.status})${RESET}`);
+  }
+}
+
+/**
+ * `bolloon p2p [--json]`
+ *   打印本机 P2P 连接信息 (peerId + 可拨入 multiaddr), 直接可抄进名片/小工具/递给对方智能体。
+ *   只报真实拿到的: 节点没跑就说明原因与下一步, 不编造 peerId。
+ */
+async function handleP2pCommand(p2pArgs: string[]): Promise<void> {
+  const { getLocalP2pInfo, formatP2pInfoText, formatP2pInfoJson } = await import('./agents/p2p-info.js');
+  const info = await getLocalP2pInfo();
+  if (p2pArgs.includes('--json')) { console.log(formatP2pInfoJson(info)); return; }
+  console.log(formatP2pInfoText(info));
+  if (!info.ok) process.exitCode = 1;
+}
+
 async function handleModelCommand(modelArgs: string[]): Promise<void> {
   const { llmConfigStore, PROVIDER_INFO } = await import('./llm/config-store.js');
   await llmConfigStore.initialize();
@@ -645,6 +709,15 @@ async function main() {
 
     case 'model':
       await handleModelCommand(args);
+      break;
+
+    // 2026-09-18: 工具执行轨迹 / P2P 连接信息
+    case 'trace':
+      await handleTraceCommand(args);
+      break;
+
+    case 'p2p':
+      await handleP2pCommand(args);
       break;
 
     // 2026-09-13: bolloon setup — 首次运行初始化向导

@@ -2983,6 +2983,38 @@ ${goalDesc}
   });
 
   // 2026-09-16: 运行记录 (持久化 harness) — 当前 + 历史 agent 运行。跨重载可读。
+  // 2026-09-18: 智能体工具执行轨迹 + 本机 P2P 信息 (与小工具/名片交换用, 结构化)
+  app.get('/api/trace', async (req, res) => {
+    try {
+      const { listRuns } = await import('../agents/run-store.js');
+      const { runToTraceJson } = await import('../agents/trace-export.js');
+      const runs = await listRuns({ limit: Number(req.query.limit) || 20 });
+      res.json({ runs: runs.map((r: any) => runToTraceJson(r)) });
+    } catch (err) { res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) }); }
+  });
+
+  app.get('/api/trace/:runId', async (req, res) => {
+    try {
+      const { readRun } = await import('../agents/run-store.js');
+      const { runToTraceText, runToTraceJson } = await import('../agents/trace-export.js');
+      const run = await readRun(req.params.runId);
+      if (!run) return res.status(404).json({ error: 'run 不存在' });
+      if (String(req.query.format || 'json') === 'text') {
+        res.type('text/plain; charset=utf-8').send(runToTraceText(run));
+        return;
+      }
+      res.json(runToTraceJson(run));
+    } catch (err) { res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) }); }
+  });
+
+  app.get('/api/p2p/info', async (_req, res) => {
+    try {
+      const { getLocalP2pInfo, formatP2pInfoJson } = await import('../agents/p2p-info.js');
+      const info = await getLocalP2pInfo();
+      res.type('application/json').send(formatP2pInfoJson(info));
+    } catch (err) { res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) }); }
+  });
+
   // 2026-09-16 (2-F/2-H): 判据 (criteria) + 长期执行面板 API —— CLI/Web 读同一份 Goal 事实
   app.get('/api/goals/:id/criteria', async (req, res) => {
     try {
