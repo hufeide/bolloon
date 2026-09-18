@@ -410,7 +410,13 @@ export async function buyInfo(params: {
       };
     }
     mode = 'facilitator';
-    await trackEvent({ kind: 'settled', detail: `mode=facilitator receipt=${receipt.slice(0, 24)}…`, patch: { paymentMode: 'facilitator', paymentReceipt: receipt, chainSettled: true } });
+    // ★ 链上事实需要 txHash: facilitator 说成功但没有 txHash → 不能标 chainSettled (真跑抓到过这类"假结算")
+    const txHash = parsed?.payment?.txHash || retry.headers.get('x-payment-txhash') || parsed?.txHash || '';
+    await trackEvent({
+      kind: 'settled',
+      detail: `mode=facilitator receipt=${receipt.slice(0, 24)}… txHash=${txHash ? `${String(txHash).slice(0, 16)}…` : '(缺失: 不能认定链上结算完成)'}`,
+      patch: { paymentMode: 'facilitator', paymentReceipt: receipt, chainSettled: !!txHash, ...(txHash ? { txHash: String(txHash) } : {}) },
+    });
     const report = parsed?.proof ? await verifyEnvelope(parsed, { resolveDid: params.resolveDid, expectItemId: params.expectItemId }) : undefined;
     if (report) await trackEvent({ kind: 'delivered', detail: `trust=${report.trust}`, patch: { verificationTrust: report.trust as any, contentHash: parsed?.contentHash, protocolVerified: report.trust === 'verified' } });
     return { ok: true, status: retry.status, envelope: parsed, verify: report, payment: { mode, receipt }, metadata, raw: text };

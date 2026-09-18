@@ -36,9 +36,16 @@ export interface WriteStageRecord {
   createdAt: number;
 }
 
-/** 生成唯一 stage id */
+/**
+ * 生成唯一 stage id。
+ * ★ 2026-09-18: 加**进程内单调序号** —— 原来只有 `Date.now()-随机`, 同一毫秒内的两次写入
+ * 顺序由随机后缀决定, `listStagedWrites` 的"最新在前"就不成立了 (真跑: 同毫秒 a.txt/b.txt 偶发反序,
+ * 让 write-staging 单测在全量跑时随机变红)。序号按 3 位 36 进制, 与时间戳一起保证字典序 == 发生顺序。
+ */
+let stageSeq = 0;
 function genId(): string {
-  return `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+  const seq = (stageSeq++ % 46656).toString(36).padStart(3, '0');
+  return `${Date.now()}-${seq}-${Math.random().toString(36).substring(2, 8)}`;
 }
 
 /**
@@ -75,12 +82,13 @@ export async function listStagedWrites(homeDir: string = home()): Promise<WriteS
   let files: string[];
   try { files = await fs.readdir(dir); } catch { return []; }
   const out: WriteStageRecord[] = [];
-  for (const f of files.filter(f => f.endsWith('.json')).sort().reverse()) {
+  for (const f of files.filter(f => f.endsWith('.json'))) {
     try {
       out.push(JSON.parse(await fs.readFile(path.join(dir, f), 'utf-8')) as WriteStageRecord);
     } catch { /* 坏文件跳过 */ }
   }
-  return out;
+  // 最新在前: 先按 createdAt, 同一毫秒再按 id (id 内含单调序号) —— 确定性, 不看 readdir 顺序
+  return out.sort((a, b) => (b.createdAt - a.createdAt) || String(b.id).localeCompare(String(a.id)));
 }
 
 /** 撤销最近一次写 (若文件内容仍等于 afterContent → 恢复 beforeContent). 返回是否撤销. */

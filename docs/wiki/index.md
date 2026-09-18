@@ -22,6 +22,7 @@
 | [android-agent-runtime.md](./android-agent-runtime.md) | v2 | Android Agent Runtime 架构 (Phase 1-4: Accessibility/Shizuku/本地LLM/Agent OS) |
 | [agent-economic-protocol.md](./agent-economic-protocol.md) | v2 | Agent Economic Protocol 设计 (7 协议 + bolloon 映射 + Registry/x402/Policy MVP) |
 | [durable-run-protocol.md](./durable-run-protocol.md) | v2 | Durable Run 协议 (Goal→Run→Checkpoint→Recovery 状态机 + 字段协议 + 现状盘点 + 六阶段完成度台账) |
+| [payment-recovery-protocol.md](./payment-recovery-protocol.md) | v1 | 支付中断恢复 (5 个 SIGKILL 时点 + 决策纯函数 + 先对账再重试 + 0 重复付款/0 错误 verified 验收) |
 | [executable-resource-protocol.md](./executable-resource-protocol.md) | v1 | 可执行资源协议 (输入/输出 Schema + 可执行入口 + 工具清单 + 验真/证据字段 + 能力边界 + 安装保真链 + Harness 执行) |
 | [transaction-two-layer-state.md](./transaction-two-layer-state.md) | v1 | 交易两层状态协议 (生命周期 ⊗ 结算事实 + 责任候选 + 迁移 + verified 八项门 + 写路径拒绝非法迁移) |
 | [agent-trace-sharing.md](./agent-trace-sharing.md) | v1 | 智能体工具执行轨迹与 P2P 连接信息出口 (文本/JSON 跨边界契约 + CLI/Web 接口 + 小工具边界) |

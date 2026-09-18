@@ -16,7 +16,7 @@ import {
   newTransactionId, event, type TransactionRecord, type TransactionStatus, type InfoItemMetadata,
 } from './transaction-protocol.js';
 import {
-  migrateTransactionRecord, deriveSettlementFact, checkLifecycleMove, canTransitionSettlement, isSettlementFact,
+  migrateTransactionRecord, deriveSettlementFact, checkLifecycleMove, canTransitionSettlement, isSettlementFact, hasPaymentEvidence,
   CURRENT_SCHEMA_VERSION, type SettlementFact,
 } from './settlement-state.js';
 import { sha256Hex } from './paid-info-protocol.js';
@@ -296,22 +296,50 @@ function isPidAlive(pid: number): boolean {
  *   paying + 无 txHash  → payment_pending (可安全重试: 没证据证明付过)
  *   settled/delivered/verified → 绝不重付, 只恢复交付/验真
  */
-export async function reconcilePendingTransactions(home: string = os.homedir()): Promise<{ requeued: string[]; mustNotRepay: string[] }> {
+export async function reconcilePendingTransactions(home: string = os.homedir()): Promise<{ requeued: string[]; mustNotRepay: string[]; notes: string[] }> {
   const all = await listTransactions(home);
-  const requeued: string[] = []; const mustNotRepay: string[] = [];
+  const requeued: string[] = [];
+  const mustNotRepay: string[] = [];
+  const notes: string[] = [];
   for (const t of all) {
-    if (t.status === 'paying' && !t.txHash && !t.chainSettled) {
-      await updateTransaction(t.transactionId, { status: 'payment_required', event: { kind: 'reconcile', detail: '重启对账: 没有支付证据 → 允许安全重试' } }, home);
+    const fact = isSettlementFact(t.settlementFact) ? t.settlementFact : deriveSettlementFact(t);
+    const evidence = hasPaymentEvidence({ ...t, settlementFact: fact });
+    const status = String(t.status);
+
+    // ★ Phase 3: 有支付证据 (或有链上事实) → 一律进 mustNotRepay, 而且要把事实钉死
+    if (evidence) {
+      mustNotRepay.push(t.transactionId);
+      if (fact === 'unknown' || fact === 'payment_submitted') {
+        // 有 txHash 就能确认链上结算; 没有就维持"待确认", 继续挂在对账队列
+        if (t.txHash) {
+          try { await setSettlementFact(t.transactionId, t.chainSettled ? 'payment_verified' : 'payment_verified', '对账: 发现 txHash → 结算事实升级为 payment_verified', home); } catch { /* 非法迁移则保持原值 */ }
+          notes.push(`${t.transactionId}: 发现 txHash → payment_verified (不重付)`);
+        } else {
+          notes.push(`${t.transactionId}: 有支付凭据但没有 txHash → 维持 ${fact}, 需 facilitator 澄清 (不重付)`);
+        }
+      }
+      continue;
+    }
+
+    // 没有支付证据的"付款中/待付款" → 允许安全重试 (写清对账依据)
+    if (status === 'paying' || status === 'payment_required' || fact === 'unknown') {
+      try { await setSettlementFact(t.transactionId, 'unpaid', '对账: 没有支付凭据/txHash → 确认没付过', home); } catch { /* 已是 unpaid 则忽略 */ }
+      if (status !== 'payment_required') {
+        await updateTransaction(t.transactionId, {
+          status: 'payment_required',
+          event: { kind: 'reconcile', detail: '重启对账: 没有支付证据 → 允许安全重试' },
+        }, home);
+      } else {
+        await updateTransaction(t.transactionId, { event: { kind: 'reconcile', detail: '重启对账: 仍无支付证据 → 保持 payment_required (可安全重试)' } }, home);
+      }
       await releasePaymentClaim(t.requestId, home);
       requeued.push(t.transactionId);
-    } else if ((PAID_STATUSES as readonly string[]).includes(t.status) && t.status !== 'paying') {
-      mustNotRepay.push(t.transactionId);
+      notes.push(`${t.transactionId}: 无支付证据 → payment_required + unpaid (可安全重试)`);
     }
   }
-  return { requeued, mustNotRepay };
+  return { requeued, mustNotRepay, notes };
 }
 
-/** 花钱汇总 (供 policy / 审计对账) */
 export async function spentSummary(home: string = os.homedir()): Promise<{ count: number; total: number; byMode: Record<string, number> }> {
   const all = await listTransactions(home);
   let total = 0; const byMode: Record<string, number> = {};

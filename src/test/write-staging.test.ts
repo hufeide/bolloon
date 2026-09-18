@@ -39,6 +39,17 @@ describe('write-staging (写操作准备阶段)', () => {
     expect(list[0].relPath).toBe('b.txt'); // 最新的在前
   });
 
+  it('同毫秒多次写入: 顺序确定 (最新在前) 且撤销的是最后一次', async () => {
+    const writes: string[] = [];
+    for (let i = 0; i < 6; i++) {                       // 6 次快速写入, 大概率落在同一毫秒
+      const rel = `s${i}.txt`;
+      writes.push(rel);
+      await stageWrite(rel, '', `${i}`, 'create', cwd, tmpRoot);
+    }
+    const list = await listStagedWrites(tmpRoot);
+    expect(list.map((r) => r.relPath)).toEqual([...writes].reverse());   // 最新在前, 逐条确定
+  });
+
   it('undoLastWrite 撤销最近一次写 (文件未被后续修改时)', async () => {
     const file = path.join(cwd, 't.txt');
     await fs.writeFile(file, 'v1', 'utf-8');
