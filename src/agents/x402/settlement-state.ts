@@ -368,7 +368,8 @@ export function evaluateVerifiedGate(input: VerifiedGateInput): VerifiedGateResu
   if (rec.settlementFact && rec.settlementFact !== 'fully_settled' && rec.settlementFact !== 'partially_settled') {
     missing.push(`结算事实是 ${rec.settlementFact}, 不足以判 verified`);
   }
-  const ex = input.execution ?? (rec as any).execution ?? null;
+  // 显式传 null = 调用方明确说"这次没有执行证据"; 传 undefined = 用记录里已有的
+  const ex = input.execution !== undefined ? input.execution : ((rec as any).execution ?? null);
   if (!ex) missing.push('没有资源执行证据');
   else {
     if (ex.ok !== true) missing.push(`资源执行失败${ex.reason ? ` (${ex.reason})` : ''}`);
