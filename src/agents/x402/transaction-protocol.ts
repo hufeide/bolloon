@@ -161,6 +161,13 @@ export function validatePaymentRequirements(input: {
   const m = input.metadata || {};
   const exp = input.expected || {};
   if (exp.itemId && m.itemId && exp.itemId !== m.itemId) return { ok: false, reason: `402 的 itemId (${m.itemId}) 与预期 (${exp.itemId}) 不一致` };
+  // ★ 402 自带的 itemId 也要与 metadata/预期对齐 (与 payTo/network 的检查对称):
+  //   真跑抓到过 —— 402 声称另一条资源而 metadata 正常时, 原来完全不查。
+  const rItem = String((r as any).itemId || (r as any).extra?.itemId || '');
+  if (rItem) {
+    if (m.itemId && rItem !== String(m.itemId)) return { ok: false, reason: `402 的 itemId (${rItem}) 与元数据 (${m.itemId}) 不一致 (被篡改?)` };
+    if (exp.itemId && rItem !== String(exp.itemId)) return { ok: false, reason: `402 的 itemId (${rItem}) 与预期 (${exp.itemId}) 不一致` };
+  }
   if (!r.payTo) return { ok: false, reason: '402 缺少收款地址 payTo' };
   if (m.payTo && String(r.payTo).toLowerCase() !== String(m.payTo).toLowerCase()) return { ok: false, reason: '402 的 payTo 与元数据不一致 (被篡改?)' };
   if (!r.amount) return { ok: false, reason: '402 缺少金额' };

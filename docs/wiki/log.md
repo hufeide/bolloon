@@ -2325,3 +2325,11 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
 - **验证**: `scripts/verify-settlement-responsibility.ts` **50/50 EXIT=0** (里程碑账平/浮点拒 · 部分完成不误判完成 · 全完成+链上才计入 · 失败进争议 · 证据缺口显式 · 三条禁令纯函数+写路径双验 · 收尾必须带证据 · 退款单调防绕回 · 责任 8 类 · Run 证据带里程碑/争议/责任 · 审计 API 含 404) · 单测 `milestone-settlement.test.ts` **12/12** · Phase 0 验收复跑 44/44 · 全量 vitest 175 文件 / 1989 测试全绿 · `tsc --noEmit` 0 错 · wiki 四门禁 OK。
 - **补刀 (同日): `awaitingPayment` → 唤醒 Goal 闭环** —— 对账不再只是"列出来": 交易挂 `rec.goalId` 时写 `continuation.nextAction = x402_payment_retry:<txId>` / `x402_continue:<txId>` + `autoContinue=true`, 交回 Goal 的执行器走**同一 requestId 的幂等付款路径** (Supervisor 依然一分钱没花); 争议未收尾的交易反过来写 `wakeReason=needs_human` + `needsExternal`, **不唤醒**。报告新增 `goalsWoken` / `goalsFlagged`。**顺手修真问题**: 扫描集原来只覆盖 `pendingTransactions` + 事实 `unknown`, 会漏掉停在 `discovered`/`quoted`/`delivered` 的中途交易 —— 即 leo 场景 ①(付款前被杀)与"交付该验真"的推进 (真跑抓到过: quoted 的交易根本没被扫到) → 改成覆盖**所有非终态 + 事实 unknown**, 并把 `disputed` 也纳入扫描 (只转人工, 不唤醒付款)。单测 19/19。
 - **未做 (如实)**: 里程碑**分次付款** (目前里程碑只记状态; 真按里程碑分批上链付款需要 Phase 1 的多笔真结算) · **自动退款执行** (第一版只有状态机与人工作证) · 仲裁 UI。
+
+## [2026-09-18] test | Phase 1 准备: 本地 mock facilitator 真跑四条路径 (26/26) + 修 2 个真漏洞
+
+- **动因**: 真链上等外部条件 (facilitator/私钥/充值钱包); 但 facilitator 的**协议路径**不必等 —— 用本地 mock facilitator (真 HTTP 服务, verify/settle 两端点) 先把四条结果跑实, 凭证到位时只剩"真钱那一步", 不把没验过的代码带进真链。
+- **真跑 26/26** (`scripts/verify-facilitator-paths.ts`): ① verify+settle 成功且有 txHash → 真 txHash + 回执 + `attempted` ② settle 成功但**无 txHash** → `chainSettled: !!txHash` 为 false (不能认定链上结算) ③ verify 被拒 → `verifyRejected=true` 且**不会走到 settle** ④ settle 失败 / facilitator 不可达 → `settlementUncertain=true` (先对账, 不许重付)。另含报价自洽(网络/收款地址/itemId/金额上限/网络白名单)与凭据绑定(回执不跨资源复用, 一致则放行)。
+- **真跑逼出的 2 个真漏洞 (已修 + 有断言)**: ① **facilitator 模式下凭据绑定校验根本没执行** —— 那段校验原先只在 local-dev 分支里, 而 facilitator 分支提前 `return` → 拿 A 资源的回执去买 B 资源不会被拦 (正是 leo Phase 1 清单里「itemId 与支付凭据一致」那一条) → 把绑定校验**提到分模式之前**, 两种模式都查。② **402 自带的 `itemId` 不参与自洽校验** (原来只比 `metadata.itemId`, 与 payTo/network 不对称) → 402 的 `itemId`(顶层或 `extra`) 与 metadata/预期不一致一律拒。
+- **验证**: `verify-facilitator-paths.ts` **26/26** · 既有 local-dev 闭环与全量套件见提交统计 · `tsc --noEmit` 0 错 · wiki 四门禁 OK。
+- **未覆盖 (等真链, 不装作验过)**: 余额不足 / gas 不足 / 真 RPC 对账 / 真 txHash 可查买卖双方与金额 / Base Sepolia 至少一笔 `verified`。

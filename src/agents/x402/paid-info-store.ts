@@ -229,6 +229,18 @@ export async function checkAndSettlePayment(opts: CheckPaymentOptions): Promise<
   const facilitatorUrl = opts.facilitatorUrl ?? process.env.BOLLOON_X402_FACILITATOR ?? '';
   const allowLocalDev = opts.allowLocalDev ?? (process.env.BOLLOON_X402_LOCAL_VERIFY === '1');
 
+  // ★ 凭据绑定校验必须在**分模式之前** (两种模式都查): 拿旧回执去换另一条资源 → 一律拒绝。
+  //   真跑抓到过: 这段原来只对 local-dev 生效, facilitator 模式提前 return → 跨资源复用没被拦。
+  const boundItem = payload?.accepted?.extra?.itemId || payload?.accepted?.itemId || payload?.itemId;
+  if (opts.expectedItemId) {
+    if (!boundItem) {
+      return { ok: false, mode: 'none', attempted: false, error: '支付凭据没有绑定 itemId: 无法证明这笔钱是为这条资源付的' };
+    }
+    if (String(boundItem) !== String(opts.expectedItemId)) {
+      return { ok: false, mode: 'none', attempted: false, error: `支付凭据绑定的资源 (${boundItem}) 与本次请求 (${opts.expectedItemId}) 不一致 — 回执不能跨资源复用` };
+    }
+  }
+
   if (facilitatorUrl) {
     const f = opts.fetchImpl ?? fetch;
     const body = { x402Version: 2, paymentPayload: payload, paymentRequirements: req };
@@ -249,7 +261,7 @@ export async function checkAndSettlePayment(opts: CheckPaymentOptions): Promise<
         return { ok: false, mode: 'facilitator', attempted: true, verifyRejected: false, settlementUncertain: true, error: `结算失败: ${s?.errorReason || s?.errorMessage || 'unknown'}` };
       }
       const receipt = encodePaymentResponse(s);
-      return { ok: true, mode: 'facilitator', receipt, txHash: s.transaction, payer: s.payer || v.payer, network };
+      return { ok: true, mode: 'facilitator', receipt, txHash: s.transaction, payer: s.payer || v.payer, network, attempted: true };
     } catch (e: any) {
       return { ok: false, mode: 'facilitator', attempted: true, verifyRejected: false, settlementUncertain: true, error: `facilitator 不可达: ${String(e?.message || e).slice(0, 160)}` };
     }
@@ -262,17 +274,6 @@ export async function checkAndSettlePayment(opts: CheckPaymentOptions): Promise<
       attempted: false,
       error: '未配置 facilitator (BOLLOON_X402_FACILITATOR), 也未开启本机联调模式 (BOLLOON_X402_LOCAL_VERIFY=1) — 无法校验真实付款',
     };
-  }
-
-  // 凭据绑定校验 (两种模式都查): 拿旧回执去换另一条资源 → 一律拒绝
-  const boundItem = payload?.accepted?.extra?.itemId || payload?.accepted?.itemId || payload?.itemId;
-  if (opts.expectedItemId) {
-    if (!boundItem) {
-      return { ok: false, mode: 'none', error: '支付凭据没有绑定 itemId: 无法证明这笔钱是为这条资源付的' };
-    }
-    if (String(boundItem) !== String(opts.expectedItemId)) {
-      return { ok: false, mode: 'none', error: `支付凭据绑定的资源 (${boundItem}) 与本次请求 (${opts.expectedItemId}) 不一致 — 回执不能跨资源复用` };
-    }
   }
 
   // 本机联调: 只检查 payload 声明的收款/金额与要求一致, 明确标记非链上
@@ -449,7 +450,7 @@ export async function buyInfo(params: {
   if (report) await trackEvent({ kind: 'delivered', detail: `trust=${report.trust} (本机联调)`, patch: { verificationTrust: report.trust as any, contentHash: parsed?.contentHash, protocolVerified: report.trust !== 'unverified' } });
   return {
     ok: true, status: retry.status, envelope: parsed, verify: report, metadata,
-    payment: { mode, receipt: receiptLd }, raw: text,
+    payment: { mode, receipt: receiptLd, attempted: true }, raw: text,
   };
 }
 
