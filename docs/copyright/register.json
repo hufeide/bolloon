@@ -1,0 +1,20 @@
+{
+  "$note": "软著登记基础信息 — 生成器 scripts/gen-copyright-source.ts 读这个文件。标 [必填] 的字段请按登记实际改写; 改完重跑 `npx tsx scripts/gen-copyright-source.ts --write --pdf` 即可, 页眉/材料文件名会自动更新。",
+  "softwareFullName": "Bolloon 智能体软件",
+  "softwareShortName": "Bolloon",
+  "version": "V1.0",
+  "copyrightOwner": "yuanjie liu",
+  "ownerLegalNameNote": "登记时请替换为身份证姓名 (LICENSE 署名: Copyright (c) 2026 yuanjie liu)",
+  "devLanguage": "TypeScript / JavaScript",
+  "devCompletedDate": "2026-09-17",
+  "firstPublishDate": "待填写",
+  "linesPerPage": 50,
+  "frontPages": 30,
+  "backPages": 30,
+  "docLinesPerPage": 30,
+  "docFrontPages": 30,
+  "docBackPages": 30,
+  "maxColumns": 100,
+  "includeFileMarkers": true,
+  "dropCommentOnlyLines": false
+}

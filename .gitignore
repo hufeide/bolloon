@@ -70,3 +70,6 @@ contracts/cache/
 
 # iOS/Xcode 构建产物
 build/
+
+# 软著登记: 生成物 (PDF/HTML/TXT + 报告, 可由 scripts/gen-copyright-*.ts 重出)
+docs/copyright/out/

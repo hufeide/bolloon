@@ -23,6 +23,8 @@
 | [agent-economic-protocol.md](./agent-economic-protocol.md) | v2 | Agent Economic Protocol 设计 (7 协议 + bolloon 映射 + Registry/x402/Policy MVP) |
 | [durable-run-protocol.md](./durable-run-protocol.md) | v2 | Durable Run 协议 (Goal→Run→Checkpoint→Recovery 状态机 + 字段协议 + 现状盘点 + 六阶段完成度台账) |
 | [setup-protocol.md](./setup-protocol.md) | v2 | 初始化协议 M0/M1/M4 (初始化状态机 + SetupStore 唯一事实 + 分层 readiness + 启动硬门禁 + M2–M6 计划) |
+| [copyright-registration.md](./copyright-registration.md) | v2 | 软著登记材料 (500 字主要功能 + 源程序前/后各 30 页 · 生成器/口径/自检/未闭合项) |
+
 || [log.md](./log.md) | (none) | session-by-session 变更日志 |
 
 ## 读者向页面 (docs/, audience=reader)
