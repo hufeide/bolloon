@@ -183,11 +183,9 @@ export async function updateTransaction(
   const factChanged = rest.settlementFact && String(rest.settlementFact) !== String(rec.settlementFact || '');
   const ev2 = ev || (factChanged ? { kind: `settlement:${rest.settlementFact}`, detail: '结算事实变更 (自动留痕)' } : undefined);
 
-  // ★ Phase 0: 状态迁移必须合法 —— 非法就拒绝 (抛错), 不静默修正
-  if (rest.status && String(rest.status) !== String(rec.status)) {
-    const chk = checkLifecycleMove(rec, String(rest.status));
-    if (!chk.ok) throw new IllegalTransactionTransition(chk.reason || '非法迁移', transactionId, String(rest.status));
-  }
+  // ★ Phase 0/4: 迁移必须合法 —— 非法就拒绝 (抛错), 不静默修正。
+  //   判定顺序: 先结算事实(它是状态的依据), 再状态; 两者都按**应用 patch 之后**的记录判断
+  //   (允许"结算 + 状态"在一次写里原子推进, 例如 fully_settled + verified)。
   if (rest.settlementFact && String(rest.settlementFact) !== String(rec.settlementFact || '')) {
     const from = isSettlementFact(rec.settlementFact) ? String(rec.settlementFact) : deriveSettlementFact(rec);
     const chk = canTransitionSettlement(from, String(rest.settlementFact), {
@@ -196,6 +194,11 @@ export async function updateTransaction(
       txHash: String(rec.txHash || (rest as any).txHash || ''),
     });
     if (!chk.ok) throw new IllegalTransactionTransition(chk.reason || '非法结算迁移', transactionId, `fact:${rest.settlementFact}`);
+  }
+  if (rest.status && String(rest.status) !== String(rec.status)) {
+    const effective = (rest.settlementFact ? { ...rec, settlementFact: rest.settlementFact as any } : rec) as TransactionRecord;
+    const chk = checkLifecycleMove(effective, String(rest.status));
+    if (!chk.ok) throw new IllegalTransactionTransition(chk.reason || '非法迁移', transactionId, String(rest.status));
   }
   const next: TransactionRecord = {
     ...rec,

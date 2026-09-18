@@ -16,6 +16,7 @@
 import { recordStep, readRun, addRunEvidence } from '../run-store.js';
 import { addEvidence as addGoalEvidenceViaStore } from '../goal-store.js';
 import type { TransactionRecord } from './transaction-protocol.js';
+import { aggregateMilestones, milestoneGoalEligibility } from './milestone-settlement.js';
 
 export type BridgeEvent =
   | 'transaction.discovered' | 'transaction.quoted' | 'transaction.policy_denied'
@@ -52,6 +53,8 @@ export function transactionEvidenceLines(rec: TransactionRecord): string[] {
     `verificationTrust=${rec.verificationTrust || 'unverified'}`,
     `transactionStatus=${rec.status}`,
     ...(rec.responsibility ? [`responsibility=${rec.responsibility.type}(${rec.responsibility.reason})`] : []),
+    ...(rec.milestones?.length ? (() => { const a = aggregateMilestones(rec.milestones); return [`milestones=${a.verified}/${a.total}`, `milestoneSettlement=${a.settlementFact}`]; })() : []),
+    ...(rec.dispute ? [`dispute=opened(${rec.dispute.reason})`, `disputeResolved=${rec.dispute.resolution ? rec.dispute.resolution.decision : 'no'}`] : []),
     ...(rec.execution ? [`executionOk=${rec.execution.ok === true} schemaOk=${rec.execution.schemaOk === true}`] : []),
   ];
 }
@@ -89,17 +92,19 @@ export async function bridgeTransactionToRunGoal(
 
   // Goal 侧: 只有 verified + 执行成功 + 命中判据 才计入成功证据
   if (opts.goalId) {
-    // 纵深防御: 就算有人绕过门写成 verified, 没有链上结算事实也不许进 Goal 成功证据
-    const eligible = rec.status === 'verified' && rec.chainSettled === true && opts.executionOk === true && opts.goalCriteriaHit === true;
+    // 纵深防御 + Phase 4 门槛: 链上结算 + 全部里程碑完成 + 无争议 + 执行成功 + 命中判据
+    // (partially_settled 一律不算 —— leo: 不要让 partially_settled 直接进 Goal 成功证据)
+    const elig = milestoneGoalEligibility(rec, { executionOk: opts.executionOk, goalCriteriaHit: opts.goalCriteriaHit });
+    const eligible = elig.eligible;
     try {
       if (eligible) {
         await addGoalEvidenceViaStore(opts.goalId, [
           `付费资源已执行并命中判据: ${lines.join(' ')}`,
         ]);
         out.goalEvidenceWritten = true;
-      } else if (rec.status === 'verified') {
+      } else if (rec.status === 'verified' || (rec.milestones?.length || 0) > 0) {
         await addGoalEvidenceViaStore(opts.goalId, [
-          `付费资源已验证但未命中判据 (不满足完成条件): ${lines.join(' ')}`,
+          `付费资源未达成功证据门槛 (${elig.reason}): ${lines.join(' ')}`,
         ]);
       } else {
         await addGoalEvidenceViaStore(opts.goalId, [

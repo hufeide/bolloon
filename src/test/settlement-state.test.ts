@@ -85,6 +85,7 @@ describe('Phase 0 · 生命周期迁移表', () => {
     expect([...LIFECYCLE_STATUSES]).toEqual([
       'discovered', 'quoted', 'policy_denied', 'payment_required', 'paying',
       'settled', 'delivered', 'verified', 'delivery_failed', 'verification_failed',
+      'disputed',                       // Phase 4 新增: 争议 (自动化到此为止, 钱的归宿在结算层)
     ]);
     expect([...SETTLEMENT_FACTS]).toEqual([
       'unpaid', 'payment_submitted', 'payment_verified', 'partially_settled', 'fully_settled', 'refund_pending', 'refunded', 'unknown',

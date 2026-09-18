@@ -2984,6 +2984,44 @@ ${goalDesc}
 
   // 2026-09-16: 运行记录 (持久化 harness) — 当前 + 历史 agent 运行。跨重载可读。
   // 2026-09-18: 智能体工具执行轨迹 + 本机 P2P 信息 (与小工具/名片交换用, 结构化)
+  // 2026-09-18 (Phase 4): 交易审计 — 里程碑 / 争议 / 责任 / 事件链 一眼可查
+  app.get('/api/x402/transactions', async (_req, res) => {
+    try {
+      const { listTransactions } = await import('../agents/x402/transaction-store.js');
+      const { aggregateMilestones } = await import('../agents/x402/milestone-settlement.js');
+      const txs = await listTransactions();
+      res.json({
+        count: txs.length,
+        transactions: txs.map((t: any) => ({
+          transactionId: t.transactionId, status: t.status, settlementFact: t.settlementFact,
+          itemId: t.itemId, amount: t.amount, currency: t.currency, network: t.network,
+          paymentMode: t.paymentMode, chainSettled: t.chainSettled === true, txHash: t.txHash,
+          milestones: t.milestones?.length ? aggregateMilestones(t.milestones) : null,
+          disputed: !!t.dispute, disputeResolved: t.dispute?.resolution?.decision || null,
+          responsibility: t.responsibility?.type || null,
+          partial: t.settlementFact === 'partially_settled',
+        })),
+      });
+    } catch (err) { res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) }); }
+  });
+
+  app.get('/api/x402/transactions/:id', async (req, res) => {
+    try {
+      const { readTransaction, replayTransaction } = await import('../agents/x402/transaction-store.js');
+      const { aggregateMilestones, milestoneGoalEligibility } = await import('../agents/x402/milestone-settlement.js');
+      const rec: any = await readTransaction(req.params.id);
+      if (!rec) return res.status(404).json({ error: '交易不存在' });
+      res.json({
+        transaction: rec,
+        milestones: rec.milestones?.length ? { list: rec.milestones, aggregate: aggregateMilestones(rec.milestones) } : null,
+        dispute: rec.dispute || null,
+        responsibility: rec.responsibility || null,
+        goalEligibility: milestoneGoalEligibility(rec, { executionOk: rec.execution?.ok === true, goalCriteriaHit: rec.goalCriteriaMet === true }),
+        replay: await replayTransaction(req.params.id),
+      });
+    } catch (err) { res.status(500).json({ error: String((err as Error)?.message || err).slice(0, 200) }); }
+  });
+
   app.get('/api/trace', async (req, res) => {
     try {
       const { listRuns } = await import('../agents/run-store.js');

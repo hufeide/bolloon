@@ -12,6 +12,8 @@
  */
 
 import { sha256Hex } from './paid-info-protocol.js';
+// 类型专用导入 (会被擦除, 不产生运行时循环依赖)
+import type { TransactionMilestone, DisputeRecord } from './milestone-settlement.js';
 
 // ── 资源元数据 (交易的输入侧) ────────────────────────────────────────────────
 
@@ -91,6 +93,10 @@ export interface TransactionRecord {
   schemaVersion?: number;
   /** 结算事实 (钱到底动没动): unpaid / payment_submitted / payment_verified / partially_settled / fully_settled / refund_pending / refunded / unknown */
   settlementFact?: string;
+  /** 里程碑 (分阶段服务; Phase 4) */
+  milestones?: TransactionMilestone[];
+  /** 争议记录 (Phase 4; 一旦存在 → 不许重付/不许 verified/不许静默关闭) */
+  dispute?: DisputeRecord;
   /** 责任候选 (机器只给候选, 不做赔偿判决) */
   responsibility?: { type: string; reason: string; evidence: string[] };
   /** 资源执行证据 (Phase 2: 买到的是可执行资源时才可能有) */

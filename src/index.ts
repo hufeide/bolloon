@@ -1413,6 +1413,43 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     return;
   }
 
+  // 2026-09-18 (Phase 4): /tx [transactionId] —— 交易审计 (里程碑/争议/责任/结算事实)
+  if (cmd === '/tx' || cmd.startsWith('/tx ')) {
+    const id = trimmed.slice('/tx'.length).trim().split(/\s+/).filter(Boolean)[0];
+    try {
+      const { listTransactions, readTransaction, replayTransaction } = await import('./agents/x402/transaction-store.js');
+      const MILE = await import('./agents/x402/milestone-settlement.js');
+      if (!id) {
+        const txs = await listTransactions();
+        if (!txs.length) { appendLine(`${C_DIM}还没有交易记录 (~/.bolloon/transactions/)${RESET}`); return; }
+        appendLine(`${C_DIM}最近 ${txs.length} 笔交易 (生命周期 + 结算事实 两层):${RESET}`);
+        for (const t of txs.slice(-12)) {
+          const agg = t.milestones?.length ? MILE.aggregateMilestones(t.milestones) : null;
+          appendLine(`  ${C_DIM}${t.transactionId} ${RESET}${String(t.status).padEnd(18)} 结算=${String(t.settlementFact || '?').padEnd(18)} ${t.amount || '?'} ${t.currency || ''}${agg ? ` · 里程碑 ${agg.verified}/${agg.total}` : ''}${t.dispute ? ' · ⚠争议' : ''}`);
+        }
+        appendLine(`${C_DIM}/tx <transactionId> 看完整审计 (含证据链回放)${RESET}`);
+        return;
+      }
+      const rec: any = await readTransaction(id);
+      if (!rec) { appendLine(`${C_ERROR}没有这笔交易: ${id}${RESET}`); return; }
+      appendLine(`  ${C_DIM}交易 ${rec.transactionId} · ${rec.status} · 结算 ${rec.settlementFact} · 链上=${rec.chainSettled === true} txHash=${rec.txHash || '(无)'}${RESET}`);
+      appendLine(`  ${C_DIM}资源 ${rec.itemId} · ${rec.amount} ${rec.currency} · ${rec.network} · 付款方式 ${rec.paymentMode}${RESET}`);
+      if (rec.milestones?.length) {
+        const agg = MILE.aggregateMilestones(rec.milestones);
+        appendLine(`  ${C_DIM}里程碑 ${agg.verified}/${agg.total} 完成 → ${agg.settlementFact}: ${agg.reason}${RESET}`);
+        for (const m of rec.milestones) appendLine(`    ${C_DIM}${m.milestoneId} ${m.title} ${m.amount} [付:${m.paymentStatus} 交:${m.deliveryStatus} 验:${m.verificationStatus}]${RESET}`);
+      }
+      if (rec.dispute) appendLine(`  ${C_ERROR}争议: ${rec.dispute.reason} (缺证据 ${rec.dispute.missingEvidence.length} 项, ${rec.dispute.resolution ? `已收尾: ${rec.dispute.resolution.decision}` : '未收尾'})${RESET}`);
+      if (rec.responsibility) appendLine(`  ${C_DIM}责任候选: ${rec.responsibility.type} — ${rec.responsibility.reason}${RESET}`);
+      const elig = MILE.milestoneGoalEligibility(rec, { executionOk: rec.execution?.ok === true, goalCriteriaHit: rec.goalCriteriaMet === true });
+      appendLine(`  ${C_DIM}Goal 成功证据资格: ${elig.eligible ? '✓' : '✗'} ${elig.reason}${RESET}`);
+      const lines = await replayTransaction(id);
+      appendLine(`  ${C_DIM}证据链 (${lines.length} 条):${RESET}`);
+      for (const l of lines) appendLine(`    ${C_DIM}${l}${RESET}`);
+    } catch (e: any) { appendLine(`${C_ERROR}/tx 失败: ${String(e?.message || e).slice(0, 200)}${RESET}`); }
+    return;
+  }
+
   // 2026-09-18: /trace [runId] [--json] —— 智能体工具执行轨迹 (真跑过什么工具/结果/耗时), 可复制交换
   if (cmd === '/trace' || cmd.startsWith('/trace ')) {
     const rest = trimmed.slice('/trace'.length).trim();

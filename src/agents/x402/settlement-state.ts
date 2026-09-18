@@ -33,6 +33,7 @@ export const LIFECYCLE_STATUSES = [
   'verified',
   'delivery_failed',
   'verification_failed',
+  'disputed',            // Phase 4: 争议 — 自动化到此为止, 钱的归宿在结算层 (refund_pending/refunded)
 ] as const;
 export type LifecycleStatus = typeof LIFECYCLE_STATUSES[number];
 
@@ -48,7 +49,7 @@ export function isKnownStatus(v: unknown): boolean {
 }
 
 /** 终态: 走进去就不再自动变化 (delivery_failed 不是"还能重付"的意思) */
-export const TERMINAL_LIFECYCLE: LifecycleStatus[] = ['verified', 'delivery_failed', 'verification_failed', 'policy_denied'];
+export const TERMINAL_LIFECYCLE: LifecycleStatus[] = ['verified', 'delivery_failed', 'verification_failed', 'policy_denied', 'disputed'];
 
 /**
  * 允许的迁移表。没列出来的**一律拒绝**。
@@ -63,13 +64,14 @@ const LIFECYCLE_TRANSITIONS: Record<string, string[]> = {
   policy_denied: [],
   payment_required: ['paying', 'failed', 'policy_denied'],
   // 付款中 → 结算/交付/验真各结果, 或"对账发现没付过"退回 payment_required
-  paying: ['settled', 'delivered', 'verified', 'delivery_failed', 'verification_failed', 'payment_required', 'failed'],
-  settled: ['delivered', 'verified', 'delivery_failed', 'verification_failed'],
-  delivered: ['verified', 'delivery_failed', 'verification_failed'],
+  paying: ['settled', 'delivered', 'verified', 'delivery_failed', 'verification_failed', 'payment_required', 'failed', 'disputed'],
+  settled: ['delivered', 'verified', 'delivery_failed', 'verification_failed', 'disputed'],
+  delivered: ['verified', 'delivery_failed', 'verification_failed', 'disputed'],
   verified: [],
-  delivery_failed: [],
-  verification_failed: [],
-  failed: [],           // 旧状态: 终态
+  delivery_failed: ['disputed'],          // 付了钱但没交付 → 可以进争议
+  verification_failed: ['disputed'],      // 验真不过 → 可以进争议
+  disputed: [],                           // 终态: 收尾只能通过 resolveDispute + 结算层退款状态
+  failed: [],                             // 旧状态: 终态
 };
 
 export interface TransitionCheck { ok: boolean; reason?: string; noop?: boolean }
@@ -110,6 +112,25 @@ export function checkVerifiedPreconditions(rec: TransactionRecord): TransitionCh
 }
 
 /**
+ * 争议的三条禁令 (Phase 4, leo 原话): 不能自动重付 · 不能标 verified · **不能静默关闭**。
+ * 纯函数 + 无外部依赖, 所以写路径 (`checkLifecycleMove`) 和验收都能直接用同一份判断。
+ */
+export function disputeForbids(rec: Partial<TransactionRecord>, target: string): TransitionCheck {
+  const d: any = (rec as any).dispute;
+  if (!d) return { ok: true };
+  if (target === 'paying' || target === 'payment_required') {
+    return { ok: false, reason: '争议期间不允许重新付款 (禁令 1: 不能自动重付)' };
+  }
+  if (target === 'verified') {
+    return { ok: false, reason: '争议期间不允许标 verified (禁令 2: 争议不能标成功)' };
+  }
+  if (!d.resolution && String(rec.status) === 'disputed') {
+    return { ok: false, reason: '争议只能通过 resolveDispute 显式收尾 (禁令 3: 不能静默关闭)' };
+  }
+  return { ok: true };
+}
+
+/**
  * 记录级的迁移许可 (在 from→to 表之上再加两条安全规则):
  *   ① 已经有支付证据的交易**不许**被标成普通 `failed` (钱不能凭空消失) → 该记 delivery_failed / verification_failed, 或回 payment_required 走对账
  *   ② 目标 `verified` 必须过硬证据子集 (链上结算 + 协议验真 + 哈希 + 回执绑定)
@@ -118,6 +139,8 @@ export function checkLifecycleMove(rec: TransactionRecord, to: string): Transiti
   const base = canTransitionLifecycle(String(rec.status), to);
   if (!base.ok) return base;
   if (base.noop) return base;
+  const disputeCheck = disputeForbids(rec, to);
+  if (!disputeCheck.ok) return disputeCheck;
   if (to === 'failed' && hasPaymentEvidence(rec)) {
     return { ok: false, reason: '这笔交易已有支付证据 (txHash/回执/链上结算) → 不许标成普通 failed; 应付交付失败用 delivery_failed, 验真失败用 verification_failed, 状态不明先回 payment_required 对账' };
   }
@@ -177,7 +200,10 @@ export function canTransitionSettlement(
   if (!allowed.includes(to)) {
     // 例外: 对账时拿到**链上事实** (txHash + chainSettled) 可以一步到位 fully_settled, 不必绕 payment_verified
     const chainProof = opts.chainSettled === true && !!opts.txHash;
-    if (to === 'fully_settled' && chainProof && !CHAIN_BACKED_FACTS.includes(from as SettlementFact)) {
+    // ★ 例外只对"还没到链上口径"的事实生效; 退款状态是终态, 不许被链上证据绕回结算
+    //   (真跑抓到过: refunded → fully_settled 被这条例外放行 = 钱退出去又算结算)
+    const refundTerminal = from === 'refunded' || from === 'refund_pending';
+    if (to === 'fully_settled' && chainProof && !refundTerminal && !CHAIN_BACKED_FACTS.includes(from as SettlementFact)) {
       return { ok: true };
     }
     return { ok: false, reason: `非法结算迁移 ${from} → ${to}; 允许: ${allowed.length ? allowed.join(', ') : '(无, 终态)'}${to === 'fully_settled' ? ' (一步到 fully_settled 需要链上证据: chainSettled=true + txHash)' : ''}` };
