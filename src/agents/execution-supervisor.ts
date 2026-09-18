@@ -234,6 +234,8 @@ export interface TickReport {
   owner: string;
   tick: number;
   reconciled: { interrupted: string[]; stillRunning: string[]; failed: string[] };
+  /** 2026-09-18 (Phase 3): 支付事实对账 (只对账, 绝不代替付款方花钱) */
+  payments: import('./x402/payment-recovery.js').PaymentReconcileReport;
   supervised: { stalled: string[]; failed: string[] };
   claimed: string[];
   executed: { goalId: string; runId?: string; status?: string; error?: string }[];
@@ -332,6 +334,31 @@ export class ExecutionSupervisor {
         report.reconciled = await reconcileOrphans();
         this.reconciledOnce = true;
         if (report.reconciled.interrupted.length) this.log(`[supervisor] 对账: ${report.reconciled.interrupted.length} 条僵尸 run → interrupted`);
+
+        // 1.1 (2026-09-18, Phase 3): 支付中断对账 —— 只把结算事实钉死, **绝不代替付款方花钱**
+        try {
+          const { reconcileInterruptedPayments } = await import('./x402/payment-recovery.js');
+          const home = process.env.HOME || os.homedir();
+          report.payments = await reconcileInterruptedPayments({
+            home,
+            reconcile: async (rec) => {
+              // 对账依据: 记录里既有的链上证据。查真链上历史属 Phase 1 (需 RPC/facilitator), 这里不猜。
+              if (rec.chainSettled === true && rec.txHash) return { fact: 'payment_verified', txHash: rec.txHash, note: '对账: 记录自带 txHash 与链上结算事实' };
+              if (rec.txHash) return { fact: 'payment_verified', txHash: rec.txHash, note: '对账: 发现 txHash → 结算事实升级' };
+              if (rec.paymentReceipt) return { fact: 'unknown', note: '有支付凭据但无 txHash → 维持 unknown, 需 facilitator 澄清 (不重付)' };
+              return { fact: 'unpaid', note: '没有任何支付凭据 → 确认没付过 (可安全重试)' };
+            },
+            persist: async (transactionId, patch, event) => {
+              const { updateTransaction } = await import('./x402/transaction-store.js');
+              await updateTransaction(transactionId, { ...patch, event } as any, home);
+            },
+          });
+          if (report.payments.reconciled.length || report.payments.mustNotRepay.length) {
+            this.log(`[supervisor] 支付对账: ${report.payments.reconciled.length} 条已钉结算事实 · ${report.payments.mustNotRepay.length} 条绝不重付 · ${report.payments.awaitingPayment.length} 条等付款方决定`);
+          }
+        } catch (err: any) {
+          report.payments.errors.push(String(err?.message || err).slice(0, 120));
+        }
       }
       report.supervised = await superviseRuns();
 
@@ -383,6 +410,7 @@ export class ExecutionSupervisor {
     return {
       at: new Date().toISOString(), owner: this.owner, tick: this.tickCount,
       reconciled: { interrupted: [], stillRunning: [], failed: [] },
+    payments: { scanned: 0, reconciled: [], awaitingPayment: [], mustNotRepay: [], closed: [], errors: [] },
       supervised: { stalled: [], failed: [] },
       claimed: [], executed: [], skipped: [], errors: [], dryRun: !this.runner,
     };

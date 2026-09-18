@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planTransactionRecovery, runTransactionRecovery, reconciliationIsChainBacked } from '../agents/x402/payment-recovery.js';
+import { planTransactionRecovery, runTransactionRecovery, reconciliationIsChainBacked, reconcileInterruptedPayments } from '../agents/x402/payment-recovery.js';
 import { beginTransaction, updateTransaction, readTransaction } from '../agents/x402/transaction-store.js';
 import type { TransactionRecord } from '../agents/x402/transaction-protocol.js';
 
@@ -155,5 +155,64 @@ describe('Phase 3 · 执行器 (幂等, 只有计划允许才付款)', () => {
     expect(after?.settlementFact).toBe('fully_settled');
     expect(after?.chainSettled).toBe(true);
     expect((after?.events || []).some((e) => e.kind === 'recovery_reconciled')).toBe(true);
+  });
+});
+
+describe('Phase 3 · Supervisor 对账入口 (只对账, 绝不代替付款方花钱)', () => {
+  it('没有凭据的"付款中" → 钉成 unpaid + payment_required, 并列为"等付款方决定"', async () => {
+    const { record } = await beginTransaction({ requestId: 'r-sup-1', metadata: { itemId: 'i' } as any, buyerDid: 'b', providerDid: 'p' }, HOME);
+    await updateTransaction(record.transactionId, { status: 'quoted', paymentMode: 'facilitator' }, HOME);
+    await updateTransaction(record.transactionId, { status: 'paying' }, HOME);
+
+    const persisted: string[] = [];
+    const rep = await reconcileInterruptedPayments({
+      home: HOME,
+      reconcile: async () => ({ fact: 'unpaid', note: '没有任何支付凭据' }),
+      persist: async (id, patch, ev) => { persisted.push(ev.kind); await updateTransaction(id, { ...patch, event: ev } as any, HOME); },
+    });
+    expect(rep.scanned).toBeGreaterThanOrEqual(1);
+    expect(rep.reconciled).toContain(record.transactionId);
+    expect(rep.awaitingPayment.map((x) => x.transactionId)).toContain(record.transactionId);
+    expect(persisted).toContain('supervisor_payment_reconciled');
+    const after = await readTransaction(record.transactionId, HOME);
+    expect(after?.settlementFact).toBe('unpaid');
+    expect(after?.status).toBe('payment_required');       // 推回可安全重试的状态
+  });
+
+  it('有凭据但无 txHash → 维持 unknown 且进 mustNotRepay (绝不重付)', async () => {
+    const { record } = await beginTransaction({ requestId: 'r-sup-2', metadata: { itemId: 'i' } as any, buyerDid: 'b', providerDid: 'p' }, HOME);
+    await updateTransaction(record.transactionId, { status: 'quoted', paymentMode: 'facilitator' }, HOME);
+    await updateTransaction(record.transactionId, { status: 'paying' }, HOME);
+    await updateTransaction(record.transactionId, { settlementFact: 'unknown', paymentReceipt: 'rcpt' } as any, HOME);
+
+    const rep = await reconcileInterruptedPayments({
+      home: HOME,
+      reconcile: async () => ({ fact: 'unknown', note: '有凭据但无 txHash' }),
+      persist: async (id, patch, ev) => { await updateTransaction(id, { ...patch, event: ev } as any, HOME); },
+    });
+    expect(rep.mustNotRepay).toContain(record.transactionId);
+    expect(rep.awaitingPayment.map((x) => x.transactionId)).not.toContain(record.transactionId);
+    const after = await readTransaction(record.transactionId, HOME);
+    expect(after?.settlementFact).toBe('unknown');
+  });
+
+  it('真 tick 集成: Supervisor 的 tick 会做支付对账, 且报告里能看到', async () => {
+    const prevHome = process.env.HOME;
+    process.env.HOME = HOME;          // Supervisor 对账读 process.env.HOME
+    try {
+      const { record } = await beginTransaction({ requestId: 'r-sup-tick', metadata: { itemId: 'i' } as any, buyerDid: 'b', providerDid: 'p' }, HOME);
+      await updateTransaction(record.transactionId, { status: 'quoted', paymentMode: 'facilitator' }, HOME);
+      await updateTransaction(record.transactionId, { status: 'paying' }, HOME);
+
+      const { ExecutionSupervisor } = await import('../agents/execution-supervisor.js');
+      const sup = new ExecutionSupervisor({ owner: 'test-owner', tickIntervalMs: 999_999 } as any);
+      const report = await (sup as any).tickOnce();
+      expect(report.payments).toBeTruthy();
+      expect(report.payments.scanned).toBeGreaterThanOrEqual(1);
+      expect(report.payments.reconciled).toContain(record.transactionId);
+      const after = await readTransaction(record.transactionId, HOME);
+      expect(after?.status).toBe('payment_required');
+      expect(report.payments.errors).toEqual([]);
+    } finally { process.env.HOME = prevHome; }
   });
 });

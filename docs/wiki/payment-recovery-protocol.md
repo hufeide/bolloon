@@ -77,9 +77,25 @@ unpaid + quoted/payment_required                → retry_payment (确认没付�
 - 记录丢失: 盘上交易条数 ≥ 期望; 非法迁移企图: 持久化回调的错误文件为空
 - 证据可回放: 每条交易 `replayTransaction` 均 ≥1 条事件
 
-## 6. 未做 (如实)
+## 6. Supervisor 接入 (无人值守对账, 但**不代替付款方花钱**)
 
-- **Supervisor 自动触发**: 恢复计划与执行器已就绪 (`planTransactionRecovery` / `runTransactionRecovery`), 但**还没接进 Supervisor 的 tick**
-  (即"支付中断后无人值守自动恢复"目前要显式调用) —— 这是下一步。
-- 真人 facilitator 对账: 目前 `reconcile` 只认 `txHash` 与既有凭据; 真链上对账 (查 RPC/facilitator 历史) 属 Phase 1 未做部分。
+`reconcileInterruptedPayments({home, reconcile, persist})` 已接进 `ExecutionSupervisor.tickOnce()` 的启动对账段
+(与孤儿 run 对账同一次), 结果进 `TickReport.payments`:
+
+```text
+scanned          扫了多少条未完结交易
+reconciled       钉死结算事实的 (含"确认没付过"退回 payment_required)
+awaitingPayment  可安全重试付款的 → 只列出来, 交给持钱包的一方 (agent runner / 人)
+mustNotRepay     有支付证据或结算事实 → 绝不重付
+closed           终态/无动作 (含"付了钱但没交付"→ 追责)
+```
+
+**设计取舍 (为什么 Supervisor 不自动付款)**: Supervisor 不持有钱包/私钥。让它替人花钱 = 把"恢复"变成
+"自己决定花第二笔钱", 直接违反 `payment failed ≠ safe to retry`。付款必须由**能对账、能签名**的那一方显式执行;
+Supervisor 负责的是把事实钉死 + 把该谁做列清楚 (安全方向)。
+
+## 7. 未做 (如实)
+
+- 真链上 RPC / facilitator 历史对账: 目前 `reconcile` 只认记录里既有的 `txHash` 与凭据, 不查链 (属 Phase 1)。
 - 退款/争议状态机 (`refund_pending`/`refunded`/`disputed`) 属 Phase 4。
+- `awaitingPayment` 目前只进 tick 报告; 还没做成"唤醒对应 Goal 去付款"的自动闭环。

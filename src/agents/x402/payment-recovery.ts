@@ -224,3 +224,76 @@ export function reconciliationIsChainBacked(r: { fact: SettlementFact; txHash?: 
   if (!r.txHash) return false;
   return ['payment_verified', 'partially_settled', 'fully_settled'].includes(r.fact);
 }
+
+// ── Supervisor 接入点: 只对账事实, 绝不付款 ────────────────────────────────
+
+export interface PaymentReconcileReport {
+  scanned: number;
+  reconciled: string[];                 // 对账过 (结算事实被钉死或确认没付过)
+  awaitingPayment: { transactionId: string; reason: string }[];   // 可安全重试付款, 但付款由持有钱包的一方做
+  mustNotRepay: string[];               // 有支付证据/结算事实 → 绝不重付
+  closed: { transactionId: string; reason: string }[];
+  errors: string[];
+}
+
+/**
+ * 供 Supervisor 的 tick 调用: 扫描未完结交易, **只做对账** (安全、无副作用),
+ * 把结论钉在结算事实上, 并把"可安全重试付款"的交易列出来交给持有付款能力的一方 (agent runner / 人)。
+ *
+ * 为什么这里**不付款**: Supervisor 不持有钱包/私钥。让它替人花钱是把"恢复"变成"自己决定花第二笔钱",
+ * 违反 `payment failed ≠ safe to retry` 的边界 —— 付款必须由能对账、能签名的那一方显式执行。
+ */
+export async function reconcileInterruptedPayments(opts: {
+  home: string;
+  reconcile: (rec: TransactionRecord) => Promise<{ fact: SettlementFact; txHash?: string; note?: string }>;
+  persist: (transactionId: string, patch: Record<string, unknown>, event: { kind: string; detail?: string }) => Promise<void>;
+  limit?: number;
+}): Promise<PaymentReconcileReport> {
+  const report: PaymentReconcileReport = { scanned: 0, reconciled: [], awaitingPayment: [], mustNotRepay: [], closed: [], errors: [] };
+  const { pendingTransactions, listTransactions } = await import('./transaction-store.js');
+  let all: TransactionRecord[] = [];
+  try {
+    const pending = await pendingTransactions(opts.home);
+    const unknownFact = (await listTransactions(opts.home)).filter((t) => t.settlementFact === 'unknown');
+    const seen = new Set<string>();
+    all = [...pending, ...unknownFact].filter((t) => { if (seen.has(t.transactionId)) return false; seen.add(t.transactionId); return true; });
+  } catch (err: any) {
+    report.errors.push(`读取未完结交易失败: ${String(err?.message || err).slice(0, 120)}`);
+    return report;
+  }
+  for (const rec of all.slice(0, opts.limit ?? 50)) {
+    report.scanned++;
+    const plan = planTransactionRecovery(rec);
+    try {
+      if (plan.action === 'reconcile') {
+        const r = await opts.reconcile(rec);
+        const patch: Record<string, unknown> = { settlementFact: r.fact };
+        if (r.txHash) { patch.txHash = r.txHash; patch.chainSettled = true; }
+        const backToRetry = r.fact === 'unpaid' && String(rec.status) === 'paying';
+        if (backToRetry) patch.status = 'payment_required';
+        await opts.persist(rec.transactionId, patch, {
+          kind: 'supervisor_payment_reconciled',
+          detail: `${r.note || r.fact}${r.txHash ? ` (txHash=${r.txHash.slice(0, 12)}…)` : ''}${backToRetry ? ' → payment_required (可安全重试)' : ''}`,
+        });
+        report.reconciled.push(rec.transactionId);
+        const after = { ...rec, ...patch } as TransactionRecord;
+        const nextPlan = planTransactionRecovery(after);
+        if (nextPlan.action === 'retry_payment') report.awaitingPayment.push({ transactionId: rec.transactionId, reason: nextPlan.reason });
+        else if (nextPlan.mustNotRepay) report.mustNotRepay.push(rec.transactionId);
+        continue;
+      }
+      if (plan.action === 'retry_payment') {
+        // 不需要对账就能确认"没付过" → 列出来给付款方, 这里不动钱
+        report.awaitingPayment.push({ transactionId: rec.transactionId, reason: plan.reason });
+        continue;
+      }
+      if (plan.mustNotRepay) report.mustNotRepay.push(rec.transactionId);
+      if (plan.action === 'closed' || plan.action === 'complete' || plan.action === 'wait') {
+        report.closed.push({ transactionId: rec.transactionId, reason: plan.reason });
+      }
+    } catch (err: any) {
+      report.errors.push(`${rec.transactionId}: ${String(err?.reason || err?.message || err).slice(0, 120)}`);
+    }
+  }
+  return report;
+}
