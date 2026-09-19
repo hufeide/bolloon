@@ -92,6 +92,8 @@ import {
   IdempotencyCache,
   type ToolRegistryContext,
 } from './pi-sdk-tools.js';
+import { registerContactTools } from './contacts/tools.js';
+import { ContactChain } from './contacts/chain.js';
 
 export {
   createAgentSession,
@@ -651,6 +653,13 @@ export class PiAgentSession implements AgentSession {
       },
     };
     registerBuiltinTools(toolCtx);
+    // 2026-09-19: 联系方式工具 (手机/邮箱) —— Agent 拿不到明文, 只能给 contactId;
+    //   所有调用都要过 contacts/policy (首次联系/敏感内容需人工批准, 批量永远禁止)。
+    try {
+      registerContactTools(toolCtx as any, new ContactChain({ ownerDid: this.identity?.did || 'did:bolln:local' }));
+    } catch (err) {
+      console.warn('[contacts] 注册联系工具失败 (非致命, 该能力不可用):', (err as any)?.message || err);
+    }
     registerWalletTools(toolCtx);
     setupInboxListener(toolCtx);
     // 镜像到 ToolRegistry (alias resolve 用)

@@ -15,9 +15,12 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   readGoal, setContinuation, updateGoal, listGoals, addEvidence, type GoalRecord,
+  type GoalExternalSource,
 } from './goal-store.js';
 
-export type ExternalSource = 'p2p' | 'delegate' | 'http' | 'any';
+// 2026-09-19: 新增 'contact' —— 联系方式(手机/邮箱)回复也是外部事件, 复用同一套等待/唤醒/过期/provenance 校验,
+//   不另造一套"等回信"机制 (correlation 由 requestId/continuationId 保证, 只唤醒对应 Goal)。
+export type ExternalSource = GoalExternalSource;   // 定义在 goal-store (单一事实)
 
 export interface ExternalWait {
   /** 外部请求 id (发送方生成; 回包必须带上) */

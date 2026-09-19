@@ -17,6 +17,8 @@ import { registerJudgmentsRoutes } from './routes-judgments.js';
 import { registerLlmConfigRoutes } from './routes-llm-config.js';
 import { registerExternalEngineRoutes } from './routes-external-engines.js';
 import { registerTaskRoutes } from './routes-tasks.js';
+// 2026-09-19: 联系方式 / 人工批准 / 手机—桌面配对 路由
+import { registerContactRoutes } from './routes-contacts.js';
 // 2026-09-13: 微支付信息服务 (x402) 路由
 import { registerX402InfoRoutes } from './routes-x402-info.js';
 import { loadPeerTier, recordInteraction, recordViolation, checkToolAccess, tierLabel } from '../social/dunbar-tier.js';
@@ -6690,6 +6692,10 @@ app.post('/active-channel', async (req, res) => {
 
   // 2026-07-06: Task Queue API 抽到 ./routes-tasks.ts
   registerTaskRoutes(app, { broadcast, getAgentForChannel });
+
+  // 2026-09-19: 社交身份 API (DID + 已验证联系方式 + 联系能力 + 权限 + 证据)
+  //   只返回脱敏值; 明文联系方式不进 Run/prompt/Git
+  registerContactRoutes(app, {});
 
   // 2026-09-13: 微支付信息服务 (x402) — 发布 / 402 收款 / 买方代付 / 验真
   registerX402InfoRoutes(app);

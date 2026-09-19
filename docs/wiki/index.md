@@ -31,6 +31,7 @@
 | [transaction-two-layer-state.md](./transaction-two-layer-state.md) | v1 | 交易两层状态协议 (生命周期 ⊗ 结算事实 + 责任候选 + 迁移 + verified 八项门 + 写路径拒绝非法迁移) |
 | [agent-trace-sharing.md](./agent-trace-sharing.md) | v1 | 智能体工具执行轨迹与 P2P 连接信息出口 (文本/JSON 跨边界契约 + CLI/Web 接口 + 小工具边界) |
 | [runtime-bootstrap-protocol.md](./runtime-bootstrap-protocol.md) | v2 | **运行时安装协议**: 完成定义(Node/npm/Git/Python 全部可用+可验证+路径已配) + 冻结最低版本 + 唯一管理器 + 三平台适配 + 不偷偷 sudo + PATH/配置持久化 + 真执行验证 + 安装未完成不许说成功 + Phase 0-9 台账 |
+| [contacts-protocol.md](./contacts-protocol.md) | v2 | **联系方式/社交身份**: DID + 已验证联系方式 + 联系能力 Skill + 调用权限 + 可恢复证据; 外部四状态; `~/.bolloon/contacts/` 落盘事实 (0600); 12 步 contact policy (批量永久禁止/首次联系需批/幂等/限额/任务绑定); 三通道 (local-sink 明标未外发 / http-webhook / smtp); 与 external-events 的 `contact` 来源接线 (只唤醒对应 Goal); 双端配对只同步 capability; 真跑 51/0 |
 | [update-protocol.md](./update-protocol.md) | v2 | **更新协议**: 版本身份唯一来源 + 安装方式/更新来源枚举 + 7 个检查结论 + 更新计划/风险检查 + 锁与回滚 + 更新后健康检查 + doctor + 发布硬门 + Phase 0-8 完成度台账 + 6 条行为变更 |
 | [setup-protocol.md](./setup-protocol.md) | v2 | 初始化协议 M0/M1/M4 (初始化状态机 + SetupStore 唯一事实 + 分层 readiness + 启动硬门禁 + M2–M6 计划) |
 | [copyright-registration.md](./copyright-registration.md) | v2 | 软著登记材料 (500 字主要功能 + 源程序前/后各 30 页 · 生成器/口径/自检/未闭合项) |

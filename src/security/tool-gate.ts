@@ -46,6 +46,10 @@ const TOOL_WHITELIST = new Set<string>([
   'read', 'write', 'edit_file', 'list_files',
   'list_sessions', 'get_session_state', 'list_messages',
   'send_to_channel', 'create_channel',
+  // 2026-09-19: 联系方式 (手机/邮箱) —— 高风险工具, 白名单放行后**仍要过 contact policy**
+  //   (unverified_contact / consent_revoked / batch_forbidden / rate_limited / not_bound_to_task ...)
+  'contact.list_authorized', 'contact.preview', 'contact.request_consent',
+  'contact.send', 'contact.await_reply', 'contact.revoke',
   // M2.1 (2026-06-17): 新增的 10 个 agent 工具 (跟 pi-sdk registerTools 同步)
   'write_file', 'git_diff', 'git_commit', 'git_push', 'git_branch',
   'create_task', 'update_task', 'get_task', 'list_tasks',

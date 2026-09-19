@@ -25,6 +25,10 @@ import * as crypto from 'crypto';
  * 语义: active=现在就能推进; recovering=崩溃接管中; retry_wait=等 retryAt; awaiting_external=等外部事件;
  *       stalled=失速待 Supervisor 决策; paused/needs_human=等人; completed/failed/abandoned=终态。
  */
+// 2026-09-19: 外部事件来源 (含 'contact' = 手机/邮箱回复)。定义在这里, external-events 复用,
+//   避免 goal-store ←→ external-events 循环 import。
+export type GoalExternalSource = 'p2p' | 'delegate' | 'http' | 'contact' | 'any';
+
 export type GoalStatus =
   | 'open' | 'active' | 'recovering' | 'retry_wait' | 'awaiting_external' | 'stalled'
   | 'paused' | 'needs_human' | 'completed' | 'failed' | 'abandoned';
@@ -59,7 +63,7 @@ export interface GoalContinuation {
   external?: {
     requestId: string;
     continuationId: string;
-    expectedSource: 'p2p' | 'delegate' | 'http' | 'any';
+    expectedSource: GoalExternalSource;
     expectedEvent?: string;
     createdAt: string;
     expiresAt: string;

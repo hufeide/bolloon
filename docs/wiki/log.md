@@ -4,6 +4,7 @@
 > `phase` ∈ {init / feature / fix / refactor / docs / chore / test}.
 
 | 日期 | phase | 一句话 | 关联 |
+| 2026-09-19 | feat | **联系方式与社交身份核心链 (绑定 → 受约束调用 → 进长期任务 → 等待回复 → Supervisor 恢复 → 证据回放): 真跑 51/0 (真 SMTP 服务器 + 真 HTTP 网关 + 真 express 路由 + 真 Goal/Run/Skills)** | [contacts-protocol.md](./contacts-protocol.md) / [chain.ts](../../src/agents/contacts/chain.ts) / [verify-contacts-chain.ts](../../scripts/verify-contacts-chain.ts) |
 | 2026-09-19 | release | **0.4.29 已 npm publish (EXIT=0, 1404 文件 18.1MB); 顺手修掉一直挡着发布的 electron 构建 (import.meta → TS1343)** | [update-protocol.md](./update-protocol.md) / [package.json](../../package.json) / [tsconfig.electron.json](../../tsconfig.electron.json) |
 | 2026-09-19 | test | **消融实验本轮未跑成 (环境门禁未就绪, 非功能回归): 夹具改为明确退出码 3, 不写误导报告**: 真跑 `scripts/ablation/run.ts` 时 `/message` 全部 **503** —— 根因是**初始化门禁**: 本机 setup 状态为 `connectivity_pending` (`连通性结果已过期 (>24h) → 需重测`; 另有 `234 个技能不合格` 让 agent 层不就绪)。门禁按设计**不可绕过** (`BOLLOON_SKIP_SETUP=1` 也只是诊断模式), 所以旧夹具会跑完 4 个实验再写出"工具循环 4 项全失败"的误导报告。**修法 (夹具层)**: 启动后先查 `GET /api/setup`, `gate !== 'ready'` → 打印门禁原因与两条修复命令 (`bolloon setup --test` 重测连通性 / `bolloon skills` 处理不合格技能) 并**退出码 3** (与"功能失败"=1 区分开); 同时把上一轮那份误导性 `report.md`/`results.json` **回退**到 14:04 那次真跑的结果 —— 不把环境问题伪装成功能回归。**待 leo 做**: 跑 `bolloon setup --test` (刷新连通性) + 处理不合格技能后再跑消融。 | [ablation/run.ts](../../scripts/ablation/run.ts) / [runtime-bootstrap-protocol.md](./runtime-bootstrap-protocol.md) |
 | 2026-09-19 | feat | **运行时安装协议 (Node/npm · Git · Python): 统一管理器 + 安装完成定义 + 真装一遍验收 (真跑 18/0)**: leo 计划 Phase 0-9 落地。**完成定义冻结**: **Bolloon 安装完成 = Node/npm、Git、Python 都已可执行、版本可验证、路径已配置** —— 缺任何一个, 安装**不能说成功** (退出码非 0)。**最低版本只此一处**: node≥18 / npm≥9 / git≥2.20 / python≥3.8; 平台矩阵 macOS/Linux/Windows (不在矩阵 → `unsupported`, 不假装能装)。**唯一管理器** `src/utils/runtime-bootstrap.ts`: 探测(真执行 `--version` 拿绝对路径+版本) · 包管理器识别 (brew/apt/dnf/yum/pacman/zypper/apk/winget/choco, 命令形状是**纯函数**所以能跨平台单测) · 计划 · 安装 · PATH/配置 · 验证 · 报告; `install.sh` / `postinstall` / `bolloon runtime` / `bolloon doctor` / `bolloon --version` 全读同一份事实。**策略**: 不偷偷 sudo (需要管理员权限只进计划, `allowSudo` 默认关) · 改系统前先给计划 (`runtime plan` / `install.sh --dry-run`) · 不覆盖用户已有运行时 · **macOS 无 Homebrew 时不静默装 Homebrew** (只给官方指引) · Windows 识别 App Execution Aliases 劫持 Python。**配置**: 写 `~/.bolloon/config.json` 的 `runtime.*` (只动这一个键), 配置路径只作优先候选, **每次启动重新真执行验证** (路径失效→按 PATH 重新发现)。**安装后硬验证 (不是"命令存在")**: node 真加载 CLI · npm 真读全局 · git 真建临时仓库读 status · python 真跑脚本; 报告分"安装完成/未完成"两形状 + 能力矩阵 (核心运行/源码更新/Git 协作/Python Skill/Wiki 工具)。**npm 路径一致**: postinstall **不装系统软件**但检测 Git/Python, 缺则打印"安装未完成"+ 写 `install-incomplete.json`(doctor 报降级, 补齐后自动清除) + `bolloon setup repair-runtime`。**更新纳入运行时** (Phase 8): 更新后健康检查第 8 项真执行 (Git 被删 → failed); `doctor` 增"运行时配置""能力矩阵"两项。**`--version` 展示运行时配置块** (leo 要求: 更新到最新后展示安装信息要展示这些配置): 普通版就有 Node/npm/Git/Python 的**版本+绝对路径+来源**, json 里带完整 `runtime` 字段, 配置里还没写 runtime.* 时如实标注"实时探测"。**真跑逼出的 4 个真问题 (全修)**: ① install.sh 假设刚装的 CLI 支持 `runtime` 子命令 → **旧版本没有** → 补 `BOLLOON_TARBALL` 本地 tarball 安装路径 (顺带成为发布硬门"tarball 可安装") ② 真网络 ECONNRESET 让干净安装直接失败 → npm 加 `--fetch-retries=5 --fetch-retry-maxtimeout=120000` ③ `bolloon runtime` 只看报告时也走安装流程, 打印无关的"未获得同意" ④ 验收脚本没预建 `<prefix>/lib` → install.sh 按设计回退到 `~/.npm-global`, 断言看错路径 (夹具问题, 非产品缺陷) ⑤ **真装出来的 CLI 把自己报成 `npm-local`** —— 包在 `<prefix>/lib/node_modules/@bolloon/bolloon-agent` 这种 npm 全局布局里, 但当 `npm root -g` 解析出别的目录 (安装与查询 prefix 不一致) 时安装识别只看 `npm root -g` → 误判 → 补全局布局兜底 (项目内 `node_modules/` 仍判 npm-local, 有单测) ⑥ **doctor 在全新 HOME 里假阴性**: `~/.bolloon` 还不存在就报"不可写"并据此判失败 → 改成"尚不存在但父目录可写 = degraded" (有单测)。**验证**: 单测 `src/test/runtime-bootstrap.test.ts` **32/32** + `update-system.test.ts` **53/53** · 真跑 `scripts/verify-runtime-bootstrap.ts` **20/0** (A 真探测+真执行验证 · B 配置落盘/用户字段不动/路径失效重新发现 · C dry-run 0 执行 · D 未同意 0 执行 · E 缺 Node 时拒绝静默装 Homebrew · F 老版本 git 判 failed · G 缺运行时→"安装未完成"+退出码 1 · H install.sh 只读入口不改任何东西 · **I 真装一遍: 本地 pack tarball → 真 npm → postinstall → runtime 补齐 → `--version`/`doctor` 硬验证**) · `tsc` 0 错 · wiki 门禁 OK。**未做 (如实)**: Onboard 运行时门禁 (Phase 6) · "首次执行 bolloon 再次进入 Runtime Bootstrap" · 三平台真机矩阵 (干净 macOS/Linux/Windows、无 sudo、网络失败、安装中 SIGKILL) 未验 (只有命令形状与策略层单测) | [runtime-bootstrap-protocol.md](./runtime-bootstrap-protocol.md) / [runtime-bootstrap.ts](../../src/utils/runtime-bootstrap.ts) / [install.sh](../../scripts/install.sh) / [verify-runtime-bootstrap.ts](../../scripts/verify-runtime-bootstrap.ts) |
@@ -2507,3 +2508,47 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
   夹具已改为**明确退出码 3 + 打印修复命令**, 不再写"4 项工具循环失败"的误导报告; 上一轮那份误导输出已回退到
   14:04 那次真跑结果。需要 leo 跑 `bolloon setup --test` + 处理不合格技能后再跑。
 - Android/iOS 侧版本号**未同步** (本轮没有出 APK/IPA; 商店包 versionCode 28 / iPhone 包各自独立).
+
+## [2026-09-19] feat | 联系方式 / 社交身份: 把"找到人 → 联系他 → 等待他 → 接着做"变成能力
+
+**产品边界 (leo 冻结)**: 社交身份 = **DID 主身份 + 已验证联系方式 + 联系能力 Skill + 调用权限 + 可恢复任务证据**;
+不是"公开手机号/邮箱", 也不是再做一个社交平台。第一版只做 `phone.contact` / `email.contact`。
+外部只看到四类状态 (已验证/可联系/不可联系/需要重新授权); 内部状态 `unbound/pending_verification/verified/revoked/expired/blocked` 不对外。
+
+**明确不做**: 信息流 · 公开通讯录 · 自动群发 · 推荐联系人 · 社交积分 · 全量邮箱读取 · 全量通讯录读取 · 多账号合并 · CRM · 关系图谱 ·
+自动代表用户做高风险承诺 · 联系方式替代 DID。
+
+**新代码 (全部复用既有地基, 没造第四套身份/配置)**
+- `src/agents/contacts/{types,store,providers,policy,consent,chain,tools,preview-types}.ts` (新)
+  - 模型: SocialIdentity / VerifiedContact (含 `secretRef` 而非明文密钥) / SendRecord / LedgerEntry / 四类外部状态映射
+  - 规范化与脱敏: E.164 (`region_required` 不猜国家) · 邮箱小写化 · `+86******8000` / `s******@example.com`
+  - 三个通道: `local-sink` (本地落盘,**明确标注未真实外发**) · `http-webhook` (真 HTTP + Bearer) · `smtp` (真 SMTP 会话 net/tls + AUTH LOGIN)
+  - 策略门 12 步 (批量永远禁止 · draft_only · 幂等 requestId · 每天/每任务限额 · 任务绑定 · 首次联系/敏感内容/每次确认必须人工批准)
+  - 审批与 dispatch 同 `payment-approval` 形状; 台账 12 种活动每条带 evidenceRef
+- `src/web/routes-contacts.ts` (新): 脱敏 API (绑/验/授权/撤销/预览/发送/批准/回复/配对) + 明文载荷守卫
+- `skills/phone-contact/SKILL.md` · `skills/email-contact/SKILL.md` (新): 契约字段齐 (input/outputSchema · requiredSecrets ·
+  permissionScopes · maxRecipients · rateLimit · verification · guarantees · doesNotGuarantee · replyCanWakeGoal)
+- 接线: `external-events` 新增外部来源 **`contact`** (定义在 `goal-store.GoalExternalSource`, 单一事实) ·
+  `tool-gate` 白名单放行 6 个联系工具 (**放行 ≠ 免检, 仍要过 contact policy**) · `pi-sdk.registerTools` 注册联系工具 ·
+  `server.ts` 挂载路由
+- 工具面 (Agent 拿不到明文): `contact.list_authorized/preview/request_consent/send/await_reply/revoke`
+
+**核心链真跑验收**: `npx tsx scripts/verify-contacts-chain.ts` → **51 passed / 0 failed, EXIT=0**
+真跑: 真 SMTP 服务器 (真走 220/EHLO/AUTH LOGIN/MAIL/RCPT/DATA/QUIT) · 真 HTTP 短信网关 (Bearer 鉴权) ·
+真 express 路由模块 (绑/验/预览/批准/撤销/配对全走 HTTP) · 真 Goal/Run 落盘 · 真 `SkillsManager.discover`。
+关键通过项: 验证码**取自真收到的邮件/短信** · 未批准前对方收不到 · 批准后真外发且带 `X-Bolloon-Thread` ·
+Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤醒 · 可信回复只唤醒对应 Goal (唤醒回调收到正确 goalId) ·
+**重启后新实例仍读到等待事实** · 同 requestId 不重复 · 撤销即失效且等待中的任务留 unresolved · 超时转人工 ·
+盘上无明文 (Run/Goal/ledger/consents/otp) 且事实表/秘密表 0600。单测 `src/test/contacts.test.ts` **46/46**。
+
+**真跑逼出并修掉的真 bug (5)**
+1. **SMTP 多行应答丢行** — 一条 chunk 里 `250-x\r\n250-AUTH LOGIN\r\n250 OK` 时只喂第一个等待者、其余丢弃 →
+   客户端死等超时 (表现: 一发 EHLO 就 `smtp_timeout`)。修: 行队列 + 错误/断开快速失败。
+2. **SMTP 问候语竞态** — TCP 建好瞬间服务器就发 `220`, 监听器挂晚会丢 → 先挂监听再等连接。
+3. **批准后丢执行参数** — 是否等回复/等待窗口没跟正文一起暂存 → 批准后回退默认 48h。修: `pending/<requestId>.json` 一起存。
+4. **幂等占位自撞** — 待批准时写的 `sent.json` 占位会让"批准后复检"把自己判成 `duplicate_request`。修: 不写占位, 幂等由 consent 保证。
+5. **`contacts.json` 明文副本** — 含 `normalizedValue`, 落盘改 **0600** (纵深防御)。
+
+**未做 (如实)**: 未接商用运营商/邮箱服务商 (验收用真 SMTP 服务器 + 真 HTTP 网关 = 真协议真 socket, 但不是商用通道) ·
+接收侧没有 IMAP 轮询/全量邮箱 · 手机端 UI 未改 (APK/IPA 未重出, 只提供配对/确认 API 契约与载荷守卫) ·
+无模板/附件/群发审批流 · `email.draft` 未落盘 (draft_only 只用于拒绝发送)。
