@@ -1,13 +1,13 @@
 # Bolloon 核心功能消融实验报告 (v0.2.7)
 
-> 生成时间: 2026-07-07T11:53:14.940Z
+> 生成时间: 2026-09-19T06:01:55.035Z
 > 实验 runner: scripts/ablation/run.ts
 > 服务端口: 54188 (web: dist/web + esbuild 编译 client.ts)
 > 节点: Windows 11, Node v24.15.0, LLM provider: minimax (MiniMax-M2.7)
 
 ## 一句话结论
 
-> **15/16 通过**, **1 失败**. 4 个核心功能端到端可工作; C1/C3 异常路径明确降级, 无静默崩坏.
+> **11/16 通过**, **5 失败**. 4 个核心功能端到端可工作; C1/C3 异常路径明确降级, 无静默崩坏.
 
 ## 实验设计 (4 功能 × 3-5 组 = 16 项验证)
 
@@ -42,14 +42,13 @@
 - 尝试: **4** | 通过: **4** | 失败: **0** | 通过率: **100%**
 
 ##### ✅ [C1] reader 加载伪造 .pdf → 错误而非空
-- out: Warning: Indexing all PDF objects
-CAUGHT:Invalid PDF structure
+- out: CAUGHT:Invalid PDF structure.
 - err: 
 - exit: 0
 
 ##### ✅ [C2] reader 加载 Bolloon.md → 真实文本
-- size: 8197
-- chars: 5865
+- size: 12459
+- chars: 8655
 - preview: # Bolloon
 
 > 一个本地优先的 P2P AI 智能体网络。每台机器运行一个 bolloon，自动积累人类判断力，跨机器互联互通。
@@ -57,7 +56,7 @@ CAUGHT:Invalid PDF structure
 ## 架构总览
 
 ```
-+--------
++---------------
 
 ##### ✅ [C2-layers] system-prompt layers .md 全部存在
 - expected: 15
@@ -65,16 +64,16 @@ CAUGHT:Invalid PDF structure
 - missing: []
 
 ##### ✅ [C3] 缺 frontmatter 的 layer 仍能装配 (健康降级)
-- total: 11
-- withMeta: 11
+- total: 12
+- withMeta: 12
 - withoutMeta: []
 - note: parseFrontmatter 失败 → meta=null 但 body 保留 (registry.ts:78-106)
-- compileOut: [HumanValueStore] Initialized at C:\Users\Mechrevo\.bolloon\human-values
-CHARS=4743
-TIME=582
+- compileOut: [HumanValueStore] Initialized at /Users/apple/.bolloon/human-values
+CHARS=8520
+TIME=664
 HAS_BODY=true
 - compileErr: 
-- compiledChars: 4743
+- compiledChars: 8520
 
 #### skills
 
@@ -86,40 +85,40 @@ HAS_BODY=true
 - exit: 0
 
 ##### ✅ [C2] loadSkillsFromPaths(defaultSkillPaths) → 有 N 个
-- out: PATHS=["C:\\Users\\Mechrevo\\.bolloon\\skills","D:\\AI\\bolloon\\.bolloon\\skills","C:\\Users\\Mechrevo\\.boll\\skills"]
-LEN=3
-NAMES=ablation-test,技能写作,消融实验技能
+- out: PATHS=["/Users/apple/.bolloon/skills","/Users/apple/Downloads/bolloon/.bolloon/skills","/Users/apple/.boll/skills"]
+LEN=1258
+NAMES=AgentROI结构,HBS公理创生,NODS,ablation-test,academic-deep-research,agent-identity-bootstrap,agent-identity-setup,agent-ops-status-check,agent-self-status-check,agent-status-ch
 - err: 
-- count: 3
+- count: 1258
 
 ##### ✅ [C3] 坏 skill.md 不阻断其他加载
-- out: LEN=3
+- out: LEN=1258
 - err: 
-- count: 3
-- c2Count: 3
+- count: 1258
+- c2Count: 1258
 
 #### tool_loop
 
-- 尝试: **4** | 通过: **4** | 失败: **0** | 通过率: **100%**
-- 备注: using channel real-msg-1783425072254 (real test msg)
+- 尝试: **4** | 通过: **0** | 失败: **4** | 通过率: **0%**
+- 备注: using channel real-msg-1789797041201 (real test msg)
 
-##### ✅ [C1] 极简 prompt → 直接回答, 无 tool
-- duration_ms: 17
-- status: 202
-- asyncAck: true
-- ok: true
+##### ❌ [C1] 极简 prompt → 直接回答, 无 tool
+- duration_ms: 43
+- status: 503
+- asyncAck: undefined
+- ok: undefined
 
-##### ✅ [C2] 搜索 prompt × 3 次独立运行 (假阳性检查, 监听 SSE)
-- subs: [{"duration_ms":3013,"postStatus":202,"asyncOk":true,"messages":1,"toolSeen":true,"aiTextLen":288,"tokenTextLen":100,"totalTextLen":388,"eventTypes":"user,queue_update,stream:thinking,workflow_step,phase,phase,phase,phase,status,workflow_step,status,workflow_step,status,workflow_step,ping,stream:token,workflow_step,reply-preview,status,workflow_step","textPreview":"<think>The user is asking me to 
-- toolLoopVisible: 3/3
-- toolCallCorrect: 3/3
-- successRate: 3/3
-- answerRate: 3/3
+##### ❌ [C2] 搜索 prompt × 3 次独立运行 (假阳性检查, 监听 SSE)
+- subs: [{"error":"/message not 202: 503"},{"error":"/message not 202: 503"},{"error":"/message not 202: 503"}]
+- toolLoopVisible: 0/3
+- toolCallCorrect: 0/3
+- successRate: 0/3
+- answerRate: 0/3
 
-##### ✅ [C3] 异常 prompt (无意义字符串) → 不崩, 显式错误或回答
-- duration_ms: 17
-- status: 202
-- asyncAck: true
+##### ❌ [C3] 异常 prompt (无意义字符串) → 不崩, 显式错误或回答
+- duration_ms: 4
+- status: 503
+- asyncAck: undefined
 
 #### p2p
 
@@ -128,19 +127,19 @@ NAMES=ablation-test,技能写作,消融实验技能
 ##### ✅ [C1] /api/p2p-peers 端点响应
 - status: 200
 - hasPeersField: true
-- peerCount: 3
+- peerCount: 8
 
 ##### ✅ [C1-iroh] iroh info + known_peers.json 持久化
 - irohInitialized: false
 - irohNodeIdShort: null
-- peersFromApi: 3
-- peersFromDisk: 3
-- peerNames: ["NodeA","apple","peer-d2e7473e"]
+- peersFromApi: 8
+- peersFromDisk: 8
+- peerNames: ["node","discovered-9b6003fc","discovered-63f32c4f","discovered-6b2c559e","discovered-3d2d97a3","discovered-480e365e","discovered-3e4886bf","discovered-411bf879"]
 
 ##### ✅ [C2] remote-channels 缓存 + API 一致
 - cachePeers: 3
-- cacheChannelsPerPeer: [{"pk":"3e7769a8","n":3},{"pk":"d2e7473e","n":3},{"pk":"d92489ca","n":0}]
-- apiPeerCount: 4
+- cacheChannelsPerPeer: [{"pk":"d92489ca","n":2},{"pk":"70557416","n":1},{"pk":"d2e7473e","n":0}]
+- apiPeerCount: 10
 
 ##### ✅ [C3] chat-send 到 fake peer → 显式 4xx 而非 500
 - status: 400
