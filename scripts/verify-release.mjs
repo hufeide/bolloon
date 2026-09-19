@@ -63,6 +63,14 @@ function headTarball(url) {
   });
 }
 
+/** 从可能夹着别的话的 stdout 里切出 JSON —— 「第一个 { 到最后一个 }」, 不按行首猜。 */
+function sliceJson(out) {
+  const a = out.indexOf('{');
+  const b = out.lastIndexOf('}');
+  if (a < 0 || b <= a) throw new Error('no json object in output');
+  return out.slice(a, b + 1);
+}
+
 async function main() {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   const version = (versionArg || pkg.version || '').replace(/^v/, '');
@@ -157,11 +165,12 @@ async function main() {
       check('install', 'npm install -g 真实安装成功', true, prefix);
       const entry = path.join(prefix, 'lib', 'node_modules', '@bolloon', 'bolloon-agent', 'dist', 'cli-entry.js');
       const v = spawnSync(process.execPath, [entry, '--version', 'json'], { encoding: 'utf8', timeout: 180000, maxBuffer: 8 * 1024 * 1024 });
+      // 2026-09-19 修: 原写法按"行首是 {"过滤, 而 --version json 是**多行 pretty JSON** ——
+      //   只有第一行 `{` 活下来 → JSON.parse('{') 必失败 → 门报"装完后 --version json 解析失败"。
+      //   这是**门自己的假阴性** (同一类坑早先在 update-manager 出现过一次), 现在统一按
+      //   "第一个 { 到最后一个 }" 切片解析。
       let parsed = null;
-      try {
-        const s = String(v.stdout).split('\n').filter((l) => l.trim().startsWith('{')).join('\n');
-        parsed = JSON.parse(s);
-      } catch { parsed = null; }
+      try { parsed = JSON.parse(sliceJson(String(v.stdout))); } catch { parsed = null; }
       check('install_version', '装完后 bolloon --version json 可解析且版本一致', parsed?.packageVersion === version,
         parsed ? `packageVersion=${parsed.packageVersion} installMethod=${parsed.installMethod}` : `解析失败: ${String(v.stdout).slice(0, 160)}`, true);
       const human = spawnSync(process.execPath, [entry, '--version'], { encoding: 'utf8', timeout: 180000 });
@@ -170,7 +179,7 @@ async function main() {
         String(human.stdout).split('\n').slice(0, 3).join(' | '), true);
       const plan = spawnSync(process.execPath, [entry, 'update', 'plan', 'json'], { encoding: 'utf8', timeout: 180000, maxBuffer: 16 * 1024 * 1024 });
       let planJson = null;
-      try { planJson = JSON.parse(String(plan.stdout).slice(String(plan.stdout).indexOf('{'))); } catch { planJson = null; }
+      try { planJson = JSON.parse(sliceJson(String(plan.stdout))); } catch { planJson = null; }
       check('update_plan', 'bolloon update plan 结果结构正确', !!planJson && Array.isArray(planJson.risk) && Array.isArray(planJson.willNotTouch),
         planJson ? `target=${planJson.targetVersion} blockers=${planJson.blockers.length}` : '无法解析 plan JSON', true);
     }

@@ -2491,6 +2491,11 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
   → **有 tag 也报"没有 v0.4.29 tag"** (老 tag v0.4.20 同样会被误报)。修法: 拼成同一个参数 `` `v${version}^{commit}` ``
   (annotated tag 必须 `^{commit}` 解引用才拿到提交号)。修后同一命令输出 `tag=e6d491c HEAD=e6d491c` ✅。
   教训: **门自己也会说谎** —— 门报红时先按同一个命令手跑一遍再下结论。
+- **发布门第二个假阴性 (同类坑第二次)**: `--install-check` 真装线上 tarball 后跑 `--version json`, 门却报
+  "解析失败" —— 原因是它按"行首是 `{`"过滤行, 而 `--version json` 是**多行 pretty JSON**, 只有第一行 `{` 留下 →
+  `JSON.parse('{')` 必失败。**和早先 `update-manager` 里那个"多行 JSON 被按行首 { 过滤 → 更新后验证永远判失败"
+  是同一类错**, 这次长在门自己身上。已改为统一 `sliceJson()` (第一个 `{` 到最后一个 `}`), `--version json` 与
+  `update plan json` 两处都走它。修后真装验证: npm 全局安装成功 + 普通版 `--version` 四要素齐 + `update plan` 结构正确。
 - **消融实验本轮没跑成**: 环境初始化门禁未就绪 (`connectivity_pending`, 连通性结果 >24h 过期 + 234 个技能不合格),
   夹具已改为**明确退出码 3 + 打印修复命令**, 不再写"4 项工具循环失败"的误导报告; 上一轮那份误导输出已回退到
   14:04 那次真跑结果。需要 leo 跑 `bolloon setup --test` + 处理不合格技能后再跑。
