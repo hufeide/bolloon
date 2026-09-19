@@ -60,7 +60,14 @@ export type ContactActivity =
   | 'contact.reply_untrusted'
   | 'contact.failed'
   | 'contact.revoked'
-  | 'contact.wait_expired';
+  | 'contact.wait_expired'
+  // 2026-09-19 (持久授权): 长期能力授权的生命周期
+  | 'contact.grant_created'
+  | 'contact.grant_synced'
+  | 'contact.grant_paused'
+  | 'contact.grant_resumed'
+  | 'contact.grant_revoked'
+  | 'contact.grant_sync_rejected';
 
 // ── 记录形态 ────────────────────────────────────────────────────────────────
 
@@ -136,6 +143,12 @@ export interface SendRecord {
   sentAt: string;
   failureReason?: string;
   errorClass?: ContactErrorClass;
+  /** 这次发送依据的授权 (Phase 7: 以后能回答"这条消息为什么不用再问我") */
+  grantId?: string;
+  grantVersion?: number;
+  authorizationMode?: 'one_time' | 'persistent' | 'full_contact_access';
+  approvalSkipped?: boolean;
+  policyDecision?: string;
 }
 
 export type ContactErrorClass =
@@ -257,6 +270,21 @@ export function scanSensitive(text: string): SensitiveFinding[] {
   // 银行账号: 10-17 位且上下文含"账号/account"
   if (/(账号|账户|account|iban)\D{0,6}\d{10,17}/i.test(s)) push('bank_account', '疑似银行账号');
   return out;
+}
+
+/**
+ * 永不由联系方式授权放行的内容类别 (2026-09-19, Phase 6):
+ *   凭证 / 资金指令 / 合同承诺 —— 即使 full_contact_access 也拒绝, 它们属于另一类高风险能力。
+ */
+export function scanForbidden(text: string): string[] {
+  const s = String(text || '');
+  const out = new Set<string>();
+  if (/\b(sk-[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{12,}|ghp_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{20,})\b/.test(s)) out.add('api_key');
+  if (/(密码|password|passwd|pwd)\s*[:：=]\s*\S+/i.test(s)) out.add('password');
+  if (/(账号|账户|account|iban)\D{0,6}\d{10,17}/i.test(s)) out.add('bank_account');
+  if (/(转账|打款|汇款|付款指令|支付授权|remit|wire transfer|pay\s+to|send\s+funds)/i.test(s)) out.add('payment_instruction');
+  if (/(签署合同|签订合同|签合同|同意采购|承诺下单|sign\s+(the\s+)?(contract|agreement)|binding\s+commitment)/i.test(s)) out.add('contract_commitment');
+  return [...out];
 }
 
 /** 发送前把正文里明显的口令类内容打码 (预览与证据都走这个) */

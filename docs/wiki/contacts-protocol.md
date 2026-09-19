@@ -55,6 +55,8 @@ Bolloon 的社交身份 = **DID 主身份 + 已验证联系方式 + 联系能力
 | `sent.json` | 发送台账 (requestId ↔ threadToken ↔ goalId, 摘要脱敏) | 默认 |
 | `ledger.jsonl` | 只追加的通信台账 (每条带 evidenceRef) | 默认 |
 | `outbox/` | `local-sink` 通道的真落盘发件箱 | 默认 |
+| `grants.json` | **长期能力授权** (ContactGrant, 含签名) | **0600** |
+| `devices.json` | 已登记设备公钥 (手机签名验签用) | **0600** |
 
 硬规则: **明文手机号/邮箱不进 prompt、不进 Run、不进 Goal、不进 Git**; Goal/Run 只保存 `contactId` / provider / 动作 / 状态 / 证据引用。
 
@@ -162,3 +164,128 @@ Agent 侧工具: `contact.list_authorized` · `contact.preview` · `contact.requ
 - 手机端只提供配对/确认的 API 契约与载荷守卫; 移动端 UI 未改 (APK/IPA 未重出)。
 - 一版只一个收件人 (批量永久禁止); 无模板/无附件/无群发审批流。
 - 未做 `email.draft` 落地 (draft_only 只用于拒绝发送)。
+
+## 持久能力授权 (2026-09-19 升级: consent 只管一次, grant 管长期)
+
+原先把联系方式做成"每次都要批准的工具" —— 那只解决了单次动作授权。真正的用户诉求是
+**确认一次, 以后 Agent 可以持续使用**。为此把两层概念彻底分开:
+
+| 概念 | 文件 | 语义 |
+|---|---|---|
+| 验证 | `contacts.json` 的 `verificationStatus` | 证明这个手机号/邮箱属于用户 (**不等于**长期发送权限) |
+| 能力授权 | `grants.json` | 决定 Agent **以后**能否自动使用 |
+| 一次性批准 | `consents.json` | 某一次发送 (没有长期授权时才会出现) |
+
+### "完全访问"的确切定义
+
+> 对**联系方式能力**完全授权, 而不是绕过 Bolloon 的安全边界或拿到整系统无限权限。
+
+| 授权等级 (内部) | 用户看到的选项 | 范围 |
+|---|---|---|
+| `none` | 不允许 | — |
+| `task_once` | 仅本次任务 | channels=both · verified_contacts · current_goal · normal |
+| `persistent` | **长期使用 (推荐默认)** | channels=both · verified_contacts · **all_future_goals** · normal |
+| `full_contact_access` | 完全授权联系方式能力 | channels=both · all_contacts · all_future_goals · **sensitive** |
+
+**即使完全授权也仍然保留**: 单收件人 (批量永远禁止) · 频率限制 · 任务关联 · requestId 幂等 ·
+provider 可用性检查 · 发送证据 · 撤销能力 · Harness 拦截。
+
+**永不纳入联系方式授权** (属另一类高风险能力, 任何等级都拒): 读取全部邮箱 · 读取通讯录 · 短信历史 ·
+邮箱附件 · 代签合同 · 支付/转账 · 绕过工具策略 · 读 API key 明文 · 把手机号/邮箱放进 prompt。
+
+### 内容类别三分
+
+| 类别 | 例子 | `persistent` | `full_contact_access` |
+|---|---|---|---|
+| 普通 | 商务询价、交期 | 直接发 | 直接发 |
+| 敏感 (记类别不记明文) | 身份证号、卡号、一次性验证码 | 需人工批准 | **直接发 + 强提醒式审计事件** |
+| **永不放行** | 密钥、密码、银行账号、支付/转账指令、合同承诺 | 拒绝 | 拒绝 (`forbidden_content_category`) |
+
+### Policy 顺序 (引入 Grant 后)
+
+```
+contact 存在 → 未撤销 → 已验证 → provider 已配置 → Grant 存在且 active
+→ channel 在范围内 → contact 在范围内 → task 在范围内 → content 在范围内
+→ 收件人数量 (批量永远禁止) → requestId 幂等 → daily/per-task 限额
+→ 敏感类别判定 → preview → provider send → ledger + Run/Goal evidence
+```
+
+机器可读拒绝/状态原因: `grant_missing` · `grant_revoked` · `grant_expired` · `grant_suspended` ·
+`grant_channel_denied` · `grant_recipient_denied` · `grant_task_denied` · `grant_sensitive_content_denied` ·
+`grant_device_untrusted` · `grant_version_conflict` · `grant_store_unreadable` · `forbidden_content_category`。
+
+软/硬区分 (重要): `grant_missing` / `grant_suspended` / `grant_sensitive_content_denied` 是**软**的 ——
+退回**一次性人工批准**, 不是"拒绝"; 其余是硬拒。**批准 ≠ 免检**: 批准路径执行前会**再判一次 policy**。
+
+### 授权存储损坏 → fail-closed
+
+`grants.json` 读不出来时: **拒绝自动发送**, 明确报 `grant_store_unreadable` 并要人工批准 + 修文件 ——
+既不静默当成"无权限"(那样只会重新弹批准, 用户不知道文件坏了), 也不静默当成"已授权"。
+
+### 手机 → 桌面 签名同步
+
+- Grant 由**手机设备私钥 (Ed25519)** 签名, 桌面用 `devices.json` 里登记的公钥验签才接受 → **桌面不能自铸手机授权**。
+- 规范化载荷: 固定字段顺序 (不含 `signature`/`lastUsedAt`), `payloadHash = sha256(规范载荷)`。
+- 冲突规则: **撤销优先于授权** · 低 `grantVersion` 不覆盖高版本 · 同版本内容不一致 → 拒绝 (`grant_version_conflict`)。
+- 手机撤销 (`revoke-sync`) → 桌面立即失效 (该 Grant 下等待回复的任务转人工)。
+- 只同步 capability/Grant 元数据; 明文手机号/邮箱、API key、SMTP 密码一律不同步 (含明文载荷整包拒绝)。
+
+### 证据 (Phase 7): 以后能回答"这条消息为什么不用再问我"
+
+`contact.sent` 台账 + Run/Goal 证据里带:
+
+```
+authorizationMode=one_time | persistent | full_contact_access
+grantId=<gr-…>  grantVersion=<n>  approvalSkipped=true|false  policyDecision=allowed:<grantId>:v<n>:<mode>
+```
+
+完全授权下发送敏感内容时, 额外写一条审计事件, **只记类别不记明文** (例: `id_number_cn`) + goal 引用。
+
+### 撤销 / 暂停 / 恢复 (Phase 8)
+
+```
+/contacts revoke all          # 撤销全部 (等同完全收回)
+/contacts revoke <grantId>    # 撤销单个授权
+/contacts revoke <contactId>  # 撤销单个联系方式
+/contacts pause | resume      # 暂停/恢复 (保留配置, 不丢)
+```
+
+撤销后: 立即阻止新发送 · 已发送消息不回滚 · 该授权下**正在等待回复的 Goal 转 `needs_human`** (清等待 +
+留 unresolved, Supervisor 不再自动唤醒) · 旧 Grant 不能重新启用 (要重新授权) · 历史证据保留。
+
+### 迁移 (Phase 9): 刻意保守
+
+- 已验证但没有长期 Grant → **保持每次批准**, 不自动升级
+- 已经人工批准过一次 → **不**推断为长期授权 (只能用户明确升级)
+- 老 `taskRefs` → 仍是"任务级绑定", 不扩成所有未来任务
+- `requireApprovalEachTime=true` → 保持最高优先级, 直到用户主动关
+- 已撤销的联系方式 → **绝不**迁移成 active Grant
+
+### 用户入口 (Phase 10, 只三个)
+
+```
+/contacts                    # 授权状态 + 联系方式(脱敏) + 待批准 + 正在等回复 + 最近通信
+/contacts authorize [once|long|full]   # 一次性授予 (默认 long = 长期使用)
+/contacts revoke all|<grantId>|<contactId>   # 暂停/撤销
+```
+
+CLI / Web (`/api/contacts/grants*`) / 手机读的都是同一份 `grants.json` 事实。首次授权在 Onboard/联系方式设置里
+展示**统一授权卡** (「将获得权限 / 不会获得权限 / 三个选项」), 用户不需要理解 phone.contact 与 email.contact 是两个 Skill。
+
+### 真跑验收 (2026-09-19 第二次)
+
+`npx tsx scripts/verify-contacts-chain.ts` → **83 passed / 0 failed, EXIT=0** (P/Q/R/S/T 段为本次新增)
+
+- **P 持久授权**: 一次授权 → 第二/第三个任务都不再创建待批准 (`consentId=none`) · 记录写明授权来源 · **重启后仍自动** · 台账可回放 `approvalSkipped/policyDecision`
+- **Q 签名同步 (真 Ed25519 + 真 HTTP)**: 登记手机公钥 → 接受手机签名的完全授权 · 改载荷 → 拒 (`grant_device_untrusted`) · 未登记设备 → 拒 · 低版本 → 拒 (`grant_version_conflict`) · 手机撤销 → 桌面立即失效
+- **R 完全授权边界**: 敏感内容直接发 + 审计只记类别 · 密码/密钥/转账指令/合同承诺 **四种全部拒绝**
+- **S 撤销与故障**: 撤销 → 等待中的任务转 `needs_human` + unresolved · 后续发送 `grant_denied` · **grants.json 损坏 → 拒绝自动发送 + 台账大声记下** · 迁移保守 (不凭空造授权, 已撤销跳过)
+- **T CLI**: `/contacts` 状态脱敏 · `revoke all` / `authorize long` 真生效 · 授权后立刻反映
+
+单测 `src/test/contacts.test.ts` **63/63** (新增 17 条覆盖授权等级/范围/暂停恢复/签名/迁移/损坏)。
+
+### 已知边界 (如实)
+
+- 手机端仍是**契约 + 真密码学** (脚本扮演手机设备, 真密钥对真签名过真 HTTP), 不是真机 App。
+- 完全授权下敏感内容"允许发送"依赖类别识别器的覆盖面; 识别不到的新类别会走普通路径 (这是已知取舍)。
+- 未做: 按类别单独撤销 (`allowedCategories` 白名单) · 设备级信任度衰减 · 多设备冲突自动合并 (现在撤销优先)。

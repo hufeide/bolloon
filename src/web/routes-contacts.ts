@@ -16,6 +16,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ContactChain } from '../agents/contacts/chain.js';
 import { type ContactKind } from '../agents/contacts/types.js';
+import type { ContactGrant } from '../agents/contacts/grants.js';
 
 /** 配对挑战 (一次性, 桌面生成 / 手机确认) */
 interface Pairing { pairingId: string; code: string; createdAt: number; expiresAt: number; usedAt?: number; deviceDid?: string }
@@ -275,6 +276,112 @@ export function registerContactRoutes(
           detail: `手机—桌面配对完成 (deviceDid=${p.deviceDid || '未提供'}), 接受 ${accepted.length} 项能力, 拒绝 ${rejected.length} 项`,
         }),
       });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  // ── 持久能力授权 (Phase 3/4/8/10): CLI / Web / 手机 读同一份 Grant 事实 ──────
+  app.get('/api/contacts/grants', async (req, res) => {
+    try {
+      const c = chainOf(req);
+      const summary = await c.grantsSummary();
+      res.json({
+        ok: true,
+        ...summary,
+        choices: [
+          { id: 'task_once', label: '仅本次任务' },
+          { id: 'persistent', label: '长期使用 (推荐)' },
+          { id: 'full_contact_access', label: '完全授权联系方式能力' },
+        ],
+        willNotGet: ['读取全部邮箱', '读取通讯录', '群发消息', '自动支付/转账', '代表你签署合同', '拿到手机号/邮箱明文'],
+        forbiddenAlways: ['凭证 (密钥/密码)', '银行账号', '支付/转账指令', '合同承诺'],
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  app.post('/api/contacts/grants', async (req, res) => {
+    try {
+      const c = chainOf(req);
+      const choice = ['task_once', 'persistent', 'full_contact_access'].includes(String(req.body?.choice)) ? String(req.body.choice) as any : 'persistent';
+      const r = await c.authorize({
+        choice,
+        grantedBy: String(req.body?.by || 'user'),
+        grantedVia: req.body?.via === 'mobile' ? 'mobile' : req.body?.via === 'onboard' ? 'onboard' : 'web',
+      });
+      res.json({ ok: r.ok, userLabel: r.userLabel, grant: r.grant });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  app.post('/api/contacts/grants/:id/:action', async (req, res) => {
+    try {
+      const c = chainOf(req);
+      const id = String(req.params.id);
+      const action = String(req.params.action);
+      const by = String(req.body?.by || 'user');
+      if (action === 'pause') { const r = await c.pauseGrant(id, { by }); return res.status(r.ok ? 200 : 400).json({ ok: r.ok, error: r.error, grant: r.grant }); }
+      if (action === 'resume') { const r = await c.resumeGrant(id, { by }); return res.status(r.ok ? 200 : 400).json({ ok: r.ok, error: r.error, grant: r.grant }); }
+      if (action === 'revoke') {
+        const r = await c.revokeGrant(id, { by, reason: req.body?.reason ? String(req.body.reason) : undefined });
+        return res.status(r.ok ? 200 : 400).json({ ok: r.ok, error: r.error, affectedGoals: r.affectedGoals });
+      }
+      res.status(400).json({ ok: false, error: `未知动作 ${action}` });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  app.post('/api/contacts/grants/revoke-all', async (req, res) => {
+    try {
+      const c = chainOf(req);
+      const r = await c.revokeAllGrants({ by: String(req.body?.by || 'user'), reason: req.body?.reason ? String(req.body.reason) : undefined });
+      res.json({ ok: true, ...r });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  /** 登记手机设备公钥 (配对阶段; 之后只接受它签名的授权) */
+  app.post('/api/contacts/devices', async (req, res) => {
+    try {
+      const c = chainOf(req);
+      const deviceId = String(req.body?.deviceId || '');
+      const publicKeyPem = String(req.body?.publicKeyPem || '');
+      if (!deviceId || !/BEGIN PUBLIC KEY/.test(publicKeyPem)) return res.status(400).json({ ok: false, error: 'deviceId/publicKeyPem 必填 (PEM 公钥)' });
+      const d = await c.registerDevice(deviceId, publicKeyPem, req.body?.label ? String(req.body.label) : undefined);
+      res.json({ ok: true, device: { deviceId: d.deviceId, label: d.label, registeredAt: d.registeredAt } });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  /** 手机同步签名 Grant (Phase 4): 验签 → 版本冲突 → 撤销优先 */
+  app.post('/api/contacts/grants/sync', async (req, res) => {
+    try {
+      const c = chainOf(req);
+      const incoming = req.body?.grant as ContactGrant;
+      if (!incoming?.grantId || !incoming?.signature) return res.status(400).json({ ok: false, error: '需要带签名的 grant (grantId + signature)' });
+      const r = await c.syncGrant(incoming);
+      return res.status(r.ok ? 200 : 409).json({ ok: r.ok, code: r.code, reason: r.reason, grantId: r.grant?.grantId, grantVersion: r.grant?.grantVersion });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
+  });
+
+  /** 手机撤销 → 桌面立即失效 */
+  app.post('/api/contacts/grants/revoke-sync', async (req, res) => {
+    try {
+      const c = chainOf(req);
+      const r = await c.syncRevocation(String(req.body?.grantId || ''), {
+        by: String(req.body?.by || 'mobile'),
+        reason: req.body?.reason ? String(req.body.reason) : undefined,
+        version: Number(req.body?.version) || undefined,
+      });
+      res.status(r.ok ? 200 : 400).json({ ok: r.ok, error: r.reason, grant: r.grant });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: String(err?.message || err) });
     }

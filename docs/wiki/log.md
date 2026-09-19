@@ -4,6 +4,7 @@
 > `phase` ∈ {init / feature / fix / refactor / docs / chore / test}.
 
 | 日期 | phase | 一句话 | 关联 |
+| 2026-09-19 | feat | **联系方式持久能力授权 (consent → grant): 确认一次, Agent 长期自动使用 (真跑 83/0, 含真 Ed25519 签名同步 + 撤销期间转人工 + 存储损坏 fail-closed)** | [contacts-protocol.md](./contacts-protocol.md) / [grants.ts](../../src/agents/contacts/grants.ts) / [verify-contacts-chain.ts](../../scripts/verify-contacts-chain.ts) |
 | 2026-09-19 | feat | **联系方式与社交身份核心链 (绑定 → 受约束调用 → 进长期任务 → 等待回复 → Supervisor 恢复 → 证据回放): 真跑 51/0 (真 SMTP 服务器 + 真 HTTP 网关 + 真 express 路由 + 真 Goal/Run/Skills)** | [contacts-protocol.md](./contacts-protocol.md) / [chain.ts](../../src/agents/contacts/chain.ts) / [verify-contacts-chain.ts](../../scripts/verify-contacts-chain.ts) |
 | 2026-09-19 | release | **0.4.29 已 npm publish (EXIT=0, 1404 文件 18.1MB); 顺手修掉一直挡着发布的 electron 构建 (import.meta → TS1343)** | [update-protocol.md](./update-protocol.md) / [package.json](../../package.json) / [tsconfig.electron.json](../../tsconfig.electron.json) |
 | 2026-09-19 | test | **消融实验本轮未跑成 (环境门禁未就绪, 非功能回归): 夹具改为明确退出码 3, 不写误导报告**: 真跑 `scripts/ablation/run.ts` 时 `/message` 全部 **503** —— 根因是**初始化门禁**: 本机 setup 状态为 `connectivity_pending` (`连通性结果已过期 (>24h) → 需重测`; 另有 `234 个技能不合格` 让 agent 层不就绪)。门禁按设计**不可绕过** (`BOLLOON_SKIP_SETUP=1` 也只是诊断模式), 所以旧夹具会跑完 4 个实验再写出"工具循环 4 项全失败"的误导报告。**修法 (夹具层)**: 启动后先查 `GET /api/setup`, `gate !== 'ready'` → 打印门禁原因与两条修复命令 (`bolloon setup --test` 重测连通性 / `bolloon skills` 处理不合格技能) 并**退出码 3** (与"功能失败"=1 区分开); 同时把上一轮那份误导性 `report.md`/`results.json` **回退**到 14:04 那次真跑的结果 —— 不把环境问题伪装成功能回归。**待 leo 做**: 跑 `bolloon setup --test` (刷新连通性) + 处理不合格技能后再跑消融。 | [ablation/run.ts](../../scripts/ablation/run.ts) / [runtime-bootstrap-protocol.md](./runtime-bootstrap-protocol.md) |
@@ -2552,3 +2553,37 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 **未做 (如实)**: 未接商用运营商/邮箱服务商 (验收用真 SMTP 服务器 + 真 HTTP 网关 = 真协议真 socket, 但不是商用通道) ·
 接收侧没有 IMAP 轮询/全量邮箱 · 手机端 UI 未改 (APK/IPA 未重出, 只提供配对/确认 API 契约与载荷守卫) ·
 无模板/附件/群发审批流 · `email.draft` 未落盘 (draft_only 只用于拒绝发送)。
+
+## [2026-09-19] feat | 联系方式持久能力授权: 从"每次都要批准"升级成"授权一次, 长期自动使用"
+
+**为什么要做**: 上一版只完成"单次动作授权" —— 每个任务/每条消息都要打断用户。leo 要的是**确认一次, 之后 Agent 持续使用**,
+同时不牺牲 Bolloon 的长板 (受约束 · 可恢复 · 可证明)。所以把 consent (某一次) 与 grant (长期能力) 分开, 而不是再加批准页面。
+
+**"完全访问"的定义 (冻结)**: 对 phone.contact / email.contact **完全授权**, 不是绕过系统边界。
+即使完全授权仍保留: 单收件人 · 频率限制 · 任务关联 · requestId 幂等 · provider 检查 · 发送证据 · 撤销 · Harness 拦截。
+永不纳入: 读取全量邮箱/通讯录/短信历史/附件 · 代签合同 · 支付转账 · 绕过工具策略 · 读密钥明文 · 明文联系方式进 prompt。
+
+**新增/改动**
+- `src/agents/contacts/grants.ts` (新): ContactGrant 四级授权 + 范围 (channels/contactScope/taskScope/contentScope) ·
+  Ed25519 设备密钥与**规范化载荷签名** · `evaluateGrant` (12 个机器可读原因) · GrantStore (暂停/恢复/**撤销终态**/版本单调/
+  `applySignedSync` 撤销优先 · `revokeAll`) · 迁移与摘要
+- `src/agents/contacts/cli.ts` (新): `/contacts` 状态 · `authorize [once|long|full]` · `revoke all|<id>` · 暂停/恢复 · 绑定/验证 +
+  **统一授权卡** (用户不需要理解两个 Skill)
+- `policy.ts`: 判定顺序引入 5 步 Grant 判定; 软/硬区分 (`grant_missing/suspended/sensitive_content_denied` → 退回一次性批准);
+  **覆盖范围判定**修正 (被授权覆盖时不再报误导性的"未绑定任务"); 存储损坏 → `grant_store_unreadable` fail-closed
+- `chain.ts`: authorize/pause/resume/revokeGrant/revokeAllGrants · registerDevice/syncGrant/syncRevocation · migrateLegacy ·
+  **证据写入 authorizationMode/grantId/grantVersion/approvalSkipped/policyDecision** · 撤销 → 等待中任务转 `needs_human`
+- `types.ts`: grant 生命周期活动 + `scanForbidden()` (凭证/资金指令/合同承诺) + SendRecord 记授权来源
+- `routes-contacts.ts`: `/api/contacts/grants{,/:id/:action,/revoke-all,/sync,/revoke-sync}` + `/api/contacts/devices`
+- `index.ts`: `/contacts` 斜杠命令 (读真实的 grants.json, 与 Web/手机同一份事实)
+- 测试 +17 条 (授权等级/范围/暂停恢复/签名同步/迁移/损坏), 真跑验收 +P/Q/R/S/T 五段
+
+**真跑验收**: `npx tsx scripts/verify-contacts-chain.ts` → **83 passed / 0 failed, EXIT=0**
+（真 SMTP 服务器 · 真 HTTP 网关 · 真 express 路由 · 真 Ed25519 签名同步 · 真 Goal/Run · 真 SkillsManager）
+关键项: 一次授权后第二/第三个任务都不再出现待批准 · **重启后仍自动** · 记录能回答"为什么不用再问我" ·
+篡改载荷/未登记设备/低版本/撤销后复活 **全部被拒** · 手机撤销即时失效 · 完全授权下敏感内容直接发但审计只记类别 ·
+**密码/密钥/转账指令/合同承诺四种全部拒绝** · 撤销期间的任务转人工 · `grants.json` 损坏 → 拒绝自动发送并记账 · 迁移保守。
+单测 **63/63** · tsc 0 错。
+
+**未做 (如实)**: 手机端是契约 + 真密码学 (脚本扮演手机设备; 真机 App 未改) · 未做按类别白名单撤销 (`allowedCategories`) ·
+无设备信任衰减 · 多设备冲突只实现"撤销优先" · Onboard 里的授权卡 UI 未接 (卡片文案与三选项已就绪, Web 端有 `/api/contacts/grants`).

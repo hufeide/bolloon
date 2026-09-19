@@ -2116,6 +2116,32 @@ async function processInputInner(input: string, comm: HyperswarmCommunicator | n
     return;
   }
 
+  // /contacts — 联系方式与持久授权统一入口 (2026-09-19, Phase 10)
+  //   /contacts · /contacts authorize [once|long|full] · /contacts revoke all|<id> · pause|resume · bind|verify
+  if (cmd === '/contacts' || cmd.startsWith('/contacts ')) {
+    try {
+      const { ContactChain } = await import('./agents/contacts/chain.js');
+      const { contactsCli } = await import('./agents/contacts/cli.js');
+      let ownerDid = (globalThis as any).__bolloonUserDid || 'did:bolln:local';
+      try {
+        const fsmod = await import('fs');
+        const osmod = await import('os');
+        const pmod = await import('path');
+        const uf = pmod.join(process.env.HOME || osmod.homedir(), '.bolloon', 'identity', 'user.json');
+        const j = JSON.parse(fsmod.readFileSync(uf, 'utf8'));
+        if (j?.did) ownerDid = String(j.did);
+      } catch { /* 还没有用户身份 → 本地占位 */ }
+      const chain = new ContactChain({ ownerDid, displayName: '本机用户' });
+      const rest = cmd.startsWith('/contacts ') ? cmd.slice('/contacts '.length).trim() : '';
+      const r = await contactsCli(chain, rest);
+      for (const line of r.lines) appendLine(line);
+      if (!r.ok) appendLine(`${C_WARN}命令没成功, 上面是原因${RESET}`);
+    } catch (e: any) {
+      appendLine(`${C_ERROR}/contacts 失败: ${String(e?.message || e).slice(0, 160)}${RESET}`);
+    }
+    return;
+  }
+
   // /skills [名] — 查看正式技能 (2026-08-12 Task5): 无参列全部, 带名看详情. 运行时开始前的技能 view.
   if (cmd === '/skills' || cmd.startsWith('/skills ')) {
     try {

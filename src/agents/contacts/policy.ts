@@ -9,6 +9,8 @@
  */
 
 import { readGoal } from '../goal-store.js';
+import { evaluateGrant, categoriesOf, type ContactGrant, type GrantBlockKind, type GrantLevel } from './grants.js';
+import { scanForbidden } from './types.js';
 import { type ContactsStore } from './store.js';
 import { type ContactLimits, type ContactPreview } from './preview-types.js';
 import { type SendPolicy, type VerifiedContact, scanSensitive, type SensitiveFinding } from './types.js';
@@ -26,7 +28,10 @@ export type BlockKind =
   | 'goal_closed'
   | 'policy_draft_only'
   | 'duplicate_request'
-  | 'missing_content';
+  | 'missing_content'
+  // 2026-09-19 (持久授权)
+  | 'grant_denied'                 // 硬拒: 撤销/暂停/范围外/设备不可信/版本冲突/存储损坏
+  | 'forbidden_content_category';  // 凭证/资金指令/合同承诺 —— 任何等级都不放行
 
 export interface PolicyInput {
   action: 'send' | 'preview' | 'await_reply' | 'revoke' | 'list';
@@ -42,9 +47,26 @@ export interface PolicyInput {
   requestId?: string;
 }
 
+export interface GrantFinder {
+  activeFor(ownerDid: string, now?: number): Promise<ContactGrant | null>;
+  /** 管辖 Grant (含撤销/暂停状态) —— 有它才能给出精确的 grant_revoked/grant_suspended */
+  latestFor?: (ownerDid: string) => Promise<ContactGrant | null>;
+  /** 确保 Grant 事实已载入 (corrupt 标志只有载入后才可信) */
+  ready?: () => Promise<void>;
+  corrupt?: boolean;
+}
+
 export interface PolicyDecision {
   allowed: boolean;
   requiresApproval: boolean;
+  /** 持久授权判定结果 (Phase 5) */
+  grant?: { grantId: string; level: GrantLevel; version: number };
+  grantBlock?: GrantBlockKind;
+  grantMissing?: boolean;
+  authorizationMode: 'one_time' | 'persistent' | 'full_contact_access';
+  approvalSkipped: boolean;
+  policyDecision: string;
+  forbiddenCategories: string[];
   blockKind?: BlockKind;
   reason?: string;
   /** 为什么需要批准: first_contact / sensitive_content / policy / each_time / not_auto_authorized */
@@ -79,6 +101,12 @@ export function taskAutoAuthorized(goal: { continuation?: any } | null, contact:
 
 export interface PolicyCtx {
   store: ContactsStore;
+  /** 持久授权事实 (没有 = 退回一次性批准) */
+  grants?: GrantFinder;
+  /** matching_goals 范围靠它判定 */
+  goalMatchesGrant?: (grant: ContactGrant, goalId: string) => boolean;
+  /** 设备是否可信 (同步来的 Grant 必须来自已登记设备) */
+  deviceTrusted?: (deviceId: string) => boolean;
   /** 注入: 该 contact 是否历史上成功发送过 (首次联系判定) */
   hasSentBefore?: (contactId: string) => Promise<boolean>;
   /** 注入: 这个 requestId 是否已有待批准请求 (避免重复排队) */
@@ -88,7 +116,10 @@ export interface PolicyCtx {
 
 export async function decideContactAction(input: PolicyInput, ctx: PolicyCtx): Promise<PolicyDecision> {
   const now = ctx.now ? ctx.now() : Date.now();
-  const base: PolicyDecision = { allowed: false, requiresApproval: false, sensitive: [], firstContact: false, reallySent: false };
+  const base: PolicyDecision = {
+    allowed: false, requiresApproval: false, sensitive: [], firstContact: false, reallySent: false,
+    authorizationMode: 'one_time', approvalSkipped: false, policyDecision: 'not_evaluated', forbiddenCategories: [],
+  };
 
   if (input.action === 'list') return { ...base, allowed: true };
 
@@ -128,6 +159,66 @@ export async function decideContactAction(input: PolicyInput, ctx: PolicyCtx): P
   const today = await ctx.store.countSentToday(contact.contactId, now);
   const forGoal = input.goalId ? await ctx.store.countSentForGoal(input.goalId) : 0;
   const usage = { today, todayMax: limits.dailyMax, forGoal, goalMax: limits.perTaskMax };
+  // 7.5) 持久授权判定 (Phase 5): Grant 是否存在/有效/覆盖 channel·contact·task·content
+  const forbidden = scanForbidden(`${input.subject || ''}\n${input.body || ''}`);
+  base.forbiddenCategories = forbidden;
+  const sensitiveEarly = scanSensitive(`${input.subject || ''}\n${input.body || ''}`);
+  const scope0 = contact.consentScope || { kinds: [] as string[], taskRefs: [] as string[], grantedAt: '', grantedBy: '' };
+  const limits0: ContactLimits = contact.limits || { dailyMax: 5, perTaskMax: 3, requireApprovalEachTime: false };
+  const usage0 = {
+    today: await ctx.store.countSentToday(contact.contactId, now),
+    todayMax: limits0.dailyMax,
+    forGoal: input.goalId ? await ctx.store.countSentForGoal(input.goalId) : 0,
+    goalMax: limits0.perTaskMax,
+  };
+  let grantEval: ReturnType<typeof evaluateGrant> | null = null;
+  if (ctx.grants?.ready) await ctx.grants.ready();
+  if (ctx.grants?.corrupt) {
+    // Grant 存储读不出来 → **拒绝自动发送**, 且大声说出来 (不静默当成"无权限"或"已授权")
+    base.grantBlock = 'grant_store_unreadable';
+    base.policyDecision = 'grant_store_unreadable:refuse_auto_send';
+    base.authorizationMode = 'one_time';
+    return { ...base, reallySent, usage: usage0, allowed: true, requiresApproval: true,
+      approvalReason: 'policy',
+      reason: '联系方式授权文件损坏/不可读 → 已拒绝自动发送, 需要人工批准并修复 grants.json (不会静默当成无权限或已授权)' };
+  }
+  if (ctx.grants) {
+    // 优先拿"管辖 Grant"(含撤销/暂停) 以给出精确原因; 拿不到再退到 activeFor
+    const g = ctx.grants.latestFor
+      ? await ctx.grants.latestFor(contact.ownerDid)
+      : await ctx.grants.activeFor(contact.ownerDid, now);
+    grantEval = evaluateGrant(g, {
+      ownerDid: contact.ownerDid,
+      channel: contact.kind,
+      contactId: contact.contactId,
+      contactVerified: contact.verificationStatus === 'verified',
+      contactRevoked: !!contact.revokedAt,
+      taskBoundToGoal: !!input.goalId && scope0.taskRefs.includes(input.goalId!),
+      goalId: input.goalId,
+      goalMatchesGrant: ctx.goalMatchesGrant,
+      sensitiveCategories: categoriesOf(sensitiveEarly),
+      hasForbiddenContent: forbidden.length > 0,
+      deviceTrusted: ctx.deviceTrusted,
+    }, now);
+    if (grantEval.grant) base.grant = { grantId: grantEval.grant.grantId, level: grantEval.grant.level, version: grantEval.grant.grantVersion };
+    base.authorizationMode = grantEval.authorizationMode;
+    base.approvalSkipped = grantEval.approvalSkipped;
+    base.policyDecision = grantEval.policyDecision;
+    if (!grantEval.ok) {
+      // 硬拒 (撤销/暂停/范围外/禁放行类别/设备不可信) → 直接不允许
+      // 例外: grant_missing / grant_suspended / grant_sensitive_content_denied → 退回人工批准 (不是"不允许")
+      const soft = grantEval.needsHumanApproval && (grantEval.block === 'grant_missing' || grantEval.block === 'grant_suspended' || grantEval.block === 'grant_sensitive_content_denied');
+      base.grantBlock = grantEval.block;
+      base.grantMissing = grantEval.block === 'grant_missing';
+      if (!soft) {
+        return { ...base, reallySent, usage: usage0,
+          blockKind: grantEval.block === 'forbidden_content_category' ? 'forbidden_content_category' : 'grant_denied',
+          reason: grantEval.reason };
+      }
+      base.approvalReason = grantEval.block === 'grant_sensitive_content_denied' ? 'sensitive_content' : 'policy';
+    }
+  }
+
   // 8) contact 级硬禁 (与任务无关): draft_only
   if (contact.policy === 'draft_only' && input.action === 'send') {
     return { ...base, reallySent, usage, blockKind: 'policy_draft_only', reason: '该联系方式策略为 draft_only (只允许起草, 不允许发送)' };
@@ -163,16 +254,29 @@ export async function decideContactAction(input: PolicyInput, ctx: PolicyCtx): P
   }
   const scope = contact.consentScope || { kinds: [], taskRefs: [], grantedAt: '', grantedBy: '' };
   const boundToTask = !!input.goalId && (scope.taskRefs.includes(input.goalId) || (!!input.taskKind && scope.kinds.includes(input.taskKind)) || scope.kinds.includes('any'));
-  if (input.action === 'send' && !boundToTask) {
-    return { ...base, reallySent, usage, blockKind: 'not_bound_to_task', reason: `该联系方式没有授权给任务 ${input.goalId || '(未指定)'} (未绑定任务联系人)` };
+  // "范围被授权覆盖" = 授权有效, 或只是内容敏感/暂停这类**软**情形 (软情形退回一次性人工批准,
+  //   而不是报"未绑定任务"这种会误导人的原因)
+  const SOFT_GRANT_COVER = new Set(['grant_sensitive_content_denied', 'grant_suspended']);
+  const coveredByGrant = !!(grantEval && (grantEval.ok || (!!grantEval.block && SOFT_GRANT_COVER.has(grantEval.block))));
+  if (input.action === 'send' && !boundToTask && !coveredByGrant) {
+    return { ...base, reallySent, usage, blockKind: 'not_bound_to_task',
+      reason: `该联系方式没有授权给任务 ${input.goalId || '(未指定)'} (未绑定任务联系人, 也没有覆盖它的长期授权)` };
   }
 
   // 9) 需要人工批准的几种情况
-  const sensitive = scanSensitive(`${input.subject || ''}\n${input.body || ''}`);
+  const sensitive = sensitiveEarly;
   const firstContact = !(ctx.hasSentBefore ? await ctx.hasSentBefore(contact.contactId) : (await ctx.store.listSends()).some((s) => s.contactId === contact.contactId && s.status === 'sent'));
   let requiresApproval = false;
   let approvalReason: PolicyDecision['approvalReason'];
-  if (firstContact) { requiresApproval = true; approvalReason = 'first_contact'; }
+  // 持久授权命中且允许自动发送 → 跳过人工批准 (但下面的检查一个都不少)
+  if (grantEval && grantEval.ok && grantEval.approvalSkipped) {
+    requiresApproval = false;
+    approvalReason = undefined;
+  } else if (firstContact && !(grantEval && grantEval.needsHumanApproval)) {
+    requiresApproval = true; approvalReason = 'first_contact';
+  } else if (grantEval && !grantEval.ok && grantEval.needsHumanApproval) {
+    requiresApproval = true; approvalReason = base.approvalReason || 'policy';
+  }
   else if (sensitive.length > 0) { requiresApproval = true; approvalReason = 'sensitive_content'; }
   else if (limits.requireApprovalEachTime) { requiresApproval = true; approvalReason = 'each_time'; }
   else if (contact.policy === 'send_after_approval' && !taskAutoAuthorized(goal, contact)) { requiresApproval = true; approvalReason = 'policy'; }
@@ -185,6 +289,13 @@ export async function decideContactAction(input: PolicyInput, ctx: PolicyCtx): P
     firstContact,
     reallySent,
     usage,
+    grant: base.grant,
+    grantBlock: base.grantBlock,
+    grantMissing: base.grantMissing,
+    authorizationMode: base.authorizationMode,
+    approvalSkipped: requiresApproval ? false : base.approvalSkipped,
+    policyDecision: base.policyDecision,
+    forbiddenCategories: base.forbiddenCategories,
     preview: buildPreview({ contact, input, reallySent, sensitive, firstContact, requiresApproval, approvalReason, usage, goal }),
   };
 }

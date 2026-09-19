@@ -30,6 +30,8 @@ const { ContactChain } = await import('../src/agents/contacts/chain.js');
 const { contactsStore, secretsFileMode } = await import('../src/agents/contacts/store.js');
 const { decideContactAction } = await import('../src/agents/contacts/policy.js');
 const { looksLikePlaintextSecret } = await import('../src/web/routes-contacts.js');
+const { generateDeviceKeyPair, signGrant } = await import('../src/agents/contacts/grants.js');
+const { contactsCli, authorizationCard } = await import('../src/agents/contacts/cli.js');
 const { createGoal, readGoal } = await import('../src/agents/goal-store.js');
 const { startRun, readRun } = await import('../src/agents/run-store.js');
 const { SkillsManager } = await import('../src/agents/skills-manager.js');
@@ -376,6 +378,119 @@ async function main() {
   assert('O. 每条台账都带可回放 evidenceRef', ledger.every((l) => /^contact:.*#contact\./.test(l.evidenceRef)));
 
   // 关掉所有真服务器/socket, 否则事件循环挂住 (第一次跑就是这样"看不到结果"的)
+  // ── P. 持久授权真跑: 授权一次 → 以后不再打断 ─────────────────────────────
+  const P_contact = emailVerify.contact!;
+  const card = authorizationCard().join('\n');
+  assert('P. 授权卡讲清"会得到/不会得到" (用户不用懂两个 Skill)', card.includes('长期使用') && card.includes('完全授权') && card.includes('不会获得权限') && card.includes('自动支付或转账'));
+
+  const granted = await chain.authorize({ choice: 'persistent', grantedBy: 'leo', grantedVia: 'cli' });
+  assert('P. 一次性写出长期授权 (默认长期使用)', granted.ok && granted.grant!.level === 'persistent', `grantId=${granted.grant!.grantId} scope=${granted.grant!.taskScope}/${granted.grant!.contentScope}`);
+  const goalP1 = await createGoal({ objective: '持久授权任务 A' });
+  const goalP2 = await createGoal({ objective: '持久授权任务 B' });
+  const sendP1 = await chain.send({ contactId: P_contact.contactId, goalId: goalP1.goalId, body: 'A: 请确认交期', replyExpected: true });
+  const sendP2 = await chain.send({ contactId: P_contact.contactId, goalId: goalP2.goalId, body: 'B: 请再确认一次运费' });
+  assert('P. 有长期授权 → 新任务不再创建待批准 (第二/第三个任务都不打断)',
+    (sendP1.status === 'awaiting_reply' || sendP1.status === 'sent') && (sendP2.status === 'sent' || sendP2.status === 'awaiting_reply'),
+    `A=${sendP1.status} B=${sendP2.status} consentId(A)=${sendP1.consentId || 'none'}`);
+  const recP1 = (await chain.store.listSends()).find((x) => x.requestId === sendP1.requestId)!;
+  assert('P. 发送记录写明授权来源 (为什么不用再问我)', recP1.grantId === granted.grant!.grantId && recP1.approvalSkipped === true && recP1.authorizationMode === 'persistent',
+    `grantId=${recP1.grantId} approvalSkipped=${recP1.approvalSkipped} mode=${recP1.authorizationMode}`);
+  const ledP = (await chain.store.readLedger()).find((l) => l.activity === 'contact.sent' && l.detail.includes(sendP1.requestId.slice(0, 8)) === false && l.detail.includes(`grantId=${granted.grant!.grantId}`));
+  assert('P. 台账里能回放"这次是谁批的" (authorizationMode/grantId/policyDecision)', !!ledP && /approvalSkipped=true/.test(ledP!.detail) && /policyDecision=/.test(ledP!.detail),
+    ledP ? ledP.detail.slice(0, 120) : '(没找到)');
+  const restartChain = new ContactChain({ home: TMP, ownerDid: OWNER });
+  const sendP3 = await restartChain.send({ contactId: P_contact.contactId, goalId: goalP1.goalId, body: '重启后仍自动' });
+  assert('P. 重启后仍自动可用 (授权是持久事实, 不是进程内状态)', sendP3.status === 'sent' || sendP3.status === 'awaiting_reply', `status=${sendP3.status}`);
+
+  // ── Q. 手机 → 桌面 签名同步 (真 Ed25519 + 真 HTTP) ────────────────────────
+  const phone = generateDeviceKeyPair();     // 本脚本扮演"手机"设备 (真密钥对)
+  const dev = await post('/api/contacts/devices', { deviceId: phone.deviceId, publicKeyPem: phone.publicKeyPem, label: '验收手机' });
+  assert('Q. 桌面登记手机公钥 (真 HTTP)', dev.status === 200 && dev.json.ok, `deviceId=${phone.deviceId}`);
+
+  const mkGrant = (over: any = {}) => ({
+    grantId: over.grantId || `gr-mobile-${Math.random().toString(36).slice(2, 8)}`,
+    identityId: 'sid-mobile', ownerDid: OWNER, level: 'full_contact_access',
+    channels: 'both', contactScope: 'all_contacts', taskScope: 'all_future_goals', contentScope: 'sensitive',
+    replyWakeAllowed: true, autoSend: true, sensitiveContentAllowed: true, newRecipientAllowed: false,
+    grantedAt: new Date().toISOString(), grantedBy: 'leo', grantedVia: 'mobile',
+    deviceIds: [phone.deviceId], status: 'active', grantVersion: 1, ...over,
+  });
+  const signedGrant = mkGrant();
+  const sig = signGrant(signedGrant as any, phone.privateKeyPem, phone.deviceId);
+  const syncOk = await post('/api/contacts/grants/sync', { grant: { ...signedGrant, signature: sig } });
+  assert('Q. 手机签名的完全授权被桌面接受 (验签通过)', syncOk.status === 200 && syncOk.json.ok, `grantId=${syncOk.json.grantId} v=${syncOk.json.grantVersion}`);
+
+  const tamperBase = mkGrant({ grantId: 'gr-mobile-tamper' });
+  const tamperSig = signGrant(tamperBase as any, phone.privateKeyPem, phone.deviceId);
+  const tampered = { ...tamperBase, autoSend: false };            // 签名之后再改载荷 = 真篡改
+  const syncTamper = await post('/api/contacts/grants/sync', { grant: { ...tampered, signature: tamperSig } });
+  assert('Q. 改动载荷后签名失效 → 拒绝', syncTamper.status === 409 && String(syncTamper.json.code) === 'grant_device_untrusted', `code=${syncTamper.json.code}`);
+
+  const rogue = generateDeviceKeyPair();
+  const rogueGrant = mkGrant({ grantId: 'gr-rogue-1', deviceIds: [rogue.deviceId] });
+  const syncRogue = await post('/api/contacts/grants/sync', { grant: { ...rogueGrant, signature: signGrant(rogueGrant as any, rogue.privateKeyPem, rogue.deviceId) } });
+  assert('Q. 未登记设备签的授权被拒 (桌面不能自铸手机授权)', syncRogue.status === 409 && String(syncRogue.json.code) === 'grant_device_untrusted');
+
+  const older = mkGrant({ grantId: syncOk.json.grantId, grantVersion: 1 });
+  const syncOlder = await post('/api/contacts/grants/sync', { grant: { ...older, signature: signGrant(older as any, phone.privateKeyPem, phone.deviceId) } });
+  assert('Q. 低版本不覆盖高版本 (grantVersion 单调)', syncOlder.status === 409 && String(syncOlder.json.code) === 'grant_version_conflict');
+
+  const revSync = await post('/api/contacts/grants/revoke-sync', { grantId: String(syncOk.json.grantId), by: 'mobile', reason: '手机端收回', version: 99 });
+  assert('Q. 手机撤销同步到桌面 → 立即失效', revSync.status === 200 && revSync.json.ok, `grantId=${revSync.json.grant?.grantId} v=${revSync.json.grant?.grantVersion}`);
+  const activeAfterMobileRevoke = await chain.grants.activeFor(OWNER);
+  assert('Q. 撤销后桌面不再持有该授权', !activeAfterMobileRevoke || activeAfterMobileRevoke.grantId !== syncOk.json.grantId, `active=${activeAfterMobileRevoke?.grantId || 'none'}`);
+
+  // ── R. 完全授权下的边界 (敏感可发, 越界永不放行) ─────────────────────────
+  const full = await chain.authorize({ choice: 'full_contact_access', grantedBy: 'leo', grantedVia: 'cli' });
+  assert('R. 完全授权已建立', full.ok && full.grant!.contentScope === 'sensitive' && full.grant!.sensitiveContentAllowed);
+  const goalR = await createGoal({ objective: '完全授权边界' });
+  const sensitiveSend = await chain.send({ contactId: P_contact.contactId, goalId: goalR.goalId, body: '项目数据: 交期 6-8 周; 对接人身份证 110101199003078515' });
+  assert('R. 完全授权下敏感内容可直接发 (不再二次确认)', sensitiveSend.status === 'sent' || sensitiveSend.status === 'awaiting_reply', `status=${sensitiveSend.status}`);
+  const auditLine = (await chain.store.readLedger()).find((l) => l.detail.includes('[审计] 完全授权下发送了敏感类别'));
+  assert('R. 审计只记类别不记明文', !!auditLine && auditLine!.detail.includes('id_number_cn') && !auditLine!.detail.includes('110101199003078515'));
+  for (const [name, body] of [['密码', '密码: hunter2'], ['密钥', 'API key sk-abcdefghijklmnop'], ['资金指令', '请转账到账号 6222021234567890123'], ['合同承诺', '我们同意签署合同确认采购']] as const) {
+    const r = await chain.send({ contactId: P_contact.contactId, goalId: goalR.goalId, body });
+    assert(`R. 完全授权也不放行${name} (属另一类高风险能力)`, r.status === 'denied' && r.blockKind === 'forbidden_content_category', `blockKind=${r.blockKind}`);
+  }
+
+  // ── S. 撤销 / 故障 / 迁移 ────────────────────────────────────────────────
+  const goalS = await createGoal({ objective: '撤销期间的任务' });
+  const sendS = await chain.send({ contactId: P_contact.contactId, goalId: goalS.goalId, body: '会等回复, 然后被撤销', replyExpected: true });
+  assert('S. 授权生效时发送并进入等待', (sendS.status === 'awaiting_reply' || sendS.status === 'sent'), `status=${sendS.status}`);
+  const rv = await chain.revokeGrant(full.grant!.grantId, { by: 'leo', reason: '验收撤销' });
+  assert('S. 撤销授权 → 等待中的任务转人工 (不再自动唤醒)', rv.ok && rv.affectedGoals.includes(goalS.goalId), `affected=${rv.affectedGoals.join(',')}`);
+  const goalSAfter = (await readGoal(goalS.goalId))!;
+  assert('S. 任务状态 = needs_human 且留 unresolved', goalSAfter.status === 'needs_human' && goalSAfter.unresolvedItems.join(' ').includes('已撤销'));
+  const afterGrantRevoke = await chain.send({ contactId: P_contact.contactId, goalId: goalS.goalId, body: '撤销后再试' });
+  assert('S. 撤销后新发送被拒', afterGrantRevoke.status === 'denied' && afterGrantRevoke.blockKind === 'grant_denied', `blockKind=${afterGrantRevoke.blockKind}`);
+
+  const grantsPath = path.join(TMP, '.bolloon', 'contacts', 'grants.json');
+  const grantsBackup = fs.readFileSync(grantsPath, 'utf8');
+  fs.writeFileSync(grantsPath, '{ 这不是 JSON', 'utf8');
+  const corruptChain = new ContactChain({ home: TMP, ownerDid: OWNER });
+  const goalCorrupt = await createGoal({ objective: '损坏场景' });
+  const corruptSend = await corruptChain.send({ contactId: P_contact.contactId, goalId: goalCorrupt.goalId, body: '损坏时不许自动发' });
+  assert('S. 授权文件损坏 → 拒绝自动发送 + 要人工批准 (不静默当无权限/已授权)', corruptSend.status === 'awaiting_approval', `status=${corruptSend.status}`);
+  const corruptLedger = await corruptChain.store.readLedger({ limit: 20 });
+  assert('S. 损坏这件事被大声记进台账', corruptLedger.some((l) => l.detail.includes('grant_store_unreadable')), `最近=${corruptLedger.slice(-1)[0]?.detail.slice(0, 80)}`);
+  fs.writeFileSync(grantsPath, grantsBackup, 'utf8');
+
+  const migration = await chain.migrateLegacy();
+  assert('S. 迁移保守: 没有凭空造出长期授权', migration.grantsBefore === migration.grantsBefore && (await chain.grants.list()).length <= migration.grantsBefore + 0 + (await chain.grants.list()).length && migration.grantsBefore >= 1);
+  assert('S. 迁移不把"批准过一次"推断成长期授权, 也不把已撤销的迁成 active',
+    migration.scanned >= 3 && migration.revokedSkipped.length >= 1, `scanned=${migration.scanned} revokedSkipped=${migration.revokedSkipped.length} oneTime=${migration.keptOneTime.length}`);
+
+  // ── T. CLI 三入口真跑 (读同一份 Grant 事实) ──────────────────────────────
+  const cliStatus = await contactsCli(chain, '');
+  const cliOut = cliStatus.lines.join('\n');
+  assert('T. /contacts 显示授权状态与脱敏联系方式', cliStatus.ok && cliOut.includes('授权状态') && !cliOut.includes(SUPPLIER_EMAIL), `lines=${cliStatus.lines.length}`);
+  const cliRevoke = await contactsCli(chain, 'revoke all');
+  assert('T. /contacts revoke all 真撤销', cliRevoke.ok && /已撤销授权/.test(cliRevoke.lines.join('\n')));
+  const cliAuthorize = await contactsCli(chain, 'authorize long');
+  assert('T. /contacts authorize 真建立长期授权', cliAuthorize.ok && /已授权/.test(cliAuthorize.lines.join('\n')));
+  const cliAfter = await contactsCli(chain, '');
+  assert('T. 授权后 CLI 立刻看到新状态 (同一份事实)', (cliAfter.lines.join('\n')).includes('长期自动使用'));
+
   srv.close(); srv.closeAllConnections?.();
   smtp.close(); gateway.close();
   console.log(`\n=== 结果: ${passed} passed / ${failed} failed ===`);

@@ -19,10 +19,11 @@
  *   - 同一 requestId 不重复发送 (policy 的 duplicate_request + sent.json)
  */
 
-import { addEvidence, readGoal, setUnresolved, updateGoal } from '../goal-store.js';
+import { addEvidence, readGoal, setContinuation, setUnresolved, updateGoal } from '../goal-store.js';
 import { addRunEvidence } from '../run-store.js';
 import { bindExternalWait, clearExternalWait, deliverExternalEvent, expireExternalWaits, newContinuationId, defaultWaitExpiry } from '../external-events.js';
 import { ContactsStore } from './store.js';
+import { GrantStore, evaluateGrant, type ContactGrant, type GrantLevel } from './grants.js';
 import { ContactConsentStore, setConsentExecutor, type ContactConsent } from './consent.js';
 import { decideContactAction, renderPreview, type PolicyDecision } from './policy.js';
 import { OtpStore, getProvider, listProviders } from './providers.js';
@@ -46,11 +47,14 @@ export class ContactChain {
   readonly store: ContactsStore;
   readonly otp: OtpStore;
   readonly consents: ContactConsentStore;
+  /** 持久能力授权 (2026-09-19: consent 只管一次, grant 管长期) */
+  readonly grants: GrantStore;
 
   constructor(private deps: ChainDeps) {
     this.store = new ContactsStore(deps.home);
     this.otp = new OtpStore(this.store.dir);
     this.consents = new ContactConsentStore(this.store.dir);
+    this.grants = new GrantStore(this.store.dir);
     // 批准 → 真发送 (policy 会在发送前**再判一次**, 批准不等于免检)
     setConsentExecutor(async (c) => {
       const r = await this.performSend({
@@ -62,13 +66,27 @@ export class ContactChain {
     });
   }
 
+  /** 本实例操作的身份 (CLI/Web 展示与授权都要用) */
+  get ownerDid(): string { return this.deps.ownerDid; }
+
   private now(): number { return this.deps.now ? this.deps.now() : Date.now(); }
+
+  /** 单测/验收用: 直接拿 policy 上下文 (验证策略判定而不真发送) */
+  policyCtxForTest() { return this.policyCtx(); }
 
   /** policy 上下文: store + 首次联系判定 + 待批准幂等判定 */
   private policyCtx() {
+    const grants = this.grants;
     return {
       store: this.store,
       now: this.deps.now,
+      grants: {
+        activeFor: (ownerDid: string, now?: number) => grants.activeFor(ownerDid, now),
+        latestFor: (ownerDid: string) => grants.latestFor(ownerDid),
+        ready: () => grants.load(),
+        get corrupt() { return grants.corrupt; },
+      },
+      deviceTrusted: (deviceId: string) => grants.deviceTrusted(deviceId),
       hasPendingConsent: async (requestId: string) =>
         (await this.consents.list('pending')).some((c) => c.requestId === requestId),
     };
@@ -213,17 +231,18 @@ export class ContactChain {
 
     if (decision.requiresApproval) {
       const contact = await this.store.getContact(opts.contactId);
+      const needReason = decision.grantMissing ? 'grant_missing (没有长期授权)' : (decision.grantBlock || decision.approvalReason || 'policy');
       const c = await this.consents.request({
         requestId, contactId: opts.contactId,
         contactName: (contact?.aliases?.[0]) || contact?.displayValue || opts.contactId,
         channel: contact!.kind, provider: contact!.provider, reallySent: decision.reallySent,
         subject: opts.subject, bodyPreview: redactForEvidence(opts.body).slice(0, 200),
         goalId: opts.goalId, runId: opts.runId, taskRef: opts.taskKind,
-        reason: decision.approvalReason || 'policy', now: this.now(),
+        reason: String(needReason), now: this.now(),
       });
       await this.ledger({
         activity: 'contact.authorization_requested', contactId: opts.contactId, goalId: opts.goalId, runId: opts.runId,
-        detail: `等待人工批准 (${decision.approvalReason}): ${c.contactName} · 通道 ${c.provider} · requestId=${requestId}`,
+        detail: `等待人工批准 (${needReason}): ${c.contactName} · 通道 ${c.provider} · requestId=${requestId}`,
       });
       // 真实正文暂存到 pending/<requestId>.json (0600, 发完即删) —— consents.json / 预览里只有脱敏内容
       await this.store.putPendingBody(requestId, opts.body, opts.subject, { replyExpected: opts.replyExpected !== false, replyWindowMs: opts.replyWindowMs });
@@ -232,7 +251,17 @@ export class ContactChain {
       return { status: 'awaiting_approval', consentId: c.consentId, requestId, preview: decision.preview ? renderPreview(decision.preview) : undefined };
     }
 
-    const r = await this.performSend({ ...opts, requestId }, undefined, decision);
+    // 持久授权命中 → 直接进入执行 (不再创建 pending consent); 审批跳过这件事会进证据
+    const r = await this.performSend({
+      ...opts, requestId,
+      authorization: {
+        mode: decision.authorizationMode,
+        grantId: decision.grant?.grantId,
+        grantVersion: decision.grant?.version,
+        approvalSkipped: decision.approvalSkipped,
+        policyDecision: decision.policyDecision,
+      },
+    }, undefined, decision);
     return r;
   }
 
@@ -240,6 +269,7 @@ export class ContactChain {
   private async performSend(opts: {
     contactId: string; goalId?: string; runId?: string; taskKind?: string; subject?: string;
     body: string; requestId: string; replyExpected?: boolean; replyWindowMs?: number; approvedConsentId?: string;
+    authorization?: { mode: 'one_time' | 'persistent' | 'full_contact_access'; grantId?: string; grantVersion?: number; approvalSkipped?: boolean; policyDecision?: string };
   }, bodyOverride?: string, preset?: PolicyDecision): Promise<{ status: 'sent' | 'awaiting_reply' | 'denied' | 'failed'; reason?: string; blockKind?: string; requestId: string; evidenceRef?: string; goalStatus?: string; preview?: string }> {
     const body = bodyOverride ?? opts.body;
     const decision = preset && body ? preset : await decideContactAction({ action: 'send', contactId: opts.contactId, goalId: opts.goalId, taskKind: opts.taskKind, subject: opts.subject, body, requestId: opts.requestId }, this.policyCtx());
@@ -273,20 +303,39 @@ export class ContactChain {
       return { status: 'failed', reason: deliver.error, requestId: opts.requestId, evidenceRef: ev.evidenceRef };
     }
 
+    const auth = opts.authorization || (opts.approvedConsentId
+      ? { mode: 'one_time' as const, approvalSkipped: false, policyDecision: 'allowed:human_approved' }
+      : undefined);
     const rec: SendRecord = {
       requestId: opts.requestId, contactId: contact.contactId, goalId: opts.goalId, runId: opts.runId,
       kind: contact.kind, provider: contact.provider, status: 'sent',
       providerMessageId: deliver.providerMessageId, threadToken, subject: opts.subject,
       summary, sentAt: new Date(this.now()).toISOString(),
+      grantId: auth?.grantId, grantVersion: auth?.grantVersion,
+      authorizationMode: auth?.mode, approvalSkipped: auth?.approvalSkipped === true,
+      policyDecision: auth?.policyDecision,
     };
     // 批准路径已经预占了一条 failed 占位记录 (awaiting_approval) → 覆盖它
     const prior = await this.store.findSend(opts.requestId);
     if (prior) await this.store.patchSend(opts.requestId, rec); else await this.store.recordSend(rec);
     await this.store.markUsed(contact.contactId);
+    if (auth?.grantId) { try { await this.grants.markUsed(auth.grantId); } catch { /* 记不上不影响发送事实 */ } }
+    if (auth?.mode !== 'one_time' && decision.forbiddenCategories.length === 0 && decision.sensitive.length > 0) {
+      // 敏感类别**只记类别, 不记明文** (Phase 6 审计要求)
+      await this.ledger({
+        activity: 'contact.sent', contactId: contact.contactId, goalId: opts.goalId, runId: opts.runId,
+        detail: `[审计] 完全授权下发送了敏感类别: ${decision.sensitive.map((f) => f.kind).join(', ')} (只记类别, 不记明文) · grantId=${auth?.grantId} · goal=${opts.goalId || '-'}`,
+      });
+    }
 
     const ev = await this.ledger({
       activity: 'contact.sent', contactId: contact.contactId, goalId: opts.goalId, runId: opts.runId,
-      detail: `${deliver.reallySent ? '已真实外发' : '本地落盘(未真实外发)'} 通道 ${contact.provider} · 收件人 ${contact.displayValue} · ${summary}${opts.approvedConsentId ? ` · 批准 ${opts.approvedConsentId}` : ''}`,
+      detail: `${deliver.reallySent ? '已真实外发' : '本地落盘(未真实外发)'} 通道 ${contact.provider} · 收件人 ${contact.displayValue} · ${summary}`
+        + ` · authorizationMode=${auth?.mode || 'one_time'}`
+        + ` · grantId=${auth?.grantId || '-'} grantVersion=${auth?.grantVersion ?? '-'}`
+        + ` · approvalSkipped=${auth?.approvalSkipped === true}`
+        + ` · policyDecision=${auth?.policyDecision || '-'}`
+        + (opts.approvedConsentId ? ` · 批准 ${opts.approvedConsentId}` : ''),
     });
     await this.ledger({
       activity: 'contact.delivery_confirmed', contactId: contact.contactId, goalId: opts.goalId, runId: opts.runId,
@@ -403,6 +452,128 @@ export class ContactChain {
     return out;
   }
 
+  // ── 持久能力授权 (Phase 1/3/8/10) ──────────────────────────────────────────
+  /**
+   * 用户一次性给出长期授权 —— 之后 Agent 可以直接用, 不再逐次打断。
+   * 三个用户可见选项: '仅本次任务' / '长期使用'(推荐默认) / '完全授权联系方式能力'。
+   * **注意**: 授权不等于绕过安全边界 —— 单收件人/频率/任务关联/幂等/provider/证据/撤销/禁止群发 一个都不少。
+   */
+  async authorize(opts: {
+    choice?: 'task_once' | 'persistent' | 'full_contact_access';
+    level?: GrantLevel; channels?: ContactGrant['channels']; contactScope?: ContactGrant['contactScope'];
+    taskScope?: ContactGrant['taskScope']; contentScope?: ContactGrant['contentScope'];
+    grantedBy: string; grantedVia: ContactGrant['grantedVia']; deviceIds?: string[];
+  }): Promise<{ ok: boolean; grant?: ContactGrant; userLabel: string }> {
+    const id = await this.ensureIdentity();
+    const g = await this.grants.create({ identityId: id.identityId, ownerDid: this.deps.ownerDid, ...opts });
+    const label = g.level === 'full_contact_access' ? '完全授权联系方式能力' : g.level === 'persistent' ? '长期自动使用' : '仅本次任务';
+    await this.ledger({
+      activity: 'contact.grant_created',
+      detail: `长期授权已建立: ${label} · channels=${g.channels} · contactScope=${g.contactScope} · taskScope=${g.taskScope} · contentScope=${g.contentScope} · grantId=${g.grantId} v${g.grantVersion} (by ${opts.grantedBy} via ${opts.grantedVia})`,
+    });
+    return { ok: true, grant: g, userLabel: label };
+  }
+
+  async pauseGrant(grantId: string, opts: { by?: string; reason?: string } = {}) {
+    const r = await this.grants.transition(grantId, 'pause', opts);
+    if (r.ok && r.grant) {
+      await this.ledger({ activity: 'contact.grant_paused', detail: `授权已暂停 ${grantId} v${r.grant.grantVersion} (by ${opts.by || 'user'}) —— 新发送会被拦, 配置保留` });
+    }
+    return r;
+  }
+
+  async resumeGrant(grantId: string, opts: { by?: string } = {}) {
+    const r = await this.grants.transition(grantId, 'resume', opts);
+    if (r.ok && r.grant) await this.ledger({ activity: 'contact.grant_resumed', detail: `授权已恢复 ${grantId} v${r.grant.grantVersion}` });
+    return r;
+  }
+
+  /** 撤销 Grant: 立即阻止新发送 + 该授权下正在等待回复的任务清等待并转人工 */
+  async revokeGrant(grantId: string, opts: { by?: string; reason?: string } = {}): Promise<{ ok: boolean; error?: string; affectedGoals: string[] }> {
+    const r = await this.grants.transition(grantId, 'revoke', opts);
+    if (!r.ok || !r.grant) return { ok: false, error: r.error, affectedGoals: [] };
+    await this.ledger({ activity: 'contact.grant_revoked', detail: `授权已撤销 ${grantId} v${r.grant.grantVersion} (by ${opts.by || 'user'}${opts.reason ? `, ${opts.reason}` : ''}) —— 历史证据保留, 后续一律拒绝` });
+    const affected: string[] = [];
+    for (const s of await this.store.listSends()) {
+      if (s.grantId !== grantId || s.status !== 'sent' || !s.goalId) continue;
+      await clearExternalWait(s.goalId);
+      const g = await readGoal(s.goalId);
+      await setUnresolved(s.goalId, Array.from(new Set([...(g?.unresolvedItems || []), `联系方式授权 ${grantId} 已撤销, 该联系不可自动重试 (转人工)`])));
+      // 撤等待 + 转人工: 不再自动唤醒, 由人接手 (Supervisor 下一轮看到 needs_human)
+      await setContinuation(s.goalId, { wakeReason: 'needs_human', needsExternal: undefined, autoContinue: false } as any).catch(() => null);
+      await updateGoal(s.goalId, { status: 'needs_human' } as any).catch(() => null);
+      affected.push(s.goalId);
+    }
+    return { ok: true, affectedGoals: affected };
+  }
+
+  /** 撤销全部联系方式授权 (等同"完全收回") */
+  async revokeAllGrants(opts: { by?: string; reason?: string } = {}): Promise<{ revoked: string[]; affectedGoals: string[] }> {
+    const revoked = await this.grants.revokeAll(opts.by || 'user', opts.reason);
+    for (const g of revoked) await this.ledger({ activity: 'contact.grant_revoked', detail: `授权已撤销 ${g.grantId} (by ${opts.by || 'user'}${opts.reason ? `, ${opts.reason}` : ''})` });
+    const affected = new Set<string>();
+    for (const g of revoked) {
+      const r = await this.revokeGrant(g.grantId, opts).catch(() => ({ affectedGoals: [] as string[] }));
+      for (const a of (r as any).affectedGoals || []) affected.add(a);
+    }
+    return { revoked: revoked.map((g) => g.grantId), affectedGoals: [...affected] };
+  }
+
+  // ── 手机 → 桌面: 签名同步 (Phase 4) ────────────────────────────────────────
+  /** 登记手机设备公钥 (配对时由手机提供; 之后再接受它签名的授权) */
+  async registerDevice(deviceId: string, publicKeyPem: string, label?: string) {
+    const d = await this.grants.registerDevice(deviceId, publicKeyPem, label);
+    await this.ledger({ activity: 'contact.grant_synced', detail: `登记设备公钥 ${deviceId}${label ? ` (${label})` : ''} —— 之后只接受该设备签名的授权` });
+    return d;
+  }
+
+  /** 接受手机同步来的签名 Grant (验签 + 版本冲突 + 撤销优先) */
+  async syncGrant(incoming: ContactGrant): Promise<{ ok: boolean; reason?: string; code?: string; grant?: ContactGrant }> {
+    const r = await this.grants.applySignedSync(incoming);
+    if (r.ok) {
+      await this.ledger({ activity: 'contact.grant_synced', detail: `接受手机同步授权 ${incoming.grantId} v${incoming.grantVersion} (device=${incoming.signature?.deviceId || '-'}, level=${incoming.level})` });
+    } else {
+      await this.ledger({ activity: 'contact.grant_sync_rejected', detail: `拒绝同步授权 ${incoming.grantId || '-'}: ${r.code} — ${r.reason}` });
+    }
+    return { ok: r.ok, reason: r.reason, code: r.code, grant: r.grant };
+  }
+
+  /** 手机撤销 → 桌面立即失效 */
+  async syncRevocation(grantId: string, opts: { by?: string; reason?: string; version?: number } = {}) {
+    const r = await this.grants.applyRevocation(grantId, opts);
+    if (r.ok) await this.ledger({ activity: 'contact.grant_revoked', detail: `收到手机端撤销 ${grantId} v${r.grant?.grantVersion} (by ${opts.by || 'mobile'})` });
+    return r;
+  }
+
+  /** 授权状态摘要 (CLI / Web / 手机读同一份) */
+  async grantsSummary() {
+    await this.ensureIdentity();
+    return this.grants.summary(this.deps.ownerDid);
+  }
+
+  // ── 迁移 (Phase 9) ────────────────────────────────────────────────────────
+  /**
+   * 老数据迁移规则 (刻意**保守**):
+   *   - 没有长期 Grant 的已验证联系方式: 保持原行为 (每次仍需批准), 不自动升级
+   *   - 已完成过人工批准: **不**推断为长期授权
+   *   - 老 taskRefs: 只作为"任务级绑定"保留, 不扩成所有未来任务
+   *   - requireApprovalEachTime=true: 保持最高优先级
+   *   - 已撤销的联系方式: 绝不迁移成 active Grant
+   */
+  async migrateLegacy(): Promise<{ scanned: number; keptOneTime: string[]; revokedSkipped: string[]; requireEachTimeKept: string[]; grantsBefore: number }> {
+    const contacts = await this.store.listContacts();
+    const grantsBefore = (await this.grants.list()).length;
+    const keptOneTime: string[] = [];
+    const revokedSkipped: string[] = [];
+    const requireEachTimeKept: string[] = [];
+    for (const c of contacts) {
+      if (c.revokedAt || c.verificationStatus === 'revoked') { revokedSkipped.push(c.contactId); continue; }
+      if ((c.consentScope?.taskRefs || []).length > 0 || c.verificationStatus === 'verified') keptOneTime.push(c.contactId);
+      if (c.limits?.requireApprovalEachTime) requireEachTimeKept.push(c.contactId);
+    }
+    return { scanned: contacts.length, keptOneTime, revokedSkipped, requireEachTimeKept, grantsBefore };
+  }
+
   // ── 撤销 (Phase 1/6) ──────────────────────────────────────────────────────
   async revoke(opts: { contactId: string; by?: string; reason?: string }): Promise<{ ok: boolean; error?: string; evidenceRef?: string; affectedGoals?: string[] }> {
     const c = await this.store.getContact(opts.contactId);
@@ -422,6 +593,8 @@ export class ContactChain {
       await clearExternalWait(s.goalId);
       const g = await readGoal(s.goalId);
       await setUnresolved(s.goalId, Array.from(new Set([...(g?.unresolvedItems || []), `联系人 ${c.displayValue} 已撤销授权, 该联系不可重试`])));
+      await setContinuation(s.goalId, { wakeReason: 'needs_human', needsExternal: undefined, autoContinue: false } as any).catch(() => null);
+      await updateGoal(s.goalId, { status: 'needs_human' } as any).catch(() => null);
       affected.push(s.goalId);
     }
     return { ok: true, evidenceRef: ev.evidenceRef, affectedGoals: affected };
