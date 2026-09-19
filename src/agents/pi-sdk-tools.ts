@@ -1,6 +1,7 @@
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
+import { currentPackageRoot } from '../utils/version-info.js';
 import { documentReader, DocumentContent } from '../documents/reader.js';
 import { p2pNetwork } from '../network/p2p.js';
 import { shellExec } from './shell-tool.js';
@@ -2359,7 +2360,8 @@ export function registerBuiltinTools(ctx: ToolRegistryContext): void {
       try {
         // fs 读 manifests/mcp-catalog.json — 构建后 dist/agents/../../manifests = 仓库根/manifests
         const { readFileSync } = await import('fs');
-        const raw = readFileSync(new URL('../../manifests/mcp-catalog.json', import.meta.url), 'utf-8');
+        // 2026-09-19: 原为 new URL('../../manifests/...', import.meta.url) —— electron 构建(CommonJS)下 TS1343。
+        const raw = readFileSync(path.join(currentPackageRoot(), 'manifests', 'mcp-catalog.json'), 'utf-8');
         const catalog = JSON.parse(raw);
         const entries = (catalog?.entries ?? []) as Array<{
           name: string;

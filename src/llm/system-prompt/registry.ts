@@ -13,11 +13,14 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { fileURLToPath } from 'url';
 import { stripHibsml } from './strip-hibsml.js';
+import { firstExisting, packageDirCandidates } from '../../utils/module-context.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const LAYERS_DIR = path.join(__dirname, 'layers');
+// 2026-09-19: 原先是 path.dirname(fileURLToPath(import.meta.url)) + 'layers'.
+//   electron 构建是 CommonJS, 用 import.meta 直接 TS1343 (发布门过不去);
+//   而且 electron 产物的同级目录里没有 .md, 光靠 __dirname 也读不到。
+//   现在按 CJS同级 → dist/llm/system-prompt → src/llm/system-prompt 依次探测。
+const LAYERS_DIR = firstExisting(packageDirCandidates(path.join('llm', 'system-prompt', 'layers')));
 
 // 2026-06-17: VERBOSE 开关 — BOLLOON_VERBOSE=1 时打 layer 读失败诊断
 // 默认静默 (每次 chat 跑 25 次 fs.readFile, 失败 spam 会污染终端)

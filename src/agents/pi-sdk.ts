@@ -16,9 +16,12 @@ import * as os from 'os';
 import * as path from 'path';
 import { getContextManager } from '../bootstrap/context-manager.js';
 import { createRequire } from 'module';
+import { currentPackageRoot } from '../utils/version-info.js';
 // 2026-08-07: ESM 下裸 require 抛错被 catch 吞掉 → estimateHistoryTokens/maxContextTokens 静默失效
 //   (状态栏恒 0 的第二层根因). 统一用 createRequire 加载 CJS 模块.
-const _piRequire = createRequire(import.meta.url);
+// 2026-09-19: 原为 createRequire(import.meta.url) —— electron 构建(CommonJS)下 TS1343。
+//   createRequire 只用来解析裸模块名, 给包内任意文件路径即可, 用包根 package.json 最稳。
+const _piRequire = createRequire(path.join(currentPackageRoot(), 'package.json'));
 import { documentReader, DocumentContent } from '../documents/reader.js';
 import { getMinimax } from '../constraints/index.js';
 import { p2pNetwork } from '../network/p2p.js';

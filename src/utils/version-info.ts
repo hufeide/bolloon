@@ -213,7 +213,7 @@ function samePath(a: string, b: string): boolean {
  *   6. 其余 → `unknown`
  */
 export function detectInstallation(opts: { packageRoot?: string; home?: string } = {}): InstallationInfo {
-  const packageRoot = path.resolve(opts.packageRoot || packageRootFrom(import.meta.url));
+  const packageRoot = path.resolve(opts.packageRoot || currentPackageRoot());
   const globalRoot = npmGlobalRoot();
   const globalPrefix = npmGlobalPrefix();
   const expectedGlobalDir = globalRoot ? path.join(globalRoot, '@bolloon', 'bolloon-agent') : null;
@@ -312,7 +312,60 @@ function resolveEntryPath(packageRoot: string): string {
   if (fromArgv && fromArgv.startsWith(packageRoot)) return fromArgv;
   const dist = path.join(packageRoot, 'dist', 'cli-entry.js');
   if (fs.existsSync(dist)) return dist;
-  return fileURLToPath(import.meta.url);
+  const idx = path.join(packageRoot, 'dist', 'index.js');
+  if (fs.existsSync(idx)) return idx;
+  return packageRoot;   // 找不到入口就如实报包根, 不编路径
+}
+
+/**
+ * 当前包根目录 —— ESM(Node) 与 CJS(Electron) 双上下文都能用。
+ *
+ * **刻意不用 import.meta**: `tsconfig.electron.json` 是 `module: CommonJS`,
+ * 只要本文件被 electron 主进程链路 (electron.ts -> auto-update -> update-manager -> version-info)
+ * 引到, 用了 import.meta 就 TS1343 编译失败 —— 这个坑平时看不见, 只有
+ * `npm publish` (prepublishOnly -> build:all -> build:electron) 才会走 electron 编译。
+ */
+export function currentPackageRoot(): string {
+  const climb = (start: string): string | null => {
+    let dir = path.resolve(start);
+    for (let i = 0; i < 8; i++) {
+      const pkg = path.join(dir, 'package.json');
+      if (fs.existsSync(pkg)) {
+        try {
+          const j = JSON.parse(fs.readFileSync(pkg, 'utf8'));
+          if (j && j.name === PKG_NAME) return dir;
+        } catch { /* 读不了就当没有, 继续往上 */ }
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
+  };
+
+  // (1) 进程入口 (CLI = dist/cli-entry.js, 脚本, electron 主进程)
+  const fromArgv = process.argv[1] ? climb(path.dirname(process.argv[1])) : null;
+  if (fromArgv) return fromArgv;
+
+  // (2) CJS 上下文能直接拿 __dirname —— 包在 new Function 里, 避免 ESM 编译期报"未定义"
+  try {
+    const dir = new Function('return typeof __dirname === "string" ? __dirname : null')() as string | null;
+    const hit = dir ? climb(dir) : null;
+    if (hit) return hit;
+  } catch { /* ESM 下这里拿不到 __dirname, 正常 */ }
+
+  // (3) 调用栈里的本文件绝对路径 (ESM 也能拿到)
+  try {
+    const stack = new Error().stack || '';
+    const m = stack.match(/(?:file:\/\/)?(\/[^\s()]*version-info\.(?:js|mjs|cjs|ts)):\d+:\d+/);
+    if (m) {
+      const hit = climb(path.dirname(m[1]));
+      if (hit) return hit;
+    }
+  } catch { /* 拿不到就退到 cwd */ }
+
+  // (4) 仓库里直接跑 (开发态)
+  return climb(process.cwd()) || process.cwd();
 }
 
 // ── git 事实 ────────────────────────────────────────────────────────────────
@@ -404,7 +457,7 @@ export interface CollectVersionOptions {
 }
 
 export function collectVersionInfo(opts: CollectVersionOptions = {}): VersionInfo {
-  const packageRoot = path.resolve(opts.packageRoot || packageRootFrom(import.meta.url));
+  const packageRoot = path.resolve(opts.packageRoot || currentPackageRoot());
   const pkg = readPackageAt(packageRoot);
   const install = detectInstallation({ packageRoot, home: opts.home });
   const home = opts.home || resolveBolloonHome();
