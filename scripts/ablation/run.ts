@@ -96,6 +96,23 @@ async function startServer(label: string): Promise<void> {
   });
 }
 
+/**
+ * 门禁预检 (2026-09-19 加):
+ *   `/message` 在初始化门禁未就绪时**故意**返回 503 (产品设计: 不绕过门禁)。
+ *   门禁会因"连通性结果 >24h 过期 / 技能库有不合格项"而退回 setup —— 那是**环境**问题,
+ *   不是功能坏了。夹具必须在跑实验前先说清楚, 否则会写出"工具循环 4 项全失败"的误导报告。
+ */
+async function checkSetupGate(): Promise<{ gate: string; stage: string; summary: string } | null> {
+  try {
+    const r = await fetch(`${BASE}/api/setup`);
+    if (!r.ok) return null;
+    const j: any = await r.json();
+    return { gate: j.gate || j.state?.stage || 'unknown', stage: j.stage || j.state?.stage || 'unknown', summary: JSON.stringify(j).slice(0, 600) };
+  } catch {
+    return null;
+  }
+}
+
 async function stopServer(): Promise<void> {
   if (!serverProc) return;
   return new Promise((resolve) => {
@@ -790,6 +807,16 @@ async function main() {
   // 启动 server
   await startServer('main');
   try {
+    const gate = await checkSetupGate();
+    if (gate && gate.gate !== 'ready') {
+      console.error(`\n[ablation] 环境门禁未就绪 (gate=${gate.gate}, stage=${gate.stage}) —— 实验 3/4 会因 /message 503 失败, 这次**不跑**。`);
+      console.error('[ablation] 这不是产品缺陷: 门禁按设计不可绕过 (BOLLOON_SKIP_SETUP=1 也只是诊断模式)。');
+      console.error('[ablation] 修好环境的办法: ① `bolloon setup --test` 重测连通性 (>24h 会过期) ② `bolloon skills` 处理不合格技能');
+      console.error('[ablation] 或 `bolloon doctor` 看门禁/运行时/技能逐项结论。');
+      console.error(`[ablation] 门禁详情: ${gate.summary}`);
+      await stopServer();
+      process.exit(3);   // 3 = 环境未就绪 (与 1 "功能失败" 区分开)
+    }
     await experiment3_toolLoop();
     await experiment4_p2p();
   } finally {

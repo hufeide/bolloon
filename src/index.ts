@@ -3407,31 +3407,31 @@ break;
       // ==================== Update Commands ====================
 
       case 'update-check': {
-        const { checkForUpdates } = await import('./utils/auto-update.js');
-        const info = await checkForUpdates();
-        if (info && info.outdated) {
-          response = `📦 发现更新可用:\n\n` +
-            `当前版本: ${info.version}\n` +
-            `最新版本: ${info.latest}\n\n` +
-            `待更新包:\n${info.packages.map(p => `  - ${p.name}: ${p.current} → ${p.latest}`).join('\n')}\n\n` +
-            `运行 --update-now 进行更新`;
-        } else {
-          response = `✅ 已是最新版本 (${info?.version || 'unknown'})`;
-        }
+        // 2026-09-19: 统一走 Update Manager (唯一检查逻辑), 不再自己拼字符串结论
+        const { checkForUpdate } = await import('./utils/update-manager.js');
+        const r = await checkForUpdate({ force: true });
+        const head = r.status === 'up_to_date' ? '✅ 已是最新版本'
+          : r.status === 'update_available' ? '📦 发现更新可用'
+            : r.status === 'offline' || r.status === 'registry_unavailable' ? '⚠ 无法检查更新 (这不代表是最新版)'
+              : r.status === 'local_version_unknown' ? '⚠ 读不到本地版本 (不判断是否有更新)'
+                : r.status === 'unsupported_installation' ? '⚠ 当前安装方式不支持自动更新'
+                  : 'ℹ 使用缓存结论';
+        response = `${head}\n\n当前版本: ${r.currentVersion}\n最新版本: ${r.latestVersion || '未知'}\n安装方式: ${r.installMethod}\n结论: ${r.status}${r.reason ? `\n说明: ${r.reason}` : ''}`;
+        if (r.status === 'update_available') response += `\n\n运行 bolloon update plan 看计划, bolloon update now 执行更新`;
+        if (r.status === 'offline' || r.status === 'registry_unavailable' || r.status === 'local_version_unknown') error = response;
         break;
       }
 
       case 'update-now': {
-        const { performUpdate } = await import('./utils/auto-update.js');
-        const packages = args.length > 0 ? args : undefined;
-        const result = await performUpdate(packages as string[] | undefined);
-        if (result.success) {
-          response = `✅ 更新成功${result.updatedPackages ? `: ${result.updatedPackages.join(', ')}` : ''}`;
-          if (result.updated) {
-            response += `\n\n${YELLOW}请重新启动应用以使用新版本${RESET}`;
-          }
+        // 2026-09-19: 统一走同一条 applyUpdate 流水线 (计划 + 锁 + 校验 + 回滚)
+        const { applyUpdate } = await import('./utils/update-manager.js');
+        const res = await applyUpdate({ strategy: 'now' });
+        if (res.ok) {
+          response = `✅ 更新成功: ${res.from} → ${res.to}\n\n${YELLOW}请重新启动应用以使用新版本${RESET}`;
         } else {
-          response = `❌ 更新失败: ${result.error}`;
+          response = res.stage === 'blocked'
+            ? `⚠ 更新被阻塞: ${res.reason}`
+            : `❌ 更新失败 (${res.stage}): ${res.reason}\n旧版本仍在: ${res.from} — 可继续使用`;
           error = response;
         }
         break;
@@ -4300,12 +4300,12 @@ async function main() {
     process.exit(0);
   }
 
-  // 启动自动更新检查（后台执行，不阻塞主流程）。
-  // 检测到新版本会自动安装；安装成功后自动重启以应用新版本。
-  // 可用 --no-update / BOLLOON_SKIP_UPDATE 关闭，
-  // 或用 config.json 的 autoUpdate:false / autoRestart:false / BOLLOON_AUTO_UPDATE=1 控制。
-  // 手动检查: bolloon --update-check
-  // 手动更新: bolloon --update-now [package]
+  // 启动时后台检查更新 (不阻塞主流程)。
+  // 2026-09-19 行为变更: **默认只通知, 不自动安装** —— 发现新版本会打印一行提示 +
+  //   "bolloon update plan / now"。要恢复自动安装需显式 config.json `autoInstall: true`
+  //   (+ `autoRestart: true` 才自动重启)。
+  // 关闭本次检查: --no-update / BOLLOON_SKIP_UPDATE=1; 临时开自动装: BOLLOON_AUTO_UPDATE=1
+  // 手动检查: bolloon update / bolloon update plan / bolloon doctor
   if (!args.updateCheck && !args.updateNow) {
     void (async () => {
       try {

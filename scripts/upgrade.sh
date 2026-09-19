@@ -1,16 +1,36 @@
 #!/usr/bin/env bash
-# bolloon-version: 0.3.7
-# 升级 Bolloon Agent 到最新版本。
-# bolloon 通过 npm 全局分发，因此升级即 `npm install -g`。
+# bolloon-version: 0.4.29
+# 升级 Bolloon Agent —— 只是 `bolloon update --now` 的一层薄包装 (单一更新实现)。
+#
+# 为什么不再直接 `npm install -g latest`:
+#   那样会绕过**更新计划 / 更新锁 / 目标版本校验 / 切换后验证 / 失败回滚** ——
+#   同一次升级, 走 CLI 有保护, 走这个脚本没有, 等于两套更新语义。
+#
+# 用法:
+#   bash scripts/upgrade.sh              # 先看计划, 再执行 (等价 bolloon update now)
+#   bash scripts/upgrade.sh plan         # 只看计划
+#   bash scripts/upgrade.sh force        # 忽略"有长期任务在跑"的提醒, 仍然更新
 set -euo pipefail
 
-echo "🔄 升级 Bolloon Agent 到最新版本..."
+PKG="@bolloon/bolloon-agent"
 
-if npm install -g @bolloon/bolloon-agent@latest; then
+if command -v bolloon >/dev/null 2>&1; then
+  BOLLOON="bolloon"
+  echo "🔄 通过 bolloon update 升级 (计划 → 执行 → 健康检查)..."
+  if [ "${1:-}" = "plan" ] || [ "${1:-}" = "--plan" ]; then
+    exec "$BOLLOON" update plan
+  fi
+  "$BOLLOON" update plan || true
+  exec "$BOLLOON" update now "$@"
+fi
+
+# 兜底: 没有任何 bolloon 入口时 (源码目录直跑) 退回 npm, 并说明为什么少了保护
+echo "⚠  未找到 bolloon 入口 (不在 PATH), 退回直接 npm 安装 —— 本次没有更新计划/回滚保护"
+if npm install -g "${PKG}@latest" --no-fund --no-audit --fetch-retries=5 --fetch-retry-maxtimeout=120000; then
   echo "✅ 升级完成。"
-  echo "💡 请重新运行 bolloon 以使用新版本。"
+  echo "💡 请重新运行 bolloon 以使用新版本; 体检: bolloon doctor"
 else
-  echo "❌ 升级失败。若提示权限不足，请尝试加 sudo 或检查 npm 全局目录权限："
-  echo "   sudo npm install -g @bolloon/bolloon-agent@latest"
+  echo "❌ 升级失败。若提示权限不足, 不要用 sudo 改系统目录, 改用用户前缀:"
+  echo "   npm config set prefix ~/.npm-global && export PATH=\"\$HOME/.npm-global/bin:\$PATH\""
   exit 1
 fi

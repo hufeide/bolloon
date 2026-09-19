@@ -18,14 +18,18 @@ if (!fs.existsSync(binDir)) {
 }
 
 // Windows 批处理入口
+// Windows 入口: 同样只指向真入口 (cli-entry.js), 不再指向 dist/index.js
 const winContent = `@echo off
 set "BOLLOON_ROOT=%~dp0"
 set "BOLLOON_ROOT=%BOLLOON_ROOT:~0,-1%"
 
-REM 确定入口文件
-set "ENTRY=%BOLLOON_ROOT%\\dist\\index.js"
+set "ENTRY=%BOLLOON_ROOT%\\dist\\cli-entry.js"
 if not exist "%ENTRY%" (
-    set "ENTRY=%BOLLOON_ROOT%\\src\\index.ts"
+    set "ENTRY=%BOLLOON_ROOT%\\dist\\index.js"
+)
+if not exist "%ENTRY%" (
+    echo 找不到 dist 入口, 请先构建: npm run build:main
+    exit /b 1
 )
 
 node "%ENTRY%" %*
@@ -34,163 +38,40 @@ node "%ENTRY%" %*
 fs.writeFileSync(path.join(binDir, 'bolloon.cmd'), winContent);
 
 // Unix/Linux/Mac 入口脚本
+//
+// 2026-09-19 修正: 这里以前生成的是**一整套重复实现** —— 第二套命令解析 + 第二份版本号
+// (硬编码 `v0.1.1`, 而当时真实版本已是 0.4.x) + 自己的 banner/启动分支。同一个包在两个入口上
+// 会给出两个答案 ("我是什么版本" 有 4 个来源就是这个原因之一)。
+// 现在生成的只是一个**转发器**: 一律转发到真入口 `dist/cli-entry.js`
+// (package.json 的 bin 字段也是它) —— 版本、命令、子命令只有一份实现。
+// 见 docs/wiki/update-protocol.md §1。
 const unixContent = `#!/usr/bin/env node
+/**
+ * 遗留 CJS 入口 (兼容老脚本/老文档里的 \`node bin/bolloon.cjs\`)。
+ * 真入口是 dist/cli-entry.js; 这里只转发, 不重复实现任何命令。
+ * NOTE: 本文件由 scripts/build-cli.js 生成 —— 改行为请改生成器, 别只改这里。
+ */
 const path = require("path");
-const { spawn } = require("child_process");
 const fs = require("fs");
+const { spawn } = require("child_process");
 
-const RESET = "\\x1b[0m";
-const BOLD = "\\x1b[1m";
-const CYAN = "\\x1b[36m";
-const GREEN = "\\x1b[32m";
-const MAGENTA = "\\x1b[35m";
+const candidates = [
+  path.join(__dirname, "..", "dist", "cli-entry.js"),
+  path.join(__dirname, "..", "dist", "cli-entry.cjs"),
+];
+const entry = candidates.find((p) => fs.existsSync(p));
 
-function log(msg, color) {
-  console.log((color || RESET) + msg + RESET);
+if (!entry) {
+  console.error("❌ 找不到 dist/cli-entry.js —— 请先构建: npm run build:main");
+  process.exit(1);
 }
 
-function printBanner() {
-  console.log("\\n" + CYAN + BOLD + [
-    "   ╔═══════════════════════════════════════════╗",
-    "   ║      🤖 Bolloon Agent                     ║",
-    "   ║      P2P AI Document Processor            ║",
-    "   ╚═══════════════════════════════════════════╝"
-  ].join("\\n") + RESET + "\\n");
-}
-
-function getMainEntry() {
-  const distDir = path.dirname(require.main.filename);
-  const distIndex = path.join(distDir, "index.js");
-  if (fs.existsSync(distIndex)) {
-    return distIndex;
-  }
-  return path.join(process.cwd(), "src", "index.ts");
-}
-
-function parseArgs() {
-  const args = process.argv.slice(2);
-  if (args.length === 0) {
-    return { mode: "gui", args: [] };
-  }
-  const first = args[0];
-  switch (first) {
-    case "-v":
-    case "--version":
-      return { mode: "version", args: [] };
-    case "-h":
-    case "--help":
-      return { mode: "help", args: [] };
-    case "-g":
-    case "--gui":
-      return { mode: "gui", args: args.slice(1) };
-    case "-w":
-    case "--web":
-      return { mode: "web", args: args.slice(1) };
-    case "-c":
-    case "--cli":
-      return { mode: "cli", args: args.slice(1) };
-    default:
-      return { mode: "passthrough", args };
-  }
-}
-
-async function startElectron(additionalArgs) {
-  try {
-    const electron = require("electron");
-    const distDir = path.dirname(require.main.filename);
-    let mainPath = path.join(distDir, "electron.js");
-    if (!fs.existsSync(mainPath)) {
-      mainPath = path.join(process.cwd(), "src", "electron.ts");
-    }
-    log("启动 Electron...", CYAN);
-    const child = spawn(electron, [mainPath, ...additionalArgs], {
-      stdio: "inherit",
-      env: { ...process.env, NODE_ENV: "development" }
-    });
-    child.on("error", (err) => {
-      log("Electron 启动失败: " + err.message, MAGENTA);
-      process.exit(1);
-    });
-    child.on("exit", (code) => process.exit(code || 0));
-  } catch (err) {
-    log("Electron 不可用，切换到 Web 模式...", CYAN);
-    await startWebServer(additionalArgs);
-  }
-}
-
-async function startWebServer(additionalArgs) {
-  const mainPath = getMainEntry();
-  const webArgs = ["--web", ...additionalArgs];
-  log("启动 Web 服务...", CYAN);
-  const child = spawn(process.execPath, [mainPath, ...webArgs], { stdio: "inherit" });
-  child.on("error", (err) => {
-    log("Web 服务启动失败: " + err.message, MAGENTA);
-    process.exit(1);
-  });
-  child.on("exit", (code) => process.exit(code || 0));
-}
-
-async function startCLI(additionalArgs) {
-  const mainPath = getMainEntry();
-  log("启动命令行界面...", CYAN);
-  const child = spawn(process.execPath, [mainPath, ...additionalArgs], { stdio: "inherit" });
-  child.on("error", (err) => {
-    log("CLI 启动失败: " + err.message, MAGENTA);
-    process.exit(1);
-  });
-  child.on("exit", (code) => process.exit(code || 0));
-}
-
-async function main() {
-  const { mode, args } = parseArgs();
-  switch (mode) {
-    case "version":
-      console.log("Bolloon Agent v0.1.1");
-      break;
-    case "help":
-      printBanner();
-      console.log(BOLD + "用法:" + RESET + "  bolloon [选项] [命令] [参数]");
-      console.log(BOLD + "选项:" + RESET + "  --gui, -g           启动图形界面");
-      console.log("         --web, -w           启动 Web UI");
-      console.log("         --cli, -c           启动命令行界面");
-      console.log("         --version, -v       显示版本");
-      console.log("         --help, -h          显示帮助");
-      console.log(BOLD + "示例:" + RESET + "  bolloon              # 启动图形界面");
-      console.log("         bolloon --web        # 启动 Web UI");
-      console.log("         bolloon --read file  # 读取文档");
-      break;
-    case "gui":
-      printBanner();
-      await startElectron(args);
-      break;
-    case "web":
-      printBanner();
-      await startWebServer(args);
-      break;
-    case "cli":
-      await startCLI(args);
-      break;
-    case "passthrough":
-      const mainPath = getMainEntry();
-      const child = spawn(process.execPath, [mainPath, ...args], { stdio: "inherit" });
-      child.on("error", (err) => {
-        log("执行失败: " + err.message, MAGENTA);
-        process.exit(1);
-      });
-      child.on("exit", (code) => process.exit(code || 0));
-      break;
-    default:
-      log("未知模式: " + mode, MAGENTA);
-      printBanner();
-      console.log("输入 --help 查看帮助");
-      process.exit(1);
-  }
-}
-
-main().catch((err) => {
-  console.error("Fatal error:", err);
+const child = spawn(process.execPath, [entry, ...process.argv.slice(2)], { stdio: "inherit" });
+child.on("error", (err) => {
+  console.error("启动失败:", err.message);
   process.exit(1);
 });
+child.on("exit", (code) => process.exit(code || 0));
 `;
 
 fs.writeFileSync(path.join(binDir, 'bolloon.cjs'), unixContent);

@@ -30,6 +30,15 @@
       "source_file": "docs/wiki/agent-economic-protocol.md"
     },
     {
+      "id": "agent-trace-sharing.md",
+      "type": "chapter",
+      "label": "智能体执行轨迹与 P2P 连接信息 (Trace / P2P Sharing)",
+      "tags": "[trace, agent-trace, tool-execution, run-steps, trace-export, p2p-info, peer-id, multiaddr, circuit-relay, interchange, minitool, agent-card, cli, web, cross-boundary]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/agent-trace-sharing.md"
+    },
+    {
       "id": "android-agent-runtime.md",
       "type": "chapter",
       "label": "Android Agent Runtime 架构 (Phase 1-4 路线图)",
@@ -66,6 +75,15 @@
       "source_file": "docs/wiki/claude-code-design-parallels.md"
     },
     {
+      "id": "copyright-registration.md",
+      "type": "chapter",
+      "label": "软件著作权登记材料 (500 字主要功能 + 源程序前后各 30 页)",
+      "tags": "[copyright, compliance, deliverable, source-pages]",
+      "stage": "current",
+      "audience": "internal",
+      "source_file": "docs/wiki/copyright-registration.md"
+    },
+    {
       "id": "crystallized-claims.md",
       "type": "claim",
       "label": "Bolloon Crystallized Claims",
@@ -78,10 +96,37 @@
       "id": "current-status.md",
       "type": "chapter",
       "label": "Bolloon 当前状态",
-      "tags": "[status, v0.2.7, v0.2.10-p2p-resources, v0.2.11-safe-name, v0.2.11-loading-tui, v0.2.10-non-streaming-render, v0.2.13-loading-tui-7step, tool-args-validation, step-event-buffer, owner-public-key, version-dynamic, v0.3.5, streaming-timeline-fix, streaming-finalize-connector, social-heartbeat, external-engines, lsp-module, cli-bottom-status, cli-brand-art, opencli-discovery, tool-denylist, snip-collapse, hooks-engine, deny-pipeline, jsonl-storage, sidechain, dunbar-tftt, model-visibility-gate, v0.3.25, native-toolcalls, plan-store, skill-writer, memory-readback, channel-atomic-write, ui-fixes-2026-08-02, remote-chat-step, running-self-heal, remote-chat-mirror, context-os, decision-store, valuepoint-routing, mcp-stdio, publish-did, kubo-autosetup, cli-mention-popup, orbitdb-cid-layer, cli-enter-fix, cli-startup-timeout, context-usage-fix, cli-thinking-box, run-end-skill-merge, did-catalog-multidevice, did-catalog-bridge, did-catalog-orbitdb-replication, trajectory-store, gui-web-fallback, react-loop-progress, concurrent-tools, streaming-closed-box, auth-framework, did-ownership, cli-agent-channel-rebuild, context-os-per-agent, organize-heartbeat, knowledge-organize, skill-organize, organize-result-box, unreported-escape, loop-completeness-check, write-file-default-permit, cli-kubo-autostart, terminal-tool, denylist-only-guard, js-yaml-esm-fix, dep-upgrade-2026-09-08, cli-fast-start, zero-install-warnings, agent-gateway-bootstrap, mobile-gateway, qr-scan-join, net-command, shared-context, ios-appintents-deeplink, circuit-relay-v2, p2p-circuit-inbound, next-tools-2026-09-13, clarify-channel, browser-cdp, computer-use, patch-tool, setup-wizard, skill-share-ipfs, x402-paid-info, paid-info-verify, cron-tick-lock, cron-dnd-quiet, mobile-tap-network, gateway-join-closed-loop, gateway-join-tool, deepseek-reasoning-content, address-broadcast-tofu, npm-0.4.23, npm-0.4.24, mobile-self-join, delegate-real-execution, ios-sim-join-e2e, pkg-rename-hibs-bolloon, compliance-privacy-gate, adaptive-icon, store-flavor, permissions-doc]",
+      "tags": "[status, v0.2.7, v0.2.10-p2p-resources, v0.2.11-safe-name, v0.2.11-loading-tui, v0.2.10-non-streaming-render, v0.2.13-loading-tui-7step, tool-args-validation, step-event-buffer, owner-public-key, version-dynamic, v0.3.5, streaming-timeline-fix, streaming-finalize-connector, social-heartbeat, external-engines, lsp-module, cli-bottom-status, cli-brand-art, opencli-discovery, tool-denylist, snip-collapse, hooks-engine, deny-pipeline, jsonl-storage, sidechain, dunbar-tftt, model-visibility-gate, v0.3.25, native-toolcalls, plan-store, skill-writer, memory-readback, channel-atomic-write, ui-fixes-2026-08-02, remote-chat-step, running-self-heal, remote-chat-mirror, context-os, decision-store, valuepoint-routing, mcp-stdio, publish-did, kubo-autosetup, cli-mention-popup, orbitdb-cid-layer, cli-enter-fix, cli-startup-timeout, context-usage-fix, cli-thinking-box, run-end-skill-merge, did-catalog-multidevice, did-catalog-bridge, did-catalog-orbitdb-replication, trajectory-store, gui-web-fallback, react-loop-progress, concurrent-tools, streaming-closed-box, auth-framework, did-ownership, cli-agent-channel-rebuild, context-os-per-agent, organize-heartbeat, knowledge-organize, skill-organize, organize-result-box, unreported-escape, loop-completeness-check, write-file-default-permit, cli-kubo-autostart, terminal-tool, denylist-only-guard, js-yaml-esm-fix, dep-upgrade-2026-09-08, cli-fast-start, zero-install-warnings, agent-gateway-bootstrap, mobile-gateway, qr-scan-join, net-command, shared-context, ios-appintents-deeplink, circuit-relay-v2, p2p-circuit-inbound, next-tools-2026-09-13, clarify-channel, browser-cdp, computer-use, patch-tool, setup-wizard, skill-share-ipfs, x402-paid-info, paid-info-verify, cron-tick-lock, cron-dnd-quiet, mobile-tap-network, gateway-join-closed-loop, gateway-join-tool, deepseek-reasoning-content, address-broadcast-tofu, npm-0.4.23, npm-0.4.24, mobile-self-join, delegate-real-execution, ios-sim-join-e2e, pkg-rename-hibs-bolloon, compliance-privacy-gate, adaptive-icon, store-flavor, permissions-doc, durable-run, run-store, run-state-machine, checkpoint, recovery-protocol, phase-0, acceptance-matrix, api-runs, cli-runs, durable-run-m1-hard-constraint, persistence-strict, run-lock, corrupt-fallback, degradations, update-protocol, version-info, install-identity, update-manager, update-state, update-lock, doctor, publish-gate, bare-word-commands, runtime-bootstrap, install-protocol, path-config, package-manager, doctor]",
       "stage": "current",
       "audience": "self",
       "source_file": "docs/wiki/current-status.md"
+    },
+    {
+      "id": "durable-run-protocol.md",
+      "type": "chapter",
+      "label": "Durable Run 协议 (Goal → Run → Checkpoint → Recovery)",
+      "tags": "[durable-run, run-store, goal, checkpoint, recovery, harness, state-machine, phase-0, acceptance-matrix, web, cli, pi-agent]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/durable-run-protocol.md"
+    },
+    {
+      "id": "executable-resource-protocol.md",
+      "type": "chapter",
+      "label": "可执行资源协议 (Executable Resource Protocol)",
+      "tags": "[x402, executable-resource, skill-contract, inputSchema, outputSchema, entrypoint, requiredTools, verification, guarantees, install-fidelity, drift, harness, goal-linkage, phase-2]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/executable-resource-protocol.md"
+    },
+    {
+      "id": "facilitator-paths.md",
+      "type": "chapter",
+      "label": "facilitator 路径 (Facilitator Paths) — Phase 1 准备",
+      "tags": "[x402, facilitator, verify, settle, txhash, phase-1, mock-facilitator, local-verification]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/facilitator-paths.md"
     },
     {
       "id": "github-and-raw-strategy.md",
@@ -120,6 +165,42 @@
       "source_file": "docs/wiki/log.md"
     },
     {
+      "id": "m1-m4-closure.md",
+      "type": "chapter",
+      "label": "M1–M4 收口验收口径 (Frozen Acceptance Contract)",
+      "tags": "[m1, m2, m3, m4, closure, acceptance, evidence, no-fake-green]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/m1-m4-closure.md"
+    },
+    {
+      "id": "milestone-dispute-responsibility.md",
+      "type": "chapter",
+      "label": "里程碑结算 / 争议 / 责任 (Milestone, Dispute & Responsibility)",
+      "tags": "[x402, milestone, partially-settled, dispute, refund, responsibility, audit, phase-4]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/milestone-dispute-responsibility.md"
+    },
+    {
+      "id": "payment-recovery-protocol.md",
+      "type": "chapter",
+      "label": "支付中断恢复协议 (Payment Recovery Protocol)",
+      "tags": "[x402, payment-recovery, sigkill, reconcile, claim, two-layer-state, supervisor, idempotency, phase-3]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/payment-recovery-protocol.md"
+    },
+    {
+      "id": "product-core-focus.md",
+      "type": "chapter",
+      "label": "产品核心收缩 (Core Focus) — M1 只证明一件事",
+      "tags": "[product, core-focus, freeze, roadmap, m1-m4, cli-task, report-card, subtraction]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/product-core-focus.md"
+    },
+    {
       "id": "project-overview.md",
       "type": "chapter",
       "label": "Bolloon 项目概览",
@@ -138,6 +219,15 @@
       "source_file": "docs/wiki/q1-q5-report-2026-07-07.md"
     },
     {
+      "id": "runtime-bootstrap-protocol.md",
+      "type": "chapter",
+      "label": "运行时安装协议 (Node/npm · Git · Python 的检查、安装、PATH 与验证)",
+      "tags": "[runtime, bootstrap, install, node, npm, git, python, path, config, package-manager, brew, apt, winget, doctor, acceptance-matrix, install-protocol]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/runtime-bootstrap-protocol.md"
+    },
+    {
       "id": "runtime-profile.md",
       "type": "meta",
       "label": "Bolloon 校验脚本运行时配置",
@@ -145,6 +235,15 @@
       "stage": "current",
       "audience": "self",
       "source_file": "docs/wiki/runtime-profile.md"
+    },
+    {
+      "id": "setup-protocol.md",
+      "type": "chapter",
+      "label": "Bolloon 初始化协议 (Setup Protocol)",
+      "tags": "[setup, onboarding, first-run, setup-store, onboard, readiness, gate, fail-closed, state-machine, migration, repair, reconfigure, hermes, cli, web, electron, supervisor]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/setup-protocol.md"
     },
     {
       "id": "skills-index.md",
@@ -163,9 +262,87 @@
       "stage": "current",
       "audience": "self",
       "source_file": "docs/wiki/sources-and-data.md"
+    },
+    {
+      "id": "transaction-two-layer-state.md",
+      "type": "chapter",
+      "label": "交易两层状态协议 (Two-Layer Transaction State)",
+      "tags": "[x402, transaction, two-layer-state, lifecycle, settlement-fact, responsibility, migration, verified-gate, local-dev, base-sepolia, phase-0]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/transaction-two-layer-state.md"
+    },
+    {
+      "id": "update-protocol.md",
+      "type": "chapter",
+      "label": "更新协议 (版本身份 → 更新检查 → 更新计划 → 安全替换 → 健康验证 → 回滚)",
+      "tags": "[update, version, install-identity, update-manager, update-state, update-lock, doctor, health-check, publish-gate, npm-channel, release, phase-0, acceptance-matrix, cli, bare-word-commands]",
+      "stage": "current",
+      "audience": "self",
+      "source_file": "docs/wiki/update-protocol.md"
     }
   ],
   "edges": [
+    {
+      "from": "current-status.md",
+      "to": "runtime-bootstrap-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "update-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "m1-m4-closure.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "product-core-focus.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "facilitator-paths.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "milestone-dispute-responsibility.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "payment-recovery-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "executable-resource-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "transaction-two-layer-state.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "agent-trace-sharing.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "setup-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "current-status.md",
+      "to": "durable-run-protocol.md",
+      "type": "references"
+    },
     {
       "from": "current-status.md",
       "to": "android-agent-runtime.md",
@@ -253,12 +430,97 @@
     },
     {
       "from": "index.md",
+      "to": "durable-run-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "m1-m4-closure.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "product-core-focus.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "facilitator-paths.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "milestone-dispute-responsibility.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "payment-recovery-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "executable-resource-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "transaction-two-layer-state.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "agent-trace-sharing.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "runtime-bootstrap-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "update-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "setup-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
+      "to": "copyright-registration.md",
+      "type": "references"
+    },
+    {
+      "from": "index.md",
       "to": "log.md",
       "type": "references"
     },
     {
       "from": "index.md",
       "to": "q1-q5-report-2026-07-07.md",
+      "type": "references"
+    },
+    {
+      "from": "log.md",
+      "to": "update-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "log.md",
+      "to": "copyright-registration.md",
+      "type": "references"
+    },
+    {
+      "from": "log.md",
+      "to": "setup-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "log.md",
+      "to": "durable-run-protocol.md",
       "type": "references"
     },
     {
@@ -310,19 +572,29 @@
       "from": "project-overview.md",
       "to": "current-status.md",
       "type": "references"
+    },
+    {
+      "from": "runtime-bootstrap-protocol.md",
+      "to": "update-protocol.md",
+      "type": "references"
+    },
+    {
+      "from": "update-protocol.md",
+      "to": "runtime-bootstrap-protocol.md",
+      "type": "references"
     }
   ],
   "stats": {
-    "node_count": 18,
-    "edge_count": 29,
+    "node_count": 31,
+    "edge_count": 60,
     "node_types": {
       "meta": 7,
       "protocol": 1,
-      "chapter": 9,
+      "chapter": 22,
       "claim": 1
     },
     "edge_types": {
-      "references": 29
+      "references": 60
     }
   }
 }

@@ -21,6 +21,8 @@ import { fileURLToPath } from 'url';
 import { printBanner } from './cli/loading-tui.js';
 import { discoverEngines, delegateToEngine } from './external-engines/index.js';
 import { x402CheckBalance, x402Fetch } from './agents/x402/x402Pay.js';
+import { runVersionCommand, runUpdateCommand, runDoctorCommand, runRuntimeCommand, UPDATE_HELP } from './cli/update-commands.js';
+import { collectVersionInfo } from './utils/version-info.js';
 import { createRequire } from 'module';
 const _require = createRequire(import.meta.url);
 
@@ -35,17 +37,8 @@ const YELLOW = _fg(0xf5, 0x9e, 0x0b);  // #f59e0b
 const GREEN  = _fg(0x22, 0xc5, 0x5e);  // #22c55e
 const MAGENTA= _fg(0xef, 0x44, 0x44);  // #ef4444
 
-// 版本信息 — 2026-07-20 Bug 3: 从 package.json 读取, 不再硬编码
-const VERSION = ((): string => {
-  try {
-    const entryDir = path.dirname(fileURLToPath(import.meta.url));
-    const pkgPath = path.resolve(entryDir, '..', 'package.json');
-    const raw = fs.readFileSync(pkgPath, 'utf-8');
-    return JSON.parse(raw).version || '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-})();
+// 版本信息 — 2026-09-19: 统一走 version-info 的**唯一版本解析** (不再各读一遍 package.json)
+const VERSION = collectVersionInfo({ light: true }).packageVersion;
 
 function log(msg: string, color: string = RESET) {
   console.log(`${color}${msg}${RESET}`);
@@ -64,12 +57,14 @@ ${BOLD}选项:${RESET}
   --gui, -g           启动图形界面 (Electron)
   --web, -w           启动 Web UI (浏览器)
   --cli, -c           启动命令行界面
-  --version, -v       显示版本信息
+  --version, -v       显示版本 (bolloon --version verbose / bolloon --version json)
   --help, -h          显示帮助信息
 
 ${BOLD}命令:${RESET}
   bolloon setup                     初始化向导 (你的称呼 + 模型供应商 + API key + 连通性测试)
-  bolloon update [--now]            检查更新 / 立即更新 (bolloon update --now)
+  bolloon update [plan|status|history|now]   检查更新 / 计划 / 状态 / 历史 / 执行 (默认只检查)
+  bolloon doctor                    安装入口 + 版本事实 + 更新状态自洽性诊断
+  bolloon runtime [plan|install]    运行时 (Node/npm/Git/Python) 检查与安装
   bolloon model [name] [model]      列出 / 切换模型供应商 (如: bolloon model deepseek deepseek-v4-flash)
   bolloon model key <name>          配置某供应商的 API key (隐藏输入, 不回显)
   bolloon model test [name]         测试供应商连通性
@@ -86,9 +81,11 @@ ${BOLD}示例:${RESET}
   bolloon --web              # 启动 Web UI
   bolloon --cli              # 命令行模式
   bolloon model              # 查看当前模型供应商
-  bolloon model minimax      # 切换到 MiniMax
-  bolloon update             # 检查更新
-  bolloon update --now       # 立即更新
+  bolloon update             # 检查更新 (只读, 不改任何东西)
+  bolloon update plan        # 看更新计划与风险检查
+  bolloon update now         # 真正执行更新
+  bolloon doctor             # 我这台机器的 Bolloon 是否自洽
+${UPDATE_HELP}
 
 ${BOLD}环境变量:${RESET}
   MINIMAX_API_KEY           MiniMax API 密钥
@@ -149,7 +146,10 @@ function parseArgs(): { mode: string; args: string[] } {
   switch (mode) {
     case '-v':
     case '--version':
-      return { mode: 'version', args: [] };
+      // 2026-09-19: --version 现在分三层 (普通/--verbose/--json), 参数必须往下传
+      return { mode: 'version', args: args.slice(1) };
+    case 'version':
+      return { mode: 'version', args: args.slice(1) };
     case '-h':
     case '--help':
       return { mode: 'help', args: [] };
@@ -169,6 +169,12 @@ function parseArgs(): { mode: string; args: string[] } {
     // 2026-08-06: 子命令形式 (去掉 -- 前缀)
     case 'update':
       return { mode: 'update', args: args.slice(1) };
+    // 2026-09-19: 安装入口/版本事实/更新状态 自洽性诊断
+    case 'doctor':
+      return { mode: 'doctor', args: args.slice(1) };
+    // 2026-09-19: 运行时 (Node/npm/Git/Python) 检查与安装
+    case 'runtime':
+      return { mode: 'runtime', args: args.slice(1) };
     case 'model':
       return { mode: 'model', args: args.slice(1) };
     // 2026-09-18: 智能体工具执行轨迹 + 本机 P2P 连接信息 (递给名片/小工具用)
@@ -306,39 +312,8 @@ async function handleX402Command(x402Args: string[]): Promise<void> {
   process.exit(1);
 }
 
-/** update 子命令: 检查 / 执行更新 (bolloon update [--now|now] [packages]) */
-async function handleUpdateCommand(updateArgs: string[]): Promise<void> {
-  const { checkForUpdates, performUpdate } = await import('./utils/auto-update.js');
-
-  // bolloon update --now / bolloon update now [packages] — 立即更新
-  if (updateArgs[0] === '--now' || updateArgs[0] === 'now') {
-    const packages = updateArgs.slice(1).filter(a => !a.startsWith('-'));
-    console.log('🔄 正在检查并更新...');
-    const result = await performUpdate(packages.length > 0 ? packages : undefined);
-    if (result.success) {
-      console.log(`${GREEN}✅ 更新成功${result.updatedPackages ? `: ${result.updatedPackages.join(', ')}` : ''}${RESET}`);
-      if (result.updated) console.log(`${YELLOW}  请重新启动应用以使用新版本${RESET}`);
-    } else {
-      console.error(`${MAGENTA}❌ 更新失败: ${result.error}${RESET}`);
-      process.exit(1);
-    }
-    return;
-  }
-
-  // 默认: 检查更新
-  console.log('🔄 正在检查更新...');
-  const info = await checkForUpdates();
-  if (info && info.outdated) {
-    console.log(`${CYAN}📦 发现更新可用:${RESET}\n`);
-    console.log(`  当前版本: ${info.version}`);
-    console.log(`  最新版本: ${info.latest}\n`);
-    console.log(`  待更新包:`);
-    for (const p of info.packages) console.log(`    - ${p.name}: ${p.current} → ${p.latest}`);
-    console.log(`\n  运行 ${GREEN}bolloon update --now${RESET} 执行更新`);
-  } else {
-    console.log(`${GREEN}✅ 已是最新版本${RESET} (${info?.version || 'unknown'})`);
-  }
-}
+/** update 子命令: 2026-09-19 起统一走 src/cli/update-commands.ts 的 runUpdateCommand
+ *  (旧实现只有"检查/--now"两种行为, 且各自拼一套版本信息 —— 已删除, 避免两套事实) */
 
 /** model 子命令: 列出 / 切换模型供应商 (bolloon model [name] [model]) */
 /**
@@ -522,6 +497,11 @@ async function handleSetupCommand(setupArgs: string[]): Promise<void> {
     const i = setupArgs.indexOf(name);
     return i >= 0 && i + 1 < setupArgs.length ? setupArgs[i + 1] : undefined;
   };
+  if (setupArgs.includes('repair-runtime') || setupArgs.includes('--repair-runtime')) {
+    // Phase 7: 补装缺失运行时 (与 bolloon runtime install yes 同一实现)
+    console.log(`${BOLD}setup repair-runtime${RESET} — 检查并补装 Node/npm/Git/Python (不偷偷 sudo)`);
+    process.exit(await runRuntimeCommand(['install', 'yes']));
+  }
   if (setupArgs.includes('--help') || setupArgs.includes('-h')) {
     console.log(`${BOLD}bolloon setup${RESET} — 初始化 Bolloon (用户身份 + 模型供应商 + API key)`);
     console.log('');
@@ -531,6 +511,7 @@ async function handleSetupCommand(setupArgs: string[]): Promise<void> {
     console.log('  --model <名>      指定模型');
     console.log('  --name <称呼>     你的称呼 (写入 ~/.bolloon/identity/user.json)');
     console.log('  --no-test         跳过连通性测试');
+    console.log('  repair-runtime    检查并补装缺失运行时 (Node/npm/Git/Python)');
     return;
   }
   const apiKey = val('--api-key');
@@ -758,7 +739,8 @@ async function main() {
 
   switch (mode) {
     case 'version':
-      console.log(`Bolloon Agent v${VERSION}`);
+      // 2026-09-19: 三层版本输出 (普通/--verbose/--json) 全走同一个 VersionInfo
+      process.exit(await runVersionCommand(args));
       break;
 
     case 'help':
@@ -789,7 +771,16 @@ async function main() {
 
     // 2026-08-06: 子命令 (bolloon update / bolloon model)
     case 'update':
-      await handleUpdateCommand(args);
+      process.exit(await runUpdateCommand(args));
+      break;
+
+    case 'doctor':
+      process.exit(await runDoctorCommand(args));
+      break;
+
+    // 2026-09-19: 运行时检查/安装 (与 install.sh / postinstall / doctor 同一实现)
+    case 'runtime':
+      process.exit(await runRuntimeCommand(args));
       break;
 
     case 'model':
