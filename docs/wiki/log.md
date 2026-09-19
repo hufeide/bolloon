@@ -2339,3 +2339,14 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
 - **发布**: `@bolloon/bolloon-agent@0.4.27` (commit `9d5dca5`)。registry 复核: `dist-tags.latest = 0.4.27` · `versions` 尾三 `[0.4.25, 0.4.26, 0.4.27]` · tarball **HTTP 200 / 17,391,802 bytes / 977 files** · `dist/` 967 文件含本批 6 个新模块 (`x402/{settlement-state,payment-recovery,resource-contract,milestone-settlement}.js` · `agents/{trace-export,p2p-info}.js`) · 全新目录安装 `npm install @bolloon/bolloon-agent@0.4.27` → 949 包, `version = 0.4.27`。shasum `feb2168dfbf633dbd34f80d71997be95def64267`。
 - **教训 (已写进 skill `npm-publish-and-deps`)**: npm 收紧了绕过 2FA 的粒度 token —— 这类 token 的 `npm publish` **只暂存 (staged)**, 退出码 0、日志打 `+ pkg@ver`, 但版本**不公开**(版本直连 404, `dist-tags.latest` 仍旧值); 同版本再发必得 `E409 Cannot publish over previously staged version "<ver>"` —— 那句 409 是「已被收下、等放行」的证据, **不是失败, 别改版本号重发**。本次实测约 5-7 分钟后自己放行翻到 latest。
 - **另一条坑**: **暂存按 token/actor 隔离** —— 中途把 `~/.npmrc` 换成新 token 后, 新 token 看不到旧 token 暂存的版本 (`npm@12 stage list` 空、`GET /-/stage` 回 `{items:[],total:0}`) → **待放行期间不要轮换 token**。本地 npm 11.6.2/11.10.1 没有 `stage` 子命令, **npm 12.0.2 有** (`stage list|view|approve|reject|download`) 且在 Node 24.13.0 上只报 EBADENGINE 警告照常运行 → `npx -y npm@12 stage list/approve <pkg>|<stage-id>` 即可, 不必升级全局 npm。
+
+## [2026-09-18] docs | 产品核心收缩: 确认核心 + 冻结清单 + M1-M4 (先不删代码)
+
+- **动因**: leo 以乔布斯视角给出的减法判断 —— Bolloon 过于复杂, 缺一个锋利中心; 命令是"开始思考最新的计划, 先不删代码, 但要确认核心、确认哪些可以先不使用"。
+- **现状核对(先摆事实)**: Web **163 条路由**(含 p2p/iroh/chat-inbox/self-improve/permission-mode/context/registry) · CLI **14 个子命令** · 用户可见交易态是 **10 态生命周期 + 8 态结算事实直出** · `~/.bolloon/skills` 只有 **1 个技能**(夹具 `cross-border-market-research`) · 买能力路径埋在 `src/index.ts:1688` (`buyInfo`), **无独立任务入口** · **全仓无任务报告卡渲染器**(grep `本次使用`/`reportCard` 0 命中)。
+- **核心确认**: 一句话 = 「让 Agent 买到完成任务所需的能力, 并证明这项能力被真实、受约束、可恢复地使用过」。五步闭环 = 提出任务 → 判断缺什么 → 买一个资源 → 执行 → 结果+证据。支付只是其中一个动作, 不是产品价值本身(最长板 = 长期执行 + 受约束购买 + 资源真执行 + 证据可回放)。
+- **冻结点(不改代码, 只改暴露面)**: P2P 多节点发现/iroh · 多链钱包 · 手机端完整交易 · 自动声誉经济 · 多资源类别 · 自动退款/复杂仲裁/多阶段结算 UI · Web 的 p2p/iroh/self-improve/permission-mode 面板作为主叙事 · CLI 的 `gui/improve/engine/read/summarize/passthrough/model/update` 退出核心叙事 · **10 态/8 态不再对外直出**, 对外映射 **4 态**(准备中/正在获取能力/正在执行/已完成|需要你处理)。
+- **保留(直接服务核心的地基)**: Run 持久化 · Goal continuation · Harness 门 · Supervisor tick · payment recovery · transaction evidence · skill snapshot · 不重复付款 · 真实验真。
+- **路线图**: **M1** 一个跨境商品调研任务跑通(唯一 P0, 验收 10 项清单) → **M2** 三个用户可感知恢复点(付款前 / 已付款未交付 / 已交付未验真) → **M3** 至少一笔 Base Sepolia 真支付 → **M4** 失败进争议, 不重付不假绿。**M1 前不再扩展资源类型/支付网络/入口/社交能力。**
+- **M1 真实差距(5 项)**: ① 任务入口缺失 ② 任务报告卡缺失 ③ 10 态→4 态映射缺失 ④ 资源目录"发现→报价→购买"靠硬编码 ⑤ 一条 Goal criterion 未接市场调研输出契约。
+- **待 leo 定**: 唯一入口 CLI vs Web · M1 是否锁死"可执行 Skill"为唯一资源类型 · 预算单位与上限。
