@@ -2373,3 +2373,12 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
 - **验证 (全部真跑)**: `scripts/verify-task-closure.ts` **68 passed / 0 failed** ([A] 用户主路径 · [B] 6 条失败路径 · [C] 五个**真 SIGKILL** 恢复矩阵 · [D] M3 三模式边界 · [E] Supervisor 接回) · `verify-task-loop.ts` **60/0** · 单测 `src/test/task-loop.test.ts` **30** · Phase 0 44/0 · Phase 2 51/0 · Phase 3 57/0 · Phase 4 50/0 · facilitator 26/0 · local-dev 闭环 68/0(失败矩阵 37 全拒) · **全量 vitest 177 文件 / 2021 测试** · `tsc` 0 错 · Web 构建通过 · wiki 四门禁 OK · **消融实验 4/4 通过**。
 - **顺带修掉一个环境性门禁失败**: 消融实验的服务等待只有 30s, 而本机启动时 DID/IPNS 发布先 30s 超时再走回退 (AGENTS.md 已登记的环境噪音) → 夹具改为跳过 kubo/update 初始化并等待 180s (夹具问题, 非产品缺陷)。
 - **本批明确不做**: 真实 Base Sepolia 链上支付 (需 facilitator + 钱包 + 真卖方 payTo; M1/M2 不被它阻塞) · P2P 发现 · 多链 · 自动退款 · 复杂仲裁 · Web/移动端任务入口。
+
+## [2026-09-18] docs(site) | 入网 SKILL.md 升 v1.3.0 (新增 §11 M1 任务闭环) + bolloon-UI 重新部署
+
+- **动因**: leo "可以更新 加入网关的 skills 文档, 之后更新 bolloon-UI, 顺手再次部署"。跨仓联动 (bolloon 侧新增了 `bolloon task` 任务闭环, 而 agent 的唯一入口是 `https://bolloon.cn/bolloon-gateway-join.md`) —— 不同步 = 线上入口在向 agent 传旧契约。
+- **文档变更** (`~/Downloads/bolloon-UI/bolloon-gateway-join.md`, frontmatter `version: 1.2.1 → 1.3.0`, capabilities 加 `skill-task-loop`): 新增 **§11「用买到的能力完成任务(M1 任务闭环)」** —— 五步闭环(提出任务 → 判断缺能力 → 买一个资源 → 执行 → 结果+证据) · 本地 Registry 确定性发现(不点名 Skill) · 预算门 0.05/0.02/0.10 多层取 min 且执行中不许扩大 · 可执行资源=带契约的 SKILL.md(`guarantees` 必须配 `doesNotGuarantee`) · 买到后保真链校验 + 真执行 + 输出契约校验 · 报告卡 5 个用户态与 `支付方式`/`链上已验证` · **诚实边界**(local-dev 永不进链上结算; 付款了没执行/执行了没证据一律不显示完成) · 证据回放(`bolloon trace` / `GET /api/x402/transactions[/:id]`)。§0.1 加了指向 §11 的一句话(入网向外提供能力, §11 向内补齐能力)。原有 §0–§10 全章节保留。
+- **同步**: `skill.html` 全量同步(version 显示 1.3.0 + §11 正文 + capabilities)+ `scripts/verify-site.mjs` 期待值(1.3.0 + §11 断言)。
+- **验收与部署**: 本地 `node scripts/verify-site.mjs http://127.0.0.1:8897` → **25 passed / 0 failed** · `python3 scripts/deploy-pages.py --no-deploy` 干跑(23 项、含 dl/ 的 18.30 MiB APK、无敏感文件)→ 正式部署 CF Pages(**3 个文件更新**)· 真域名 `node scripts/verify-site.mjs https://bolloon.cn` → **25 passed / 0 failed**(线上 md 正文已是 `version: 1.3.0` + §11)。
+- **UI 仓**: 提交 `135c1db` (bolloon-gateway-join.md + skill.html + scripts/verify-site.mjs) 已 push 到 `logos-42/bolloon-UI` main(GitHub Pages 镜像通道随之构建; 线上主站以 CF Pages 为准)。
+- **另有未完结项 (如实记)**: npm `@bolloon/bolloon-agent@0.4.28` 已 `npm version` + commit + push(`2684075`), `npm publish` 退出码 0 但 registry 仍是 `latest=0.4.27`、`0.4.28` 清单与 tarball 均 404 → 与 0.4.27 同一现象(**2FA-bypass 粒度 token 只暂存, 等放行**)。按教训**不重复 publish**(同版本必得 E409), 轮询等 `dist-tags.latest` 翻到 0.4.28 + tarball 200 为准。
