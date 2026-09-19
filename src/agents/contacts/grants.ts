@@ -23,12 +23,14 @@ import * as crypto from 'crypto';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 
-export type GrantLevel = 'none' | 'task_once' | 'persistent' | 'full_contact_access';
-export type GrantChannels = 'phone' | 'email' | 'both';
-export type GrantContactScope = 'verified_contacts' | 'all_contacts';
-export type GrantTaskScope = 'current_goal' | 'matching_goals' | 'all_future_goals';
-export type GrantContentScope = 'normal' | 'sensitive';
-export type GrantStatus = 'active' | 'revoked' | 'expired' | 'suspended';
+// 2026-09-19: 类型/规范载荷/预设全部从纯模块复用 —— 手机端 (WebCrypto) 与桌面端 (Node) 签的必须是同一个字节串
+export {
+  type GrantLevel, type GrantChannels, type GrantContactScope, type GrantTaskScope,
+  type GrantContentScope, type GrantStatus, type SignableGrant, type SignableRevocation,
+  canonicalGrantPayload, canonicalRevocationPayload, presetForChoice, GRANT_LEVEL_LABEL, GRANT_SIGNED_FIELDS,
+} from './grant-payload.js';
+import { canonicalGrantPayload, canonicalRevocationPayload, presetForChoice, GRANT_LEVEL_LABEL,
+  type GrantLevel, type GrantChannels, type GrantContactScope, type GrantTaskScope, type GrantContentScope, type GrantStatus } from './grant-payload.js';
 
 export interface ContactGrant {
   grantId: string;
@@ -72,25 +74,6 @@ export interface GrantSignature {
  */
 export const FORBIDDEN_CATEGORIES = ['api_key', 'password', 'bank_account', 'payment_instruction', 'contract_commitment'] as const;
 
-/** 用户可见的三个选项 → 内部等级 + 默认范围 */
-export function presetForChoice(choice: 'task_once' | 'persistent' | 'full_contact_access'): Pick<ContactGrant,
-  'level' | 'channels' | 'contactScope' | 'taskScope' | 'contentScope' | 'replyWakeAllowed' | 'autoSend' | 'sensitiveContentAllowed' | 'newRecipientAllowed'> {
-  const base = {
-    channels: 'both' as GrantChannels,
-    replyWakeAllowed: true,
-    autoSend: true,
-    newRecipientAllowed: false,      // 新收件人永远要单独授权 (即使完全授权)
-  };
-  switch (choice) {
-    case 'task_once':
-      return { ...base, level: 'task_once', contactScope: 'verified_contacts', taskScope: 'current_goal', contentScope: 'normal', autoSend: false, sensitiveContentAllowed: false };
-    case 'persistent':
-      return { ...base, level: 'persistent', contactScope: 'verified_contacts', taskScope: 'all_future_goals', contentScope: 'normal', sensitiveContentAllowed: false };
-    case 'full_contact_access':
-      return { ...base, level: 'full_contact_access', contactScope: 'all_contacts', taskScope: 'all_future_goals', contentScope: 'sensitive', sensitiveContentAllowed: true };
-  }
-}
-
 // ── 设备密钥 (Ed25519) ──────────────────────────────────────────────────────
 
 export interface DeviceKey { deviceId: string; publicKeyPem: string; label?: string; registeredAt: string }
@@ -102,22 +85,6 @@ export function generateDeviceKeyPair(): { deviceId: string; publicKeyPem: strin
     publicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }).toString(),
     privateKeyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
   };
-}
-
-/**
- * 规范化载荷 —— 签名/验签必须用同样的字段顺序 (否则"同一条 Grant"会算出不同 hash)。
- * 刻意**不含** signature 本身, 也不含 lastUsedAt (每次用都会变, 不该让签名失效)。
- */
-export function canonicalGrantPayload(g: ContactGrant): string {
-  const pick = {
-    grantId: g.grantId, identityId: g.identityId, ownerDid: g.ownerDid, level: g.level,
-    channels: g.channels, contactScope: g.contactScope, taskScope: g.taskScope, contentScope: g.contentScope,
-    replyWakeAllowed: g.replyWakeAllowed, autoSend: g.autoSend, sensitiveContentAllowed: g.sensitiveContentAllowed,
-    newRecipientAllowed: g.newRecipientAllowed, grantedAt: g.grantedAt, grantedBy: g.grantedBy,
-    grantedVia: g.grantedVia, deviceIds: [...g.deviceIds].sort(), status: g.status, revokedAt: g.revokedAt || '',
-    grantVersion: g.grantVersion,
-  };
-  return JSON.stringify(pick);
 }
 
 export function grantPayloadHash(g: ContactGrant): string {
@@ -297,6 +264,8 @@ export class GrantStore {
   private loaded = false;
   /** 读盘失败时置位 —— 之后一切自动发送都必须 fail-closed */
   corrupt = false;
+  /** 上次读到的 mtime —— 别的进程 (CLI / web server / 手机同步) 改过盘就要重读 */
+  private mtimeMs = 0;
 
   constructor(dir: string) { this.dir = dir; }
 
@@ -326,17 +295,31 @@ export class GrantStore {
       const dev = JSON.parse(await fsp.readFile(this.devicesFile(), 'utf8'));
       this.devices = Array.isArray(dev) ? dev : [];
     } catch { this.devices = []; }
+    try { this.mtimeMs = (await fsp.stat(this.grantsFile())).mtimeMs; } catch { this.mtimeMs = 0; }
     this.loaded = true;
+  }
+
+  /**
+   * 2026-09-19 (真跑抓到): 长驻进程 (web server) 会缓存 Grant 列表 →
+   *   别的进程撤销/授权后, 它还在用旧事实 —— 对"撤销必须立即失效"是硬伤。
+   * 每次读/写前按 mtime 判断要不要重读 (stat 很便宜)。
+   */
+  private async refreshIfStale(): Promise<void> {
+    try {
+      const st = await fsp.stat(this.grantsFile());
+      if (st.mtimeMs !== this.mtimeMs) { this.loaded = false; this.corrupt = false; await this.load(); }
+    } catch { /* 文件还不存在 (或刚被删) → 保持现状 */ }
   }
 
   private async persist(): Promise<void> {
     await this.atomic(this.grantsFile(), this.grants.slice(-200), 0o600);
     await this.atomic(this.devicesFile(), this.devices.slice(-50), 0o600);
+    try { this.mtimeMs = (await fsp.stat(this.grantsFile())).mtimeMs; } catch { /* 记不上下次 stat 再判 */ }
   }
 
   // ── 设备 ──────────────────────────────────────────────────────────────────
   async registerDevice(deviceId: string, publicKeyPem: string, label?: string): Promise<DeviceKey> {
-    await this.load();
+    await this.load(); await this.refreshIfStale();
     const i = this.devices.findIndex((d) => d.deviceId === deviceId);
     const entry: DeviceKey = { deviceId, publicKeyPem, label, registeredAt: new Date().toISOString() };
     if (i >= 0) this.devices[i] = entry; else this.devices.push(entry);
@@ -349,11 +332,11 @@ export class GrantStore {
   async listDevices(): Promise<DeviceKey[]> { await this.load(); return [...this.devices]; }
 
   // ── Grant ─────────────────────────────────────────────────────────────────
-  async list(): Promise<ContactGrant[]> { await this.load(); return [...this.grants]; }
+  async list(): Promise<ContactGrant[]> { await this.load(); await this.refreshIfStale(); return [...this.grants]; }
 
   /** 当前生效的最高等级 Grant (撤销/暂停/过期的不算) */
   async activeFor(ownerDid: string, now = Date.now()): Promise<ContactGrant | null> {
-    await this.load();
+    await this.load(); await this.refreshIfStale();
     if (this.corrupt) return null;
     const rank: Record<GrantLevel, number> = { none: 0, task_once: 1, persistent: 2, full_contact_access: 3 };
     const live = this.grants
@@ -363,20 +346,27 @@ export class GrantStore {
   }
 
   /**
-   * 最高的**管辖** Grant (不限状态) —— policy 用它区分"没有授权"与"授权被撤销/暂停/过期"。
-   * 撤销/暂停的 Grant 不会再进 activeFor, 但必须能被识别出来, 否则用户只会看到含糊的"没授权"。
+   * 最高的**管辖** Grant。
+   *   有 active 的 → 按等级+版本取最高 (授权优先)
+   *   一个 active 都没有 → 取最近一条失效授权, 用来给出精确原因 (revoked/suspended/expired)
+   *
+   * 2026-09-19 真跑抓到: 早先"按等级排全部 (含已撤销)"实现会让一条**已撤销的高等级授权**
+   *   盖住后建的**有效**低等级授权 → 明明有长期授权却判成 grant_revoked (用户看到"已撤销"却没撤销过)。
    */
   async latestFor(ownerDid: string): Promise<ContactGrant | null> {
-    await this.load();
+    await this.load(); await this.refreshIfStale();
     if (this.corrupt) return null;
     const rank: Record<GrantLevel, number> = { none: 0, task_once: 1, persistent: 2, full_contact_access: 3 };
     const mine = this.grants.filter((g) => g.ownerDid === ownerDid);
     if (!mine.length) return null;
-    return mine.sort((a, b) => (rank[b.level] - rank[a.level]) || (b.grantVersion - a.grantVersion))[0];
+    const live = mine.filter((g) => g.status === 'active' && !g.revokedAt);
+    if (live.length) return live.sort((a, b) => (rank[b.level] - rank[a.level]) || (b.grantVersion - a.grantVersion))[0];
+    const at = (g: ContactGrant) => Date.parse(g.revokedAt || g.suspendedAt || g.grantedAt || '') || 0;
+    return [...mine].sort((a, b) => at(b) - at(a) || b.grantVersion - a.grantVersion)[0];
   }
 
   async get(grantId: string): Promise<ContactGrant | null> {
-    await this.load();
+    await this.load(); await this.refreshIfStale();
     return this.grants.find((g) => g.grantId === grantId) || null;
   }
 
@@ -412,7 +402,7 @@ export class GrantStore {
 
   /** 暂停 / 恢复 / 撤销 (撤销是终态: 版本 +1, 不允许重新启用同一 grantId) */
   async transition(grantId: string, action: 'pause' | 'resume' | 'revoke', opts: { by?: string; reason?: string } = {}): Promise<{ ok: boolean; error?: string; grant?: ContactGrant }> {
-    await this.load();
+    await this.load(); await this.refreshIfStale();
     const g = this.grants.find((x) => x.grantId === grantId);
     if (!g) return { ok: false, error: 'grant_not_found' };
     if (g.status === 'revoked') return { ok: false, error: 'grant_already_revoked' };
@@ -457,7 +447,7 @@ export class GrantStore {
    *      ④ 低版本不覆盖高版本 ⑤ 同版本内容不同 → 冲突, 不覆盖
    */
   async applySignedSync(incoming: ContactGrant, opts: { requireSignature?: boolean } = {}): Promise<SyncResult> {
-    await this.load();
+    await this.load(); await this.refreshIfStale();
     const requireSig = opts.requireSignature !== false;
     if (requireSig) {
       const dev = this.getDevice(incoming.signature?.deviceId || '');
@@ -487,11 +477,25 @@ export class GrantStore {
     return { ok: true, grant: this.grants[i] };
   }
 
-  /** 手机撤销 → 桌面收到后立即失效 (撤销事件可以带更高的版本) */
-  async applyRevocation(grantId: string, opts: { by?: string; reason?: string; version?: number } = {}): Promise<SyncResult> {
-    await this.load();
+  /**
+   * 手机撤销 → 桌面收到后立即失效 (撤销事件可以带更高的版本)。
+   * 带签名时**先验签**: 撤销也必须来自已登记设备 (否则本地进程能冒充手机收回/伪造撤销)。
+   */
+  async applyRevocation(grantId: string, opts: { by?: string; reason?: string; version?: number; revokedAt?: string; signature?: GrantSignature } = {}): Promise<SyncResult> {
+    await this.load(); await this.refreshIfStale();
     const g = this.grants.find((x) => x.grantId === grantId);
     if (!g) return { ok: false, code: 'grant_missing', reason: `本地没有 ${grantId}` };
+    if (opts.signature) {
+      const dev = this.getDevice(opts.signature.deviceId);
+      if (!dev) return { ok: false, code: 'grant_device_untrusted', reason: `撤销来自未登记设备 ${opts.signature.deviceId}` };
+      const payload = canonicalRevocationPayload({
+        grantId, grantVersion: opts.version ?? g.grantVersion, revokedAt: opts.revokedAt || new Date().toISOString(), by: opts.by || 'mobile',
+      });
+      const hash = crypto.createHash('sha256').update(payload).digest('hex');
+      if (opts.signature.payloadHash !== hash) return { ok: false, code: 'grant_device_untrusted', reason: '撤销载荷 hash 不匹配 (被改过)' };
+      const ok = (() => { try { return crypto.verify(null, Buffer.from(payload, 'utf8'), crypto.createPublicKey(dev.publicKeyPem), Buffer.from(opts.signature.sig, 'base64')); } catch { return false; } })();
+      if (!ok) return { ok: false, code: 'grant_device_untrusted', reason: '撤销签名校验失败' };
+    }
     if (g.status === 'revoked') return { ok: true, grant: g };
     g.status = 'revoked';
     g.revokedAt = new Date().toISOString();
@@ -510,9 +514,7 @@ export class GrantStore {
     effective: string;
   }> {
     await this.load();
-    const label: Record<GrantLevel, string> = {
-      none: '不允许使用', task_once: '本次任务', persistent: '长期自动使用', full_contact_access: '完全授权联系方式能力',
-    };
+    const label = GRANT_LEVEL_LABEL;
     const mine = this.grants.filter((g) => g.ownerDid === ownerDid);
     const active = await this.activeFor(ownerDid);
     return {

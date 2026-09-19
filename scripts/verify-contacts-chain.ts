@@ -32,6 +32,7 @@ const { decideContactAction } = await import('../src/agents/contacts/policy.js')
 const { looksLikePlaintextSecret } = await import('../src/web/routes-contacts.js');
 const { generateDeviceKeyPair, signGrant } = await import('../src/agents/contacts/grants.js');
 const { contactsCli, authorizationCard } = await import('../src/agents/contacts/cli.js');
+const mobileContacts = await import('../src/web/mobile-contacts.js');
 const { createGoal, readGoal } = await import('../src/agents/goal-store.js');
 const { startRun, readRun } = await import('../src/agents/run-store.js');
 const { SkillsManager } = await import('../src/agents/skills-manager.js');
@@ -461,8 +462,14 @@ async function main() {
   assert('S. 撤销授权 → 等待中的任务转人工 (不再自动唤醒)', rv.ok && rv.affectedGoals.includes(goalS.goalId), `affected=${rv.affectedGoals.join(',')}`);
   const goalSAfter = (await readGoal(goalS.goalId))!;
   assert('S. 任务状态 = needs_human 且留 unresolved', goalSAfter.status === 'needs_human' && goalSAfter.unresolvedItems.join(' ').includes('已撤销'));
+  // 撤销"某一条"≠"没有任何授权": 若还有别的 active 授权覆盖, 发送仍应被允许 (由那条授权负责)
+  const stillActive = await chain.grants.activeFor(OWNER);
+  assert('S. 被撤销的那条不再生效 (管辖授权换成别的 active 授权, 而不是硬拒)',
+    !stillActive || stillActive.grantId !== full.grant!.grantId, `active=${stillActive?.grantId || 'none'}`);
+  const revokeAllResult = await chain.revokeAllGrants({ by: 'leo', reason: 'S 段全撤' });
+  assert('S. 全撤后确实没有生效授权', (await chain.grants.activeFor(OWNER)) === null, `revoked=${revokeAllResult.revoked.length}`);
   const afterGrantRevoke = await chain.send({ contactId: P_contact.contactId, goalId: goalS.goalId, body: '撤销后再试' });
-  assert('S. 撤销后新发送被拒', afterGrantRevoke.status === 'denied' && afterGrantRevoke.blockKind === 'grant_denied', `blockKind=${afterGrantRevoke.blockKind}`);
+  assert('S. 没有任何授权时新发送被拒', afterGrantRevoke.status === 'denied' && afterGrantRevoke.blockKind === 'grant_denied', `blockKind=${afterGrantRevoke.blockKind}`);
 
   const grantsPath = path.join(TMP, '.bolloon', 'contacts', 'grants.json');
   const grantsBackup = fs.readFileSync(grantsPath, 'utf8');
@@ -490,6 +497,52 @@ async function main() {
   assert('T. /contacts authorize 真建立长期授权', cliAuthorize.ok && /已授权/.test(cliAuthorize.lines.join('\n')));
   const cliAfter = await contactsCli(chain, '');
   assert('T. 授权后 CLI 立刻看到新状态 (同一份事实)', (cliAfter.lines.join('\n')).includes('长期自动使用'));
+
+  // ── U. 手机端真跑 (真 WebCrypto 签名 → 真 HTTP → 桌面验签 → 真发送) ─────────
+  await chain.revokeAllGrants({ by: 'leo', reason: 'U 段开始前清场 (让手机授出的那条成为唯一有效授权)' });
+  const phoneStore = (() => { const m = new Map<string, string>(); return { getItem: (k: string) => (m.has(k) ? m.get(k)! : null), setItem: (k: string, v: string) => { m.set(k, v); }, removeItem: (k: string) => { m.delete(k); } }; })();
+  assert('U. 手机端能建 Ed25519 设备密钥 (WebCrypto)', mobileContacts.ed25519Available() && !!(await mobileContacts.loadOrCreateDeviceKey(phoneStore)).publicKeyPem.includes('BEGIN PUBLIC KEY'));
+
+  const phoneAuth = await mobileContacts.authorizeFromPhone({ base, choice: 'persistent', ownerDid: OWNER, storage: phoneStore });
+  assert('U. 手机确认的长期授权经真 HTTP 送到桌面并被验签接受', phoneAuth.ok, `grantId=${phoneAuth.data?.grantId} note=${phoneAuth.note}`);
+  const goalU = await createGoal({ objective: '手机授权后的任务' });
+  const uSend = await chain.send({ contactId: emailVerify.contact!.contactId, goalId: goalU.goalId, body: '手机授权后不该再打断我' });
+  assert('U. 桌面按手机授权直接发送 (不再创建待批准)', (uSend.status === 'sent' || uSend.status === 'awaiting_reply') && !uSend.consentId, `status=${uSend.status} consentId=${uSend.consentId || 'none'}`);
+  const uRec = (await chain.store.listSends()).find((x) => x.requestId === uSend.requestId)!;
+  assert('U. 证据写明来自手机签名的哪条授权', uRec.grantId === phoneAuth.data!.grantId && uRec.approvalSkipped === true, `grantId=${uRec.grantId}`);
+
+  const phoneFull = await mobileContacts.authorizeFromPhone({ base, choice: 'full_contact_access', ownerDid: OWNER, storage: phoneStore });
+  assert('U. 手机也能授出完全授权', phoneFull.ok, `level=${phoneFull.data?.level}`);
+  const goalU2 = await createGoal({ objective: '完全授权任务 (手机授出)' });
+  const uSensitive = await chain.send({ contactId: emailVerify.contact!.contactId, goalId: goalU2.goalId, body: '项目数据 + 身份证 110101199003078515' });
+  assert('U. 完全授权下敏感内容直接发 (手机授权的效果落在桌面执行上)', uSensitive.status === 'sent' || uSensitive.status === 'awaiting_reply', `status=${uSensitive.status}`);
+  const uForbidden = await chain.send({ contactId: emailVerify.contact!.contactId, goalId: goalU2.goalId, body: '密码: hunter2' });
+  assert('U. 完全授权也不放行密钥/密码', uForbidden.status === 'denied' && uForbidden.blockKind === 'forbidden_content_category', `blockKind=${uForbidden.blockKind}`);
+
+  const phoneRevoke = await mobileContacts.revokeFromPhone({ base, grantId: phoneFull.data!.grantId, storage: phoneStore, reason: '手机收回', version: 7 });
+  assert('U. 手机撤销 (带签名) → 桌面立即失效', phoneRevoke.ok);
+  const activeAfterPhoneRevoke = await chain.grants.activeFor(OWNER);
+  assert('U. 撤销后桌面不再持有该完全授权', !activeAfterPhoneRevoke || activeAfterPhoneRevoke.grantId !== phoneFull.data!.grantId, `active=${activeAfterPhoneRevoke?.grantId || 'none'}`);
+
+  const view = await mobileContacts.loadFromDesktop(base, phoneStore);
+  assert('U. 手机从桌面读到的视图全是脱敏值', view.ok && !JSON.stringify(view.data).includes(SUPPLIER_EMAIL), `contacts=${view.data?.contacts.length} grants=${view.data?.grants.length}`);
+  const phoneCard = mobileContacts.buildPhoneCard(view.data || null, { deviceSigning: true });
+  assert('U. 手机端授权卡: 三个选项 + 明确不会获得的东西', phoneCard.choices.length === 3 && phoneCard.willNotGet.join(' ').includes('自动支付') && phoneCard.willNotGet.join(' ').includes('明文'));
+
+  // 离线: 不假装成功 → 队列 → 桌面回来后补同步
+  const offlineAuth = await mobileContacts.authorizeFromPhone({ base: 'http://127.0.0.1:1', choice: 'persistent', ownerDid: OWNER, storage: phoneStore });
+  assert('U. 桌面离线时授权只入本地队列 (不假装已生效)', !offlineAuth.ok && offlineAuth.queued === true && mobileContacts.pendingQueue(phoneStore).length === 1, `error=${String(offlineAuth.error).slice(0, 60)}`);
+  const flush = await mobileContacts.flushQueuedGrants(base, phoneStore);
+  assert('U. 桌面回来 → 排队授权补同步成功且队列清空', flush.sent === 1 && mobileContacts.pendingQueue(phoneStore).length === 0);
+  const capsRaw = phoneStore.getItem('bolloon.contacts.capabilities.v1') || '';
+  assert('U. 手机本地只存 capability 副本 (无明文邮箱/手机号)', capsRaw.length > 0 && !capsRaw.includes(SUPPLIER_EMAIL) && !capsRaw.includes(SUPPLIER_PHONE), `副本字节=${capsRaw.length}`);
+
+  const noSignCrypto = {} as any;
+  const noSign = await mobileContacts.authorizeFromPhone({ base, choice: 'persistent', ownerDid: OWNER, storage: phoneStore, cryptoObj: noSignCrypto });
+  assert('U. WebView 不支持 Ed25519 → 明确报 device_signing_unavailable (不发未签名授权)', !noSign.ok && String(noSign.error).includes('device_signing_unavailable'));
+
+  const phoneApprove = await mobileContacts.decideApprovalFromPhone(base, { consentId: 'consent-does-not-exist', action: 'approve' });
+  assert('U. 手机上批准不存在的待批准 → 如实失败 (不假装已批准)', !phoneApprove.ok, `error=${String(phoneApprove.error).slice(0, 50)}`);
 
   srv.close(); srv.closeAllConnections?.();
   smtp.close(); gateway.close();

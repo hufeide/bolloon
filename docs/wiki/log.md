@@ -4,6 +4,7 @@
 > `phase` ∈ {init / feature / fix / refactor / docs / chore / test}.
 
 | 日期 | phase | 一句话 | 关联 |
+| 2026-09-19 | feat | **手机端完成联系方式与授权能力 (真 WebCrypto 签名 → 真 HTTP → 桌面验签 → 直接发送; 含离线排队/撤销即时失效; 真跑 101/0)** | [contacts-protocol.md](./contacts-protocol.md) / [mobile-contacts.ts](../../src/web/mobile-contacts.ts) / [verify-contacts-chain.ts](../../scripts/verify-contacts-chain.ts) |
 | 2026-09-19 | feat | **联系方式持久能力授权 (consent → grant): 确认一次, Agent 长期自动使用 (真跑 83/0, 含真 Ed25519 签名同步 + 撤销期间转人工 + 存储损坏 fail-closed)** | [contacts-protocol.md](./contacts-protocol.md) / [grants.ts](../../src/agents/contacts/grants.ts) / [verify-contacts-chain.ts](../../scripts/verify-contacts-chain.ts) |
 | 2026-09-19 | feat | **联系方式与社交身份核心链 (绑定 → 受约束调用 → 进长期任务 → 等待回复 → Supervisor 恢复 → 证据回放): 真跑 51/0 (真 SMTP 服务器 + 真 HTTP 网关 + 真 express 路由 + 真 Goal/Run/Skills)** | [contacts-protocol.md](./contacts-protocol.md) / [chain.ts](../../src/agents/contacts/chain.ts) / [verify-contacts-chain.ts](../../scripts/verify-contacts-chain.ts) |
 | 2026-09-19 | release | **0.4.29 已 npm publish (EXIT=0, 1404 文件 18.1MB); 顺手修掉一直挡着发布的 electron 构建 (import.meta → TS1343)** | [update-protocol.md](./update-protocol.md) / [package.json](../../package.json) / [tsconfig.electron.json](../../tsconfig.electron.json) |
@@ -2587,3 +2588,47 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 
 **未做 (如实)**: 手机端是契约 + 真密码学 (脚本扮演手机设备; 真机 App 未改) · 未做按类别白名单撤销 (`allowedCategories`) ·
 无设备信任衰减 · 多设备冲突只实现"撤销优先" · Onboard 里的授权卡 UI 未接 (卡片文案与三选项已就绪, Web 端有 `/api/contacts/grants`).
+
+## [2026-09-19] feat | 手机端联系方式与授权: 手机确认一次 → 桌面长期自动使用
+
+**手机端做什么 (与桌面分工不变)**: 输入手机号/邮箱 · OTP 确认 · 展示待发送内容 · 批准高风险联系 ·
+**用设备私钥签名长期授权** · 保存本地 capability 副本。桌面仍是落盘/执行/等待回复/证据的唯一持有者。
+
+**怎么保证"手机授的权桌面会认"**
+- 新增 `src/agents/contacts/grant-payload.ts`: 签名载荷的**单一规范** (纯函数, 无 node: 导入) —— 手机 WebCrypto 与桌面 Node
+  必须对同一条授权算出同一个字节串。字段顺序固定, 不含 `signature` 自身, 不含 `lastUsedAt`。
+- 手机用 WebCrypto Ed25519 签名 → 桌面用 `devices.json` 登记公钥 Node `crypto.verify` 验签 → 通过才写盘。
+- 单测真验过: 手机签 → `applySignedSync` 接受; 改任一被签字段 → `grant_device_untrusted`; 未登记设备 → 拒。
+- 撤销也签名 (`canonicalRevocationPayload`): 桌面拒收未登记设备的撤销, 篡改撤销不会误撤。
+
+**手机端代码**
+- `src/web/mobile-contacts.ts` (新): 设备密钥 (JWK 存本机) · 签名/撤销签名 · 真 HTTP 调桌面 · **离线队列** ·
+  capability 副本 · 授权卡数据 · `buildPhoneCard`
+- `src/web/mobile-core.ts`: `core.contacts.*` (deviceSigning/desktopBase/storage/view/grants/card/authorize/revoke/bind/verify/decide/flushQueue)
+  + `resolve('/api/contacts')` `resolve('/api/contacts/grants')`
+- `src/web/mobile.html` + `mobile.js`: 「我」页新增「联系方式与授权」→ sheet (绑定/验证 · 待批准含待发内容预览 ·
+  三个授权选项 · 撤销全部 · 自动补同步排队授权); 独立 IIFE, 不动既有逻辑
+- `npm run build:web` 产出 `dist/web/mobile-core.js` (含 core.contacts)
+
+**三条诚实纪律 (手机端)**
+1. WebView 不支持 Ed25519 → 明确报 `device_signing_unavailable` 并提示去桌面授权, **绝不发未签名授权**
+2. 桌面离线 → 授权进本地队列 (`queued=true`, 文案说"等桌面在线自动同步"), 桌面回来 `flushQueuedGrants()` 补同步;
+   撤销在桌面不在线时**不会**被当作已完成
+3. 本地只存 capability 副本 (脱敏); 明文只走"手机→桌面"这一次 HTTP; 私钥只以 JWK 存本机, 上传的只有 SPKI 公钥 PEM
+
+**真跑抓到的两个硬伤 (都修了)**
+- **长驻进程缓存 Grant 列表**: web server 在别的进程撤销后仍用旧事实 → 对"撤销必须立即失效"是硬伤。
+  现在 `GrantStore` 每次读/写前按 **mtime** 判断是否重读 → 撤销/新授权**跨进程立即生效**。
+- **`latestFor` 按等级排全部 (含已撤销)**: 一条已撤销的高等级授权会盖住后建的**有效**低等级授权 →
+  用户明明有长期授权却看到 "grant_revoked"。改成 **active 优先**, 没有 active 才拿失效的来解释原因。
+
+**验证**
+- 真跑 `scripts/verify-contacts-chain.ts` → **101 passed / 0 failed, EXIT=0**。U 段: 手机建 Ed25519 密钥 → 手机授权经真 HTTP
+  送桌面被验签接受 → 桌面**直接发送**(不再待批准, 证据写明 grantId/approvalSkipped) → 手机授出完全授权 → 敏感内容直接发而密码**仍被拒**
+  → 手机撤销(带签名) 桌面立即失效 → 篡改撤销被拒 → 手机视图全脱敏 → 桌面离线只入队列 → 回来补同步 → 本地副本无明文
+  → 不支持签名的环境明确报错
+- 手机端单测 `src/test/mobile-contacts.test.ts` **16/16** (真 express + 真 HTTP + 真 WebCrypto 互操作)
+- 联系方式单测 63/63 · tsc 0 错 · `build:web` + 全量 vitest 见提交统计 · wiki 四门禁 OK
+
+**未做 (如实)**: 真机 App 未改 (APK/IPA 未重出; 脚本与单测扮演手机真做密码学与 HTTP) · UI 未在真机/模拟器点过
+(只做语法/构建/逻辑校验) · 生物识别 (FaceID/指纹) 与系统级确认未接 (当前 sheet 内二次确认)。

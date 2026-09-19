@@ -380,6 +380,8 @@ export function registerContactRoutes(
         by: String(req.body?.by || 'mobile'),
         reason: req.body?.reason ? String(req.body.reason) : undefined,
         version: Number(req.body?.version) || undefined,
+        revokedAt: req.body?.revokedAt ? String(req.body.revokedAt) : undefined,
+        signature: req.body?.signature,      // 手机签名 (有则验签, 未登记设备一律拒)
       });
       res.status(r.ok ? 200 : 400).json({ ok: r.ok, error: r.reason, grant: r.grant });
     } catch (err: any) {

@@ -27,6 +27,9 @@ import {
   wipeLocalData,
 } from './mobile-privacy.js';
 
+// 2026-09-19: 手机端联系方式与授权能力 (设备私钥签名, 只存 capability 副本)
+import * as mobileContacts from './mobile-contacts.js';
+
 // ============ 事件总线 (替代 SSE) ============
 
 type BusHandler = (msg: any) => void;
@@ -165,7 +168,8 @@ export function handleDeepLink(rawUrl: unknown): DeepLinkResult {
 // ============ 内核 API (mobile.js 对接面, 路由到 data/agent 层) ============
 
 export const core = {
-  /** 路径 → 内核函数 (mobile.js api.get fallback 链) */
+
+/** 路径 → 内核函数 (mobile.js api.get fallback 链) */
   resolve(path: string): (() => Promise<any>) | null {
     const p = path || '';
     if (p === '/channels') return () => core.channels.get();
@@ -173,6 +177,9 @@ export const core = {
     if (p === '/api/peers') return () => core.peers.list();
     if (p === '/api/mcp/tools') return () => core.mcp.tools();
     if (p === '/api/skills') return () => core.skills.list();
+    // 2026-09-19: 联系方式与授权 (手机端只拿脱敏值; 授权用设备私钥签名)
+    if (p === '/api/contacts') return () => core.contacts.view();
+    if (p === '/api/contacts/grants') return () => core.contacts.grants();
     if (p === '/api/auth/status') return () => core.identity.status();
     if (p === '/api/payments/pending') return () => core.payments.pending();
     if (p === '/api/llm-config') return () => core.data.getLlmConfig();
@@ -779,6 +786,88 @@ export const core = {
       return mobileGatewayTool(String(name || ''), args || {});
     },
   },
+  /**
+   * 联系方式与持久授权 (2026-09-19, Phase 5/10)
+   *   手机负责: 输入 · OTP 确认 · 生物识别/系统确认 · 展示待发内容 · 批准高风险联系 · **签名长期授权**
+   *   桌面负责: 落盘 · 执行 · 等待回复 · 证据
+   * 铁律: 明文不进手机存储 (只存 capability 副本), 桌面离线不假装成功, 不支持 Ed25519 就明说。
+   */
+  contacts: {
+    /** 本机是否能做设备签名 (老 WebView 可能没有 Ed25519) */
+    deviceSigning(): boolean { return mobileContacts.ed25519Available(); },
+    /** 桌面 HTTP 地址 (拿不到 → null, 不猜) */
+    async desktopBase(): Promise<string | null> {
+      try {
+        const u = await (core as any).desktop?.url?.();
+        const raw = (u && typeof u === 'object') ? (u.url || u.baseUrl || '') : u;
+        const s = String(raw || '').replace(/\/+$/, '');
+        return s || null;
+      } catch { return null; }
+    },
+    /** 手机端本地存储 (只放: 设备私钥 JWK / capability 副本 / 离线队列) */
+    storage(): mobileContacts.StorageLike {
+      try {
+        if (typeof localStorage !== 'undefined') return localStorage;
+      } catch { /* 隐私模式 */ }
+      const mem = new Map<string, string>();
+      return { getItem: (k) => (mem.has(k) ? mem.get(k)! : null), setItem: (k, v) => { mem.set(k, v); }, removeItem: (k) => { mem.delete(k); } };
+    },
+    /** 从桌面读脱敏视图 (桌面离线 → 退回本地 capability 副本并标注) */
+    async view() {
+      const base = await core.contacts.desktopBase();
+      const r = await mobileContacts.loadFromDesktop(base, core.contacts.storage());
+      return { ...(r.data || { contacts: [], grants: [], effective: '', approvals: [], waiting: [] }), offline: !r.ok, note: r.note, error: r.error };
+    },
+    async grants() {
+      const v = await core.contacts.view();
+      return { grants: (v as any).grants || [], effective: (v as any).effective || '', offline: (v as any).offline };
+    },
+    /** 手机端摘要卡 (给 UI 直接渲染) */
+    async card() {
+      const base = await core.contacts.desktopBase();
+      const r = await mobileContacts.loadFromDesktop(base, core.contacts.storage());
+      return mobileContacts.buildPhoneCard(r.data || null, { deviceSigning: mobileContacts.ed25519Available(), offline: r.error });
+    },
+    /** 确认授权 (三个选项之一) → 设备签名 → 桌面验签; 桌面离线则进本地队列 */
+    async authorize(choice: 'task_once' | 'persistent' | 'full_contact_access', ownerDid?: string) {
+      const base = await core.contacts.desktopBase();
+      let did = ownerDid;
+      if (!did) { try { const st: any = await (core as any).identity?.status?.(); did = st?.did; } catch { /* 没有身份就用占位 */ } }
+      return mobileContacts.authorizeFromPhone({
+        base: base || '', choice, ownerDid: did || 'did:bolln:local',
+        storage: core.contacts.storage(), grantedBy: 'leo',
+      });
+    },
+    /** 手机撤销 (带签名; 桌面离线不假装已撤销) */
+    async revoke(grantId: string, reason?: string) {
+      const base = await core.contacts.desktopBase();
+      if (!base) return { ok: false, error: 'desktop_offline: 撤销需要桌面在线' };
+      return mobileContacts.revokeFromPhone({ base, grantId, reason, storage: core.contacts.storage(), version: Date.now() });
+    },
+    async bind(kind: 'phone' | 'email', value: string, region?: string) {
+      const base = await core.contacts.desktopBase();
+      return mobileContacts.bindFromPhone(base, { kind, value, region }, core.contacts.storage());
+    },
+    async verify(contactId: string, challengeId: string, code: string) {
+      const base = await core.contacts.desktopBase();
+      return mobileContacts.verifyFromPhone(base, { contactId, challengeId, code }, core.contacts.storage());
+    },
+    /** 手机上批准/拒绝高风险联系 (展示待发内容后) */
+    async decide(consentId: string, action: 'approve' | 'reject', opts: { body?: string; reason?: string } = {}) {
+      const base = await core.contacts.desktopBase();
+      return mobileContacts.decideApprovalFromPhone(base, { consentId, action, ...opts });
+    },
+    /** 桌面回来后补同步排队中的授权 */
+    async flushQueue() {
+      const base = await core.contacts.desktopBase();
+      if (!base) return { sent: 0, failed: mobileContacts.pendingQueue(core.contacts.storage()).length, results: [] };
+      return mobileContacts.flushQueuedGrants(base, core.contacts.storage());
+    },
+    queue() { return mobileContacts.pendingQueue(core.contacts.storage()); },
+    capabilities() { return mobileContacts.loadCapabilityCopy(core.contacts.storage()); },
+    device() { return mobileContacts.loadOrCreateDeviceKey(core.contacts.storage()); },
+  },
+
   skills: {
     async list(): Promise<any[]> {
       const s = await import('./mobile-sync.js');

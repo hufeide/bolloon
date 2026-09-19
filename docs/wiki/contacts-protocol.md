@@ -289,3 +289,56 @@ CLI / Web (`/api/contacts/grants*`) / 手机读的都是同一份 `grants.json` 
 - 手机端仍是**契约 + 真密码学** (脚本扮演手机设备, 真密钥对真签名过真 HTTP), 不是真机 App。
 - 完全授权下敏感内容"允许发送"依赖类别识别器的覆盖面; 识别不到的新类别会走普通路径 (这是已知取舍)。
 - 未做: 按类别单独撤销 (`allowedCategories` 白名单) · 设备级信任度衰减 · 多设备冲突自动合并 (现在撤销优先)。
+
+## 手机端能力 (2026-09-19, Phase 5/10 落地)
+
+手机端负责 (与桌面分工不变): **输入联系方式 · OTP/验证链接确认 · 生物识别/系统确认 · 展示待发送内容 ·
+批准高风险联系 · 用设备私钥签名长期授权 · 保存本地能力副本**。桌面负责落盘/执行/等待回复/证据。
+
+### 代码落点
+
+| 文件 | 作用 |
+|---|---|
+| `src/web/mobile-contacts.ts` | 手机端能力的**纯逻辑** (浏览器安全, 无 `node:` 导入): 设备密钥 · 签名/撤销签名 · 真 HTTP 调桌面 · 离线队列 · capability 副本 · 授权卡数据 |
+| `src/web/mobile-core.ts` → `core.contacts.*` | 内核 API 面 (编译进 `mobile-core.js`), mobile.js 只调这一层 |
+| `src/web/mobile.html` + `mobile.js` | 「我」页 → 联系方式与授权 sheet: 绑定/验证 · 待批准(含待发内容预览) · 三个授权选项 · 撤销 · 离线补同步 |
+| `src/agents/contacts/grant-payload.ts` | **签名载荷单一规范** (手机 WebCrypto 与桌面 Node 必须字节一致) |
+
+### 签名互操作 (为什么手机授的权桌面会认)
+
+手机用 WebCrypto `Ed25519` 对 `canonicalGrantPayload(grant)` 签名 → 桌面用 `devices.json` 里登记的公钥
+Node `crypto.verify` 验签。两侧**共用同一个载荷函数** (`grant-payload.ts`), 字段顺序/是否含 `lastUsedAt` 等
+全部一致 —— 这是单测里真验过的 (手机签 → 桌面 `applySignedSync` 接受; 改任一被签字段 → 拒)。
+
+### 三条诚实纪律 (手机端)
+
+1. **WebView 不支持 Ed25519 就明说**: 返回 `device_signing_unavailable` 并提示去桌面授权,
+   **绝不发"未签名"的授权糊过去** (桌面本来就拒收)。
+2. **桌面离线不假装成功**: 授权进 `bolloon.contacts.queue.v1` 本地队列 + 返回 `queued=true`,
+   文案明说"等桌面在线时自动同步"; 桌面回来后 `flushQueuedGrants()` 补同步并更新状态。
+   撤销同理: 桌面不在线时**不会**当作已撤销, 提示稍后重试或去桌面撤销。
+3. **本地只存 capability**: `bolloon.contacts.capabilities.v1` 里只有 `contactId/kind/displayValue(脱敏)/状态/能力`;
+   手机号/邮箱明文只走"手机→桌面"这一次 HTTP 请求 (桌面负责落盘), 私钥只以 JWK 存本机且永不上传 (只上传 SPKI 公钥 PEM)。
+
+### 手机端验收 (真跑, 同一脚本 U 段)
+
+`npx tsx scripts/verify-contacts-chain.ts` → **101 passed / 0 failed, EXIT=0**, 其中 U 段:
+
+- 手机建 Ed25519 设备密钥 (真 WebCrypto) → 手机确认的长期授权经**真 HTTP** 送桌面并**被验签接受**
+- 桌面据此**直接发送**(不再创建待批准) 且证据写明 `grantId`/`approvalSkipped=true`
+- 手机授出**完全授权** → 桌面敏感内容直接发; 密码**仍被拒**
+- 手机撤销(带签名) → 桌面**立即失效**; 篡改撤销被拒且不会误撤
+- 手机从桌面读到的视图**全是脱敏值**; 授权卡三选项 + "不会获得"清单齐
+- 桌面离线 → 授权**只入本地队列**(不假装生效) → 桌面回来 **补同步成功且队列清空**
+- 本地 capability 副本**无明文**; 不支持 Ed25519 的加密环境 → 明确报错
+
+### Grant 存储的跨进程即时性 (真跑抓到的一个硬伤)
+
+长驻进程 (web server) 早先会缓存 `grants.json` 列表 → **别的进程撤销后它还在用旧事实** (对"撤销必须立即生效"
+是真问题)。现在 `GrantStore` 每次读/写前按 **mtime** 判断是否重读, 撤销/新授权**跨进程立即生效**, 不需要重启。
+
+### 仍未被真机覆盖 (如实)
+
+- 手机端是**契约 + 真密码学**(脚本与单测扮演手机: 真 WebCrypto 真签名过真 HTTP), **真机 App 未改** (APK/IPA 未重出)。
+- UI 层 (mobile.html/mobile.js) 只做了语法与构建校验 + 逻辑单测, 没在真机/模拟器点过 (本机 iOS 模拟器脚本可用, 本轮未跑)。
+- 生物识别 (FaceID/指纹) 与系统级确认未接 (当前是 sheet 内 `confirm` 二次确认)。

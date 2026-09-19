@@ -3031,3 +3031,142 @@
   document.addEventListener('DOMContentLoaded', init);
   if (document.readyState !== 'loading') init();
 })();
+
+// ============ 联系方式与持久授权 (2026-09-19) ============
+// 独立 IIFE: 不改动既有逻辑, 只用 window.BolloonCore.contacts (编译进 mobile-core.js)。
+// 分工: 手机 = 输入/OTP/确认/展示待发内容/批准/签名授权; 桌面 = 落盘/执行/等待回复/证据。
+(function () {
+  const $ = (sel) => document.querySelector(sel);
+  const C = () => (window.BolloonCore && window.BolloonCore.contacts) || null;
+  const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  function openSheet() { const el = $('#contacts-sheet'); if (el) el.hidden = false; }
+  function closeSheet() { const el = $('#contacts-sheet'); if (el) el.hidden = true; }
+  function setText(id, text) { const el = $(id); if (el) el.textContent = text; }
+
+  let _lastChallenge = null;
+
+  async function refresh() {
+    const c = C();
+    setText('#contacts-effective', '加载中...');
+    if (!c) { setText('#contacts-effective', '内核未就绪 (mobile-core 没加载)'); return; }
+    setText('#contacts-signing', c.deviceSigning()
+      ? '本机可做设备签名 (Ed25519) — 授权由这台手机签名后桌面才认'
+      : '⚠ 本机 WebView 不支持 Ed25519 设备签名 — 无法在手机上授权, 请在桌面端授权');
+    // 桌面回来先补同步排队中的授权
+    try { const fl = await c.flushQueue(); if (fl && fl.sent) setText('#contacts-signing', `已补同步 ${fl.sent} 条手机授权到桌面`); } catch (e) {}
+
+    let card = null;
+    try { card = await c.card(); } catch (e) { card = null; }
+    if (!card) { setText('#contacts-effective', '读取失败'); return; }
+    setText('#contacts-effective',
+      `当前授权: ${card.effective}` + (card.deviceSigning ? '' : ' · 本机不能签名'));
+    setText('#contacts-willnot', '不会获得权限: ' + (card.willNotGet || []).join(' · '));
+
+    // 联系方式 (只有脱敏值)
+    const list = $('#contacts-list');
+    if (list) {
+      list.innerHTML = (card.contacts && card.contacts.length)
+        ? card.contacts.map((x) => `<div class="sheet-text">${esc(x.displayValue)} <span style="color:var(--text-secondary)">[${esc(x.kind)}] ${esc(x.state)} · ${esc(x.label)}</span></div>`).join('')
+        : '<div class="sheet-text" style="color:var(--text-secondary)">还没有绑定 — 在下面输入手机号或邮箱</div>';
+    }
+
+    // 待批准 (展示待发内容 → 批准/拒绝)
+    const ap = $('#contacts-approvals');
+    if (ap) {
+      ap.innerHTML = (card.approvals && card.approvals.length)
+        ? `<div class="sheet-title" style="margin-top:10px">待你批准 (${card.approvals.length})</div>` + card.approvals.map((a) => `
+          <div style="border:1px solid var(--border);border-radius:10px;padding:8px;margin-top:6px">
+            <div class="sheet-text" style="font-weight:600">${esc(a.contactName)} · ${esc(a.channel)}${a.reallySent ? '' : ' · 本地落盘(未真实外发)'}</div>
+            <div class="sheet-text" style="font-size:12px">${a.subject ? esc(a.subject) + ' — ' : ''}${esc(a.bodyPreview)}</div>
+            <div class="sheet-text" style="font-size:11px;color:var(--text-secondary)">原因: ${esc(a.reason)}</div>
+            <div style="display:flex;gap:8px;margin-top:6px">
+              <button class="sheet-choice" data-approve="${esc(a.consentId)}" style="flex:1">批准并发送</button>
+              <button class="sheet-choice sheet-cancel" data-reject="${esc(a.consentId)}" style="flex:1">拒绝</button>
+            </div>
+          </div>`).join('')
+        : '<div class="sheet-text" style="color:var(--text-secondary);margin-top:10px">没有待批准的联系</div>';
+      ap.querySelectorAll('[data-approve]').forEach((b) => b.addEventListener('click', async () => {
+        const id = b.getAttribute('data-approve');
+        const r = await C().decide(id, 'approve');
+        alert(r && r.ok ? '已批准并发送' : '批准失败: ' + ((r && r.error) || '未知'));
+        refresh();
+      }));
+      ap.querySelectorAll('[data-reject]').forEach((b) => b.addEventListener('click', async () => {
+        const id = b.getAttribute('data-reject');
+        const r = await C().decide(id, 'reject', { reason: '手机端拒绝' });
+        alert(r && r.ok ? '已拒绝' : '拒绝失败: ' + ((r && r.error) || '未知'));
+        refresh();
+      }));
+    }
+
+    // 三个授权选项
+    const ch = $('#contacts-choices');
+    if (ch && !ch.dataset.bound) {
+      ch.dataset.bound = '1';
+      ch.innerHTML = (card.choices || []).map((x) => `<button class="sheet-choice" data-choice="${esc(x.id)}">${esc(x.label)}</button>`).join('');
+      ch.querySelectorAll('[data-choice]').forEach((b) => b.addEventListener('click', async () => {
+        const choice = b.getAttribute('data-choice');
+        const warn = choice === 'full_contact_access'
+          ? '完全授权联系方式能力: 手机号/邮箱能力交给 Agent, 普通与敏感内容不再逐次确认 (密钥/支付/合同承诺仍然拒绝)。确认吗?'
+          : choice === 'persistent' ? '长期使用: 以后 Agent 联系已验证的人不再打断你 (仍受频率/任务/证据/撤销约束)。确认吗?'
+            : '仅本次任务: 只授权当前任务使用。确认吗?';
+        if (window.confirm && !window.confirm(warn)) return;
+        const r = await C().authorize(choice);
+        if (r && r.ok) alert('已授权: 桌面已验签接受\n' + (r.note || ''));
+        else if (r && r.queued) alert('桌面暂时不在线\n授权已保存在手机本地队列, 桌面一上线自动同步\n(' + (r.error || '') + ')');
+        else alert('授权失败: ' + ((r && r.error) || '未知'));
+        refresh();
+      }));
+    }
+  }
+
+  function bindEvents() {
+    const item = $('#item-contacts');
+    if (item) item.addEventListener('click', () => { openSheet(); refresh(); });
+    const close = $('#contacts-close');
+    if (close) close.addEventListener('click', closeSheet);
+
+    const bind = $('#contacts-bind');
+    if (bind) bind.addEventListener('click', async () => {
+      const v = ($('#contacts-value') || {}).value || '';
+      if (!v.trim()) { alert('先输入手机号或邮箱'); return; }
+      const isEmail = /@/.test(v);
+      const r = await C().bind(isEmail ? 'email' : 'phone', v.trim(), isEmail ? undefined : 'CN');
+      if (!r || !r.ok) { alert('绑定失败: ' + ((r && r.error) || '未知')); return; }
+      _lastChallenge = r.data;
+      alert('已登记 ' + r.data.displayValue + '\n通道: ' + (r.data.channelLabel || '') +
+        (r.data.otpForLocalSink ? '\n本地落盘验证码: ' + r.data.otpForLocalSink : '\n验证码已通过通道发出, 收到后填在下面'));
+      refresh();
+    });
+
+    const verify = $('#contacts-verify');
+    if (verify) verify.addEventListener('click', async () => {
+      const code = ($('#contacts-code') || {}).value || '';
+      if (!_lastChallenge) { alert('先绑定一个手机号或邮箱'); return; }
+      const r = await C().verify(_lastChallenge.contactId, _lastChallenge.challengeId, code.trim());
+      if (!r || !r.ok) { alert('验证失败: ' + ((r && r.error) || '未知')); return; }
+      alert('验证通过: ' + r.data.displayValue + '\n下一步: 选择下面的授权等级 (验证 ≠ 自动长期授权)');
+      refresh();
+    });
+
+    const revoke = $('#contacts-revoke-all');
+    if (revoke) revoke.addEventListener('click', async () => {
+      if (window.confirm && !window.confirm('撤销全部联系方式授权? 之后 Agent 不能再自动联系任何人 (历史证据保留)')) return;
+      const card = await C().card();
+      const grants = (card && card.grants) || [];
+      if (!grants.length) { alert('当前没有生效中的授权'); return; }
+      let done = 0, err = '';
+      for (const g of grants) {
+        if (g.status !== 'active') continue;
+        const r = await C().revoke(g.grantId, '手机端收回');
+        if (r && r.ok) done++; else err = (r && r.error) || '未知';
+      }
+      alert(done ? `已撤销 ${done} 条授权` : ('撤销未完成: ' + err));
+      refresh();
+    });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindEvents);
+  else bindEvents();
+})();

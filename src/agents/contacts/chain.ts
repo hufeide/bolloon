@@ -539,9 +539,13 @@ export class ContactChain {
   }
 
   /** 手机撤销 → 桌面立即失效 */
-  async syncRevocation(grantId: string, opts: { by?: string; reason?: string; version?: number } = {}) {
+  async syncRevocation(grantId: string, opts: { by?: string; reason?: string; version?: number; revokedAt?: string; signature?: any } = {}) {
     const r = await this.grants.applyRevocation(grantId, opts);
-    if (r.ok) await this.ledger({ activity: 'contact.grant_revoked', detail: `收到手机端撤销 ${grantId} v${r.grant?.grantVersion} (by ${opts.by || 'mobile'})` });
+    if (r.ok) {
+      await this.ledger({ activity: 'contact.grant_revoked', detail: `收到手机端撤销 ${grantId} v${r.grant?.grantVersion} (by ${opts.by || 'mobile'}${opts.signature ? `, 签名设备 ${opts.signature.deviceId}` : ''})` });
+    } else {
+      await this.ledger({ activity: 'contact.grant_sync_rejected', detail: `拒绝手机端撤销 ${grantId}: ${r.code} — ${r.reason}` });
+    }
     return r;
   }
 
