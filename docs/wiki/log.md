@@ -2467,9 +2467,13 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
 
 **未完成 / 需要注意 (如实)**
 
-- `dist-tags.latest` 在本轮结束时**仍是 0.4.28** (publish 返回 0 但 `Your package is being processed and may
-  take a few minutes to become available`) → 按纪律**不重复 publish**, 轮询到公开后再跑
-  `node scripts/verify-release.mjs 0.4.29` 并打 tag `v0.4.29`。
+- **发布未完成 (发布事实, 不是成功)**: `npm publish` 返回 **EXIT=0** 且打印 `+ @bolloon/bolloon-agent@0.4.29`,
+  但 **registry 上查不到** —— 18:46 CST 实测: tarball 直链 `HTTP=404`、`npm view @bolloon/bolloon-agent@0.4.29` **404**、
+  `dist-tags.latest` 仍是 **0.4.28** (轮询 33×15s ≈ 8 分钟无变化; npm 自己的说法是
+  "Your package is being processed and may take a few minutes to become available")。
+  这正是 Phase 8 要抓的"**已发布 ≠ 用户可安装**": 按纪律**不重复 publish**、**不打 tag `v0.4.29`**
+  (tag 会假装发布完成), 等它公开后再跑 `node scripts/verify-release.mjs 0.4.29` + `git tag v0.4.29` + push tag。
+  (对照: 0.4.28 当时也是同一形状 —— publish 成功但 registry 未公开, 后来才出现, 属暂存式 token 的固有延迟。)
 - **消融实验本轮没跑成**: 环境初始化门禁未就绪 (`connectivity_pending`, 连通性结果 >24h 过期 + 234 个技能不合格),
   夹具已改为**明确退出码 3 + 打印修复命令**, 不再写"4 项工具循环失败"的误导报告; 上一轮那份误导输出已回退到
   14:04 那次真跑结果。需要 leo 跑 `bolloon setup --test` + 处理不合格技能后再跑。
