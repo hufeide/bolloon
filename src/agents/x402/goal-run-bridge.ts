@@ -40,22 +40,26 @@ export function bridgeEventFor(status: TransactionRecord['status']): BridgeEvent
 
 /** 一次交易的证据行 (写进 Run evidence / Goal evidence 的同一组字段) */
 export function transactionEvidenceLines(rec: TransactionRecord): string[] {
+  // 2026-09-18: `goal-store.addEvidence` 每行**截断 300 字** —— 所以审计关键字段必须排在**前面**,
+  //   哈希类(长且可从交易记录反查)放后面。真跑抓到过: verificationTrust/executionOk 被截掉。
   return [
     `transactionId=${rec.transactionId}`,
     `itemId=${rec.itemId}`,
+    `transactionStatus=${rec.status}`,
     `paymentMode=${rec.paymentMode}`,
     `chainSettled=${rec.chainSettled}`,
     `settlementFact=${rec.settlementFact || '(legacy-未记)'}`,     // 两层状态: 钱到底动没动, 审计一眼可见
-    `protocolVerified=${rec.protocolVerified === true}`,
-    `txHash=${rec.txHash || '(none)'}`,
-    `receiptHash=${rec.receiptHash || '(none)'}`,
-    `contentHash=${rec.contentHash || '(none)'}`,
     `verificationTrust=${rec.verificationTrust || 'unverified'}`,
-    `transactionStatus=${rec.status}`,
+    `protocolVerified=${rec.protocolVerified === true}`,
+    ...(rec.execution ? [`executionOk=${rec.execution.ok === true} schemaOk=${rec.execution.schemaOk === true}`] : []),
+    ...(rec.resourceOutcome ? [`resourceInstalled=${rec.resourceOutcome.installed} resourceExecuted=${rec.resourceOutcome.executed} outputContract=${rec.resourceOutcome.outputContract} criteriaHit=${rec.resourceOutcome.criteriaHit}${rec.resourceOutcome.failureStage ? ` failureStage=${rec.resourceOutcome.failureStage}` : ''}`] : []),
     ...(rec.responsibility ? [`responsibility=${rec.responsibility.type}(${rec.responsibility.reason})`] : []),
     ...(rec.milestones?.length ? (() => { const a = aggregateMilestones(rec.milestones); return [`milestones=${a.verified}/${a.total}`, `milestoneSettlement=${a.settlementFact}`]; })() : []),
     ...(rec.dispute ? [`dispute=opened(${rec.dispute.reason})`, `disputeResolved=${rec.dispute.resolution ? rec.dispute.resolution.decision : 'no'}`] : []),
-    ...(rec.execution ? [`executionOk=${rec.execution.ok === true} schemaOk=${rec.execution.schemaOk === true}`] : []),
+    // 长哈希垫底 (可从交易记录反查; 300 字截断时优先牺牲它们, 而不是上面的判定字段)
+    `txHash=${rec.txHash || '(none)'}`,
+    `receiptHash=${rec.receiptHash || '(none)'}`,
+    `contentHash=${rec.contentHash || '(none)'}`,
   ];
 }
 

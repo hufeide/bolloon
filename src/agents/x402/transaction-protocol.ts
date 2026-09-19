@@ -101,6 +101,17 @@ export interface TransactionRecord {
   responsibility?: { type: string; reason: string; evidence: string[] };
   /** 资源执行证据 (Phase 2: 买到的是可执行资源时才可能有) */
   execution?: { ok: boolean; tool?: string; startedAt?: string; durationMs?: number; outputHash?: string; schemaOk?: boolean; sourceDeclared?: boolean; reason?: string };
+  /**
+   * 资源侧结果 (2026-09-18 M1–M4 收口): 一眼能看出"钱花了之后资源到底成没成",
+   * 不用从一堆事件里反推。失败阶段也钉在这里 (M4 归责用)。
+   */
+  resourceOutcome?: {
+    installed: boolean;
+    executed: boolean;
+    outputContract: 'pass' | 'fail' | 'not_run';
+    criteriaHit: boolean;
+    failureStage?: 'install' | 'execute' | 'output_contract';
+  };
   /** Goal 判据是否命中 (verified 门的一项) */
   goalCriteriaMet?: boolean;
   policyDecision?: { allowed: boolean; reason?: string; dailySpent?: number };

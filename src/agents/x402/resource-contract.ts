@@ -86,7 +86,13 @@ const CAPABILITY_WORDS = ['schema_valid', 'source_declared', 'content_hash_bound
  */
 export function parseResourceContract(frontmatter: Record<string, unknown> | null | undefined, opts: { skillName?: string; skillVersion?: string } = {}): ContractParseResult {
   const fm: any = frontmatter || {};
-  const raw: any = fm.resource && typeof fm.resource === 'object' ? fm.resource : fm;
+  // 手写 SKILL.md 的 `resource: {…}` 常被最小 YAML 解析器当成**字符串**留下 → 这里两种都吃。
+  // (真跑抓到过: 夹具技能因此被判"没有资源契约字段", 顾问直接看不到任何可执行资源。)
+  let resObj: any = fm.resource;
+  if (typeof resObj === 'string') {
+    try { resObj = JSON.parse(resObj); } catch { resObj = undefined; }
+  }
+  const raw: any = resObj && typeof resObj === 'object' ? resObj : fm;
   const issues: string[] = [];
   const name = String(raw?.name || opts.skillName || fm.name || '').trim();
   const version = String(raw?.version || opts.skillVersion || fm.version || '').trim();

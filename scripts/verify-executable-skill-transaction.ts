@@ -246,7 +246,9 @@ const bridgeBad = await BRIDGE.bridgeTransactionToRunGoal(synthVerified, { goalI
 const afterBad = await GS.readGoal(goalId);
 const evBad = (afterBad?.evidence || []).join(' ');
 check('未命中判据 → 无 Goal 成功证据', bridgeBad.goalEvidenceWritten === false && !evBad.includes('已执行并命中判据'), evBad.slice(0, 120));
-check('但仍留下"资源已验证"的审计痕迹 (不静默)', evBad.includes('已验证') || evBad.includes('未成立'), evBad.slice(0, 160));
+// 2026-09-18: Phase 4 把这条审计行的措辞改成更准确的"付费资源未达成功证据门槛 (原因)"
+// (旧断言写死期待"已验证/未成立", 与实现脱节 → 按语义判定: 必须留下"未达标"的痕迹, 不静默)
+check('但仍留下"未达标"的审计痕迹 (不静默)', /未达成功证据门槛|未成立/.test(evBad), evBad.slice(0, 160));
 
 const bridgeGood = await BRIDGE.bridgeTransactionToRunGoal(synthVerified, { goalId, executionOk: true, goalCriteriaHit: true, summary: '跨境市场调研' });
 const afterGood = await GS.readGoal(goalId);

@@ -2350,3 +2350,26 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
 - **路线图**: **M1** 一个跨境商品调研任务跑通(唯一 P0, 验收 10 项清单) → **M2** 三个用户可感知恢复点(付款前 / 已付款未交付 / 已交付未验真) → **M3** 至少一笔 Base Sepolia 真支付 → **M4** 失败进争议, 不重付不假绿。**M1 前不再扩展资源类型/支付网络/入口/社交能力。**
 - **M1 真实差距(5 项)**: ① 任务入口缺失 ② 任务报告卡缺失 ③ 10 态→4 态映射缺失 ④ 资源目录"发现→报价→购买"靠硬编码 ⑤ 一条 Goal criterion 未接市场调研输出契约。
 - **待 leo 定**: 唯一入口 CLI vs Web · M1 是否锁死"可执行 Skill"为唯一资源类型 · 预算单位与上限。
+
+## [2026-09-18] feat | M1 任务闭环落地: bolloon task → 买到能力 → 真执行 → 报告卡
+
+- **动因**: leo "我给你的计划要落地" + 三条冻结规则 (唯一入口 CLI task / 唯一资源 本地 Registry 可执行 Skill / 固定预算 0.05-0.02-0.10) + M1 验收改成"任务结果完整"。计划页 `docs/wiki/product-core-focus.md` 已改为"落地情况"。
+- **新增三个薄层** (`src/agents/task/`): ① `task-runner.ts` (Goal → 顾问 → 报价 → 付款 → 保真 → 执行 → Run/Goal 证据 → 报告卡; `resumeTask` 按 `planTransactionRecovery` 续跑) ② `resource-advisor.ts` (缺不缺能力 / 哪个 Skill 满足契约 / 为什么选它; 确定性匹配, 不做语义搜索与推荐) ③ `report-card.ts` (唯一面向人主出口; 5 个人类状态; 两条硬门)。另加 `local-seller.ts`: 把项目**真实卖方路由**挂到极小 HTTP 适配器上, M1 的"本地 Registry 节点"也走真协议 (真 402)。
+- **CLI**: `bolloon task "<任务>" --budget 0.05` / `bolloon task --resume <goalId>` / `--input '<json>'` / `--json`; 进度只报 4 个用户态 (prepare/acquire/execute/report), 一次命令显式收尾不退进程。
+- **预算闸 (`task-budget.ts`)**: M1 硬上限 单任务 0.05 / 单次购买 0.02 / 单日 0.10, **多层取 min**, 给多了显式留痕 (不静默), 非法值拒绝; `assertNoExpansion` 保证执行中不许扩大。接上此前**零调用者**的 `trade({taskBudget})` 与 `maxPaymentAmount`。
+- **真跑逼出的 5 个真缺陷 (全部已修 + 有断言)**: ① **契约解析只认对象** —— 手写 SKILL.md 的 `resource: {…}` 被最小 YAML 解析器留成字符串, `parseResourceContract` 判"没有资源契约字段" → 顾问看不到任何可执行资源 → 改成字符串也 JSON.parse (所有调用方受益)。② **`requestId` 每次新派生** → 重跑同一任务会**第二次扣款** → 改为按 (任务+预算) 确定性派生 `task-<sha256前16>`, 续跑复用同一 Goal。③ **两条硬门原先没有实现** (买到没执行 / 执行了没证据) → 落到报告卡。④ **setup 门禁让 `bolloon task` 直接抛栈** → 改成优雅报告卡 ("本机还没初始化好, 不记账也不花钱")。⑤ 输入推导漏可选字段 + 商品名残留"这款/市场"等词 → 清洗 + 识别到才填。
+- **验证**: `scripts/verify-task-loop.ts` **59 passed / 0 failed / EXIT=0** (真 402 → 真 local-dev 付款 → 真保真链 → 真执行技能代码 → 报告卡; 8 项验收 + 2 条硬门 + 3 层预算闸 + 幂等重跑 + 续跑) · 单测 `src/test/task-loop.test.ts` 25 项 · CLI 真跑报告卡 (约 2.8 秒) · `tsc --noEmit` 0 错 · wiki 四门禁 OK。
+- **M1 未做 (如实)**: 真链上 (M3) · 断点续跑的三个恢复点只做到"复跑不重付", 还没做真 SIGKILL 场景 (M2) · 报告卡只做 CLI 文本 (按 leo 定的不做 Web 可视化)。
+
+## [2026-09-18] feat | M1-M4 收口: 统一证据桥 + 同一恢复决策 + 支付边界 + 失败安全 (全链路验收 68/0)
+
+- **动因**: leo 的收口计划 —— "M1-M4 全做完, 可以不用真链, 但排查要结束、不能有 bug"; 明确四条不可违反规则与五个用户态口径。
+- **Phase 0 (冻结口径)**: 新增 `docs/wiki/m1-m4-closure.md` —— 四个唯一事实来源 (Goal/Run/Transaction/Report Card) + 四条不可违反规则 (local-dev 永不 verified · 付了没执行不完成 · 执行了没证据不完成 · 同一 requestId 永不第二笔付款) + 失败→出口映射表。**口径修正**: 用户态是 **5 个** (此前文档写"4 态"是错的)。
+- **Phase 1 (M1 收口)**: ① `task-runner` 证据**只走** `bridgeTransactionToRunGoal` (不再自写一套) ② Goal/Run **先建**, 每条失败路径都返回报告卡且带 goalId/runId (不抛栈、不返回空) ③ 交易记录新增 `resourceOutcome`(installed/executed/outputContract/criteriaHit/failureStage) 与 `verificationTrust` ④ 判据由资源契约生成 → confirm → 逐条 markCriterion。
+- **Phase 2 (M2 收口)**: CLI `task --resume` 与 Supervisor **收敛到同一个 `decideTaskRecovery`** (Supervisor 对 `createdBy='cli:task'` 的目标直接走它); 补交付 (`refetchDeliveredContent`: 已付未交付用**同一凭据**重取内容, 不产生第二笔付款); 非幂等保护同时看交易记录**与 Run 轨迹** (`goalAlreadyExecuted`)。
+- **Phase 3 (M3 边界)**: 报告卡明示 `支付方式` 与 `链上已验证: 否 (本机联调不冒充链上结算)`; 信任分档写入交易 (`self-attested`); 未配置 facilitator 且未开 local-dev → 明确"无法校验"; mock facilitator 协议可通但**无 txHash 不当链上结算**。
+- **Phase 4 (M4 失败安全)**: 失败映射收敛成纯函数 —— `mapFailureStatus` (有输出但契约不过 → `verification_failed`; 没产出 → `delivery_failed`) 与 `failureStageFor` (install/execute/output_contract); 归责信息全部留在交易记录。
+- **真跑逼出的 6 个真问题 (全部已修 + 有断言)**: ① `resume` 把 `verify + mustNotRepay` 误判成"转人工" → 已付款已交付的任务**卡死无法继续** → 改成 `retry_payment/deliver/verify` 都可继续 ② **故障点在"执行后、记账前"时续跑会重复执行非幂等技能** → 保护改为同时看 Run 轨迹, 并把故障点移到记账之后 ③ **复用交易不带内容** → 拿空内容安装 → 误判 `delivery_failed` → 补交付(内容为空即触发) ④ 本 Goal 没绑交易时按 requestId 追溯复用交易 (否则误判"没付过"→重复付款) ⑤ `goal-store.addEvidence` 每行**截断 300 字** → `verificationTrust/executionOk/milestones/dispute` 被砍掉 → 证据字段**重排**(判定字段在前、长哈希垫底) ⑥ per-purchase 拦截时说不清上限来源 → 归因写明"来自任务预算"。
+- **验证 (全部真跑)**: `scripts/verify-task-closure.ts` **68 passed / 0 failed** ([A] 用户主路径 · [B] 6 条失败路径 · [C] 五个**真 SIGKILL** 恢复矩阵 · [D] M3 三模式边界 · [E] Supervisor 接回) · `verify-task-loop.ts` **60/0** · 单测 `src/test/task-loop.test.ts` **30** · Phase 0 44/0 · Phase 2 51/0 · Phase 3 57/0 · Phase 4 50/0 · facilitator 26/0 · local-dev 闭环 68/0(失败矩阵 37 全拒) · **全量 vitest 177 文件 / 2021 测试** · `tsc` 0 错 · Web 构建通过 · wiki 四门禁 OK · **消融实验 4/4 通过**。
+- **顺带修掉一个环境性门禁失败**: 消融实验的服务等待只有 30s, 而本机启动时 DID/IPNS 发布先 30s 超时再走回退 (AGENTS.md 已登记的环境噪音) → 夹具改为跳过 kubo/update 初始化并等待 180s (夹具问题, 非产品缺陷)。
+- **本批明确不做**: 真实 Base Sepolia 链上支付 (需 facilitator + 钱包 + 真卖方 payTo; M1/M2 不被它阻塞) · P2P 发现 · 多链 · 自动退款 · 复杂仲裁 · Web/移动端任务入口。

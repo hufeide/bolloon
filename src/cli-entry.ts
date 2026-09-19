@@ -176,6 +176,9 @@ function parseArgs(): { mode: string; args: string[] } {
       return { mode: 'trace', args: args.slice(1) };
     case 'p2p':
       return { mode: 'p2p', args: args.slice(1) };
+    // 2026-09-18: M1 唯一入口 —— 一个任务 → 一个 Skill → 一个报告卡
+    case 'task':
+      return { mode: 'task', args: args.slice(1) };
     // 2026-09-13: 初始化向导 (用户身份 + 模型供应商 + API key)
     case 'setup':
     case 'init':
@@ -344,6 +347,86 @@ async function handleUpdateCommand(updateArgs: string[]): Promise<void> {
  *   无参 → 列出最近几次运行 + 每步摘要;  带 runId → 输出完整轨迹 (文本或 JSON)。
  *   文本格式与小工具/别的智能体对齐, 可直接复制粘贴交换。
  */
+/**
+ * `bolloon task "<任务>" --budget 0.05 [--input '<json>'] [--json]`
+ * `bolloon task --resume <goalId>`
+ *
+ * M1 唯一入口 (leo 2026-09-18 冻结规则 ①): 用户只给任务和预算,
+ * 不点名 Skill、不看内部状态。进度只报 4 个用户态, 结论在报告卡里。
+ */
+async function handleTaskCommand(taskArgs: string[]): Promise<void> {
+  const { runTask, resumeTask } = await import('./agents/task/task-runner.js');
+  const wantJson = taskArgs.includes('--json');
+  const flag = (name: string): string | undefined => {
+    const i = taskArgs.indexOf(name);
+    return i >= 0 ? taskArgs[i + 1] : undefined;
+  };
+  const resumeId = flag('--resume');
+  const budget = flag('--budget');
+  const perPurchase = flag('--per-purchase');
+  const daily = flag('--daily');
+  const inputRaw = flag('--input');
+
+  let input: unknown;
+  if (inputRaw !== undefined) {
+    try { input = JSON.parse(inputRaw); }
+    catch (e: any) { console.error(`${MAGENTA}--input 不是合法 JSON: ${String(e?.message || e)}${RESET}`); process.exit(1); }
+  }
+
+  const STAGE_LABEL: Record<string, string> = { prepare: '准备中', acquire: '正在获取能力', execute: '正在执行', report: '报告' };
+  const onStage = (stage: string, note: string) => {
+    if (wantJson) return;
+    console.error(`  ${CYAN}${STAGE_LABEL[stage] || stage}${RESET} ${note}`);
+  };
+
+  if (resumeId) {
+    const r = await resumeTask({ goalId: resumeId, input, allowLocalDev: true });
+    if (wantJson) console.log(JSON.stringify({ resumed: r.resumed, action: r.action, reason: r.reason, mustNotRepay: r.mustNotRepay, card: r.card }, null, 2));
+    else { console.log(''); console.log(r.text); console.log(''); }
+    process.exit(r.ok ? 0 : 1);
+  }
+
+  const words = taskArgs.filter((a, i) => {
+    if (a.startsWith('--')) return false;
+    const prev = taskArgs[i - 1];
+    return !['--budget', '--per-purchase', '--daily', '--input'].includes(prev || '');
+  });
+  const task = words.join(' ').trim();
+  if (!task) {
+    console.log(`
+${BOLD}bolloon task${RESET} — 给一个任务, 让智能体买到能力并做完它
+
+${CYAN}bolloon task "判断这款厨房用品是否适合进入日本市场" --budget 0.05${RESET}
+${CYAN}bolloon task --resume <goalId>${RESET}
+
+选项:
+  --budget <USDC>        这笔任务最多花多少 (M1 硬上限 0.05; 不能中途扩大)
+  --per-purchase <USDC>  单次购买上限 (M1 硬上限 0.02)
+  --daily <USDC>         当日预算 (M1 硬上限 0.10)
+  --input '<json>'       显式给技能输入 (跳过自动推导)
+  --json                 机器可读输出
+`);
+    return;
+  }
+
+  const r = await runTask({ task, budget, perPurchase, daily, input, allowLocalDev: true, onStage });
+  if (wantJson) {
+    console.log(JSON.stringify({
+      ok: r.ok, status: r.card.status, conclusion: r.card.conclusion, card: r.card,
+      goalId: r.goalId, runId: r.runId, transactionId: r.transactionId,
+      advisor: r.advisor, payment: r.payment, outputIssues: r.outputIssues,
+      budget: { taskBudget: r.budget.taskBudget, perPurchase: r.budget.perPurchase, daily: r.budget.daily, clamped: r.budget.clamped },
+      stages: r.stages,
+    }, null, 2));
+  } else {
+    console.log('');
+    console.log(r.text);
+    console.log('');
+  }
+  // 一次性命令: 显式收尾 (DIAP/HTTP 句柄不该吊住进程)
+  process.exit(r.ok ? 0 : 1);
+}
+
 async function handleTraceCommand(traceArgs: string[]): Promise<void> {
   const { listRuns, readRun } = await import('./agents/run-store.js');
   const { runToTraceText, runToTraceJson, summarizeTrace } = await import('./agents/trace-export.js');
@@ -720,6 +803,11 @@ async function main() {
 
     case 'p2p':
       await handleP2pCommand(args);
+      break;
+
+    // 2026-09-18: M1 任务闭环 (bolloon task "<任务>" --budget 0.05 / --resume <goalId>)
+    case 'task':
+      await handleTaskCommand(args);
       break;
 
     // 2026-09-13: bolloon setup — 首次运行初始化向导

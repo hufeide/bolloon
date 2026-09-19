@@ -437,6 +437,27 @@ export class ExecutionSupervisor {
       this.log(`[supervisor] goal=${goal.goalId} retry_wait 到点 → 唤醒并清 wakeAt`);
     }
 
+    // ★ 2026-09-18 (M2 收口): `bolloon task` 建的目标走**同一个恢复决策函数**
+    //   (`decideTaskRecovery`) —— CLI `task --resume` 与 Supervisor 不再各判一次。
+    //   决策说"不能动钱/已经执行过"就跳过 (不重复付款、不重复执行非幂等操作)。
+    if ((goal as any).createdBy === 'cli:task' && process.env.BOLLOON_SUPERVISOR_TASK_RESUME !== '0') {
+      try {
+        const { decideTaskRecovery, resumeTask } = await import('./task/task-runner.js');
+        const decision = await decideTaskRecovery({ goalId: goal.goalId });
+        const actionable = ['retry_payment', 'deliver', 'verify'].includes(decision.action);
+        if (!actionable) {
+          report.skipped.push({ goalId: goal.goalId, reason: `任务恢复决策=${decision.action} (${decision.reason}) → 本周期不动` });
+          return { goalId: goal.goalId, status: 'task_no_action' };
+        }
+        const res = await resumeTask({ goalId: goal.goalId });
+        this.log(`[supervisor] task 目标接回: goal=${goal.goalId} decision=${decision.action} → 状态 ${res.card.status}`);
+        this.emit({ kind: res.ok ? 'goal_done' : 'needs_human', goalId: goal.goalId, message: `任务接回: ${decision.action} → ${res.card.status}` } as any);
+        return { goalId: goal.goalId, runId: res.runId, status: res.card.status, error: res.ok ? undefined : res.reason };
+      } catch (err: any) {
+        return { goalId: goal.goalId, status: 'task_resume_failed', error: String(err?.message || err).slice(0, 160) };
+      }
+    }
+
     const prevRunId = goal.currentRunId;
     const prevRun = prevRunId ? await readRun(prevRunId) : null;
     const plan = prevRunId ? await buildContinuationPlan(prevRunId).catch(() => null) : null;

@@ -72,7 +72,14 @@ async function startServer(label: string): Promise<void> {
     serverProc = spawn(
       cmd,
       [tsxEntry, '-r', 'dotenv/config', 'src/index.ts', '--web', '--port', String(PORT)],
-      { cwd: ROOT, env: { ...process.env, BOLLOON_VERBOSE: '0' }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }
+      {
+        cwd: ROOT,
+        // 2026-09-18: 本机启动时 DID/IPNS 发布会先 30s 超时再走回退 (环境噪音, 见 AGENTS.md),
+        //   所以跳过不必要的初始化并给足等待时间 —— 夹具问题, 不是产品缺陷。
+        env: { ...process.env, BOLLOON_VERBOSE: '0', BOLLOON_SKIP_KUBO: '1', BOLLOON_SKIP_UPDATE: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      }
     );
     serverProc.stdout?.on('data', (d: any) => { serverLog.push(`[out] ${d.toString()}`); });
     serverProc.stderr?.on('data', (d: any) => { serverLog.push(`[err] ${d.toString()}`); console.log(`[server err] ${d.toString().substring(0, 200)}`); });
@@ -85,7 +92,7 @@ async function startServer(label: string): Promise<void> {
       setTimeout(checkUp, 300);
     };
     setTimeout(checkUp, 500);
-    setTimeout(() => reject(new Error('server start timeout')), 30000);
+    setTimeout(() => reject(new Error('server start timeout')), 180000);   // 本机 IPNS 回退会拖到 60s+
   });
 }
 
