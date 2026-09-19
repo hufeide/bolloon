@@ -2491,6 +2491,13 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
   → **有 tag 也报"没有 v0.4.29 tag"** (老 tag v0.4.20 同样会被误报)。修法: 拼成同一个参数 `` `v${version}^{commit}` ``
   (annotated tag 必须 `^{commit}` 解引用才拿到提交号)。修后同一命令输出 `tag=e6d491c HEAD=e6d491c` ✅。
   教训: **门自己也会说谎** —— 门报红时先按同一个命令手跑一遍再下结论。
+- **第三个假信号 (我自己手搓的探针)**: 我手拼 tarball 直链 `.../-/bolloon-bolloon-agent-0.4.29.tgz` 一直 404 ——
+  因为 `@scope/name` 的 tarball 文件名是 `<name>-<ver>.tgz`, **scope 不进文件名** (真实是 `bolloon-agent-0.4.29.tgz`)。
+  判定"是否公开"必须只看 **packument** (`dist-tags.latest` / `versions[v]` / `time[v]`); 取 tarball 要用 packument 给的
+  `dist.tarball` —— 门 (`verify-release.mjs`) 正是这么做的, 所以门报 200 而我手搓的 URL 报 404。
+  教训: **手搓的探针和门给出相反结论时先信门** (门用的是 registry 自己给的地址)。
+- **最终事实**: `dist-tags.latest = 0.4.29`, `versions[0.4.29]` 存在, `time[0.4.29] = 2026-09-19T10:49:28Z`
+  (= 发布后约 7 分钟放行, 与 0.4.27 那次"5-7 分钟"的教训一致)。
 - **发布门第二个假阴性 (同类坑第二次)**: `--install-check` 真装线上 tarball 后跑 `--version json`, 门却报
   "解析失败" —— 原因是它按"行首是 `{`"过滤行, 而 `--version json` 是**多行 pretty JSON**, 只有第一行 `{` 留下 →
   `JSON.parse('{')` 必失败。**和早先 `update-manager` 里那个"多行 JSON 被按行首 { 过滤 → 更新后验证永远判失败"
