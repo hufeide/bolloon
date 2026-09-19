@@ -2467,7 +2467,12 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
 
 **未完成 / 需要注意 (如实)**
 
-- **发布未完成 (发布事实, 不是成功)**: `npm publish` 返回 **EXIT=0** 且打印 `+ @bolloon/bolloon-agent@0.4.29`,
+- **发布已完成 (公开可装)**: 19:0x CST 复测 `dist-tags.latest = 0.4.29`、版本直连 **HTTP 200**、
+  registry 报出的 shasum `27b6a0500c6cd58e66568d09bda363e897caa5bf` **与本次 publish 日志完全一致** (证明线上就是本地这颗产物)、
+  tarball 内 `package.json` = 0.4.29 且含 `dist/cli-entry.js`; `git tag v0.4.29` (annotated) 已建并 **显式 push**
+  (`git push origin refs/tags/v0.4.29`; `--follow-tags` 只推 annotated) → 远端 `refs/tags/v0.4.29^{}` = `e6d491c`。
+  即: 暂存确实只是**延迟**, 不是失败 —— 之前的"未完成"判定与最终结果一致, 没有谎报成功。
+- (追记) 中间态: `npm publish` 返回 **EXIT=0** 且打印 `+ @bolloon/bolloon-agent@0.4.29`,
   但 **registry 上查不到** —— 18:46 CST 实测: tarball 直链 `HTTP=404`、`npm view @bolloon/bolloon-agent@0.4.29` **404**、
   `dist-tags.latest` 仍是 **0.4.28** (轮询 33×15s ≈ 8 分钟无变化; npm 自己的说法是
   "Your package is being processed and may take a few minutes to become available")。
@@ -2481,6 +2486,11 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
   不同, 18MB/1404 文件的包更慢。**待放行期间不轮换 token**(换 token 后 stage list/approve 都看不到旧 token 的暂存,
   且在飞的那颗会被孤立), **不重复 publish**(同版本必得 E409)。放行入口: `npx -y npm@12 stage view|approve <stage-id>`
   或 npmjs.com 2FA 批准。
+- **顺手修掉发布门自己的一个假阴性 bug**: `scripts/verify-release.mjs` 的 tag 检查把 `^{commit}` 当**独立参数**传给
+  `git rev-parse` (`rev-parse --short=7 v0.4.29 '^{commit}'`) → git 报 unknown revision → catch 成 `tagCommit=null`
+  → **有 tag 也报"没有 v0.4.29 tag"** (老 tag v0.4.20 同样会被误报)。修法: 拼成同一个参数 `` `v${version}^{commit}` ``
+  (annotated tag 必须 `^{commit}` 解引用才拿到提交号)。修后同一命令输出 `tag=e6d491c HEAD=e6d491c` ✅。
+  教训: **门自己也会说谎** —— 门报红时先按同一个命令手跑一遍再下结论。
 - **消融实验本轮没跑成**: 环境初始化门禁未就绪 (`connectivity_pending`, 连通性结果 >24h 过期 + 234 个技能不合格),
   夹具已改为**明确退出码 3 + 打印修复命令**, 不再写"4 项工具循环失败"的误导报告; 上一轮那份误导输出已回退到
   14:04 那次真跑结果。需要 leo 跑 `bolloon setup --test` + 处理不合格技能后再跑。

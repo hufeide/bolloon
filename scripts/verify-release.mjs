@@ -77,7 +77,11 @@ async function main() {
   } catch { /* 无 git */ }
   let tagCommit = null;
   try {
-    tagCommit = execFileSync('git', ['-C', ROOT, 'rev-parse', `--short=7`, `v${version}`, '^{commit}'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    // 2026-09-19 修: `^{commit}` 必须和 ref 拼成**同一个参数**。分开传时 git 把 `^{commit}` 当成
+    //   独立 revision → 报 unknown revision → 这里 catch 掉, 于是**有 tag 也报"没有 tag"** (假阴性,
+    //   v0.4.20 等老 tag 同样会被误报)。annotated tag 需要 `^{commit}` 解引用才能拿到提交号。
+    const ref = `v${version}^{commit}`;
+    tagCommit = execFileSync('git', ['-C', ROOT, 'rev-parse', '--short=7', ref], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   } catch { tagCommit = null; }
   if (tagCommit) {
     check('git_tag', `Git tag v${version} 与方法一致`, tagCommit === gitCommit, `tag=${tagCommit} HEAD=${gitCommit}`, false);
