@@ -4,6 +4,7 @@
 > `phase` ∈ {init / feature / fix / refactor / docs / chore / test}.
 
 | 日期 | phase | 一句话 | 关联 |
+| 2026-09-19 | release | **0.4.29 已 npm publish (EXIT=0, 1404 文件 18.1MB); 顺手修掉一直挡着发布的 electron 构建 (import.meta → TS1343)** | [update-protocol.md](./update-protocol.md) / [package.json](../../package.json) / [tsconfig.electron.json](../../tsconfig.electron.json) |
 | 2026-09-19 | test | **消融实验本轮未跑成 (环境门禁未就绪, 非功能回归): 夹具改为明确退出码 3, 不写误导报告**: 真跑 `scripts/ablation/run.ts` 时 `/message` 全部 **503** —— 根因是**初始化门禁**: 本机 setup 状态为 `connectivity_pending` (`连通性结果已过期 (>24h) → 需重测`; 另有 `234 个技能不合格` 让 agent 层不就绪)。门禁按设计**不可绕过** (`BOLLOON_SKIP_SETUP=1` 也只是诊断模式), 所以旧夹具会跑完 4 个实验再写出"工具循环 4 项全失败"的误导报告。**修法 (夹具层)**: 启动后先查 `GET /api/setup`, `gate !== 'ready'` → 打印门禁原因与两条修复命令 (`bolloon setup --test` 重测连通性 / `bolloon skills` 处理不合格技能) 并**退出码 3** (与"功能失败"=1 区分开); 同时把上一轮那份误导性 `report.md`/`results.json` **回退**到 14:04 那次真跑的结果 —— 不把环境问题伪装成功能回归。**待 leo 做**: 跑 `bolloon setup --test` (刷新连通性) + 处理不合格技能后再跑消融。 | [ablation/run.ts](../../scripts/ablation/run.ts) / [runtime-bootstrap-protocol.md](./runtime-bootstrap-protocol.md) |
 | 2026-09-19 | feat | **运行时安装协议 (Node/npm · Git · Python): 统一管理器 + 安装完成定义 + 真装一遍验收 (真跑 18/0)**: leo 计划 Phase 0-9 落地。**完成定义冻结**: **Bolloon 安装完成 = Node/npm、Git、Python 都已可执行、版本可验证、路径已配置** —— 缺任何一个, 安装**不能说成功** (退出码非 0)。**最低版本只此一处**: node≥18 / npm≥9 / git≥2.20 / python≥3.8; 平台矩阵 macOS/Linux/Windows (不在矩阵 → `unsupported`, 不假装能装)。**唯一管理器** `src/utils/runtime-bootstrap.ts`: 探测(真执行 `--version` 拿绝对路径+版本) · 包管理器识别 (brew/apt/dnf/yum/pacman/zypper/apk/winget/choco, 命令形状是**纯函数**所以能跨平台单测) · 计划 · 安装 · PATH/配置 · 验证 · 报告; `install.sh` / `postinstall` / `bolloon runtime` / `bolloon doctor` / `bolloon --version` 全读同一份事实。**策略**: 不偷偷 sudo (需要管理员权限只进计划, `allowSudo` 默认关) · 改系统前先给计划 (`runtime plan` / `install.sh --dry-run`) · 不覆盖用户已有运行时 · **macOS 无 Homebrew 时不静默装 Homebrew** (只给官方指引) · Windows 识别 App Execution Aliases 劫持 Python。**配置**: 写 `~/.bolloon/config.json` 的 `runtime.*` (只动这一个键), 配置路径只作优先候选, **每次启动重新真执行验证** (路径失效→按 PATH 重新发现)。**安装后硬验证 (不是"命令存在")**: node 真加载 CLI · npm 真读全局 · git 真建临时仓库读 status · python 真跑脚本; 报告分"安装完成/未完成"两形状 + 能力矩阵 (核心运行/源码更新/Git 协作/Python Skill/Wiki 工具)。**npm 路径一致**: postinstall **不装系统软件**但检测 Git/Python, 缺则打印"安装未完成"+ 写 `install-incomplete.json`(doctor 报降级, 补齐后自动清除) + `bolloon setup repair-runtime`。**更新纳入运行时** (Phase 8): 更新后健康检查第 8 项真执行 (Git 被删 → failed); `doctor` 增"运行时配置""能力矩阵"两项。**`--version` 展示运行时配置块** (leo 要求: 更新到最新后展示安装信息要展示这些配置): 普通版就有 Node/npm/Git/Python 的**版本+绝对路径+来源**, json 里带完整 `runtime` 字段, 配置里还没写 runtime.* 时如实标注"实时探测"。**真跑逼出的 4 个真问题 (全修)**: ① install.sh 假设刚装的 CLI 支持 `runtime` 子命令 → **旧版本没有** → 补 `BOLLOON_TARBALL` 本地 tarball 安装路径 (顺带成为发布硬门"tarball 可安装") ② 真网络 ECONNRESET 让干净安装直接失败 → npm 加 `--fetch-retries=5 --fetch-retry-maxtimeout=120000` ③ `bolloon runtime` 只看报告时也走安装流程, 打印无关的"未获得同意" ④ 验收脚本没预建 `<prefix>/lib` → install.sh 按设计回退到 `~/.npm-global`, 断言看错路径 (夹具问题, 非产品缺陷) ⑤ **真装出来的 CLI 把自己报成 `npm-local`** —— 包在 `<prefix>/lib/node_modules/@bolloon/bolloon-agent` 这种 npm 全局布局里, 但当 `npm root -g` 解析出别的目录 (安装与查询 prefix 不一致) 时安装识别只看 `npm root -g` → 误判 → 补全局布局兜底 (项目内 `node_modules/` 仍判 npm-local, 有单测) ⑥ **doctor 在全新 HOME 里假阴性**: `~/.bolloon` 还不存在就报"不可写"并据此判失败 → 改成"尚不存在但父目录可写 = degraded" (有单测)。**验证**: 单测 `src/test/runtime-bootstrap.test.ts` **32/32** + `update-system.test.ts` **53/53** · 真跑 `scripts/verify-runtime-bootstrap.ts` **20/0** (A 真探测+真执行验证 · B 配置落盘/用户字段不动/路径失效重新发现 · C dry-run 0 执行 · D 未同意 0 执行 · E 缺 Node 时拒绝静默装 Homebrew · F 老版本 git 判 failed · G 缺运行时→"安装未完成"+退出码 1 · H install.sh 只读入口不改任何东西 · **I 真装一遍: 本地 pack tarball → 真 npm → postinstall → runtime 补齐 → `--version`/`doctor` 硬验证**) · `tsc` 0 错 · wiki 门禁 OK。**未做 (如实)**: Onboard 运行时门禁 (Phase 6) · "首次执行 bolloon 再次进入 Runtime Bootstrap" · 三平台真机矩阵 (干净 macOS/Linux/Windows、无 sudo、网络失败、安装中 SIGKILL) 未验 (只有命令形状与策略层单测) | [runtime-bootstrap-protocol.md](./runtime-bootstrap-protocol.md) / [runtime-bootstrap.ts](../../src/utils/runtime-bootstrap.ts) / [install.sh](../../scripts/install.sh) / [verify-runtime-bootstrap.ts](../../scripts/verify-runtime-bootstrap.ts) |
 | 2026-09-19 | refactor | **更新系统收敛成一个可信能力 (Phase 0-8 全做, 真跑 25/0)**: 把"多个半成品叠在一起"的更新收敛成**一条链** —— 版本身份 → 更新检查 → 更新计划 → 安全替换 → 健康验证 → 回滚。**唯一事实**: 新增 `src/utils/version-info.ts` (VersionInfo, 三种输出读同一份) + `update-state.ts` (状态/历史/锁/开关, 原子写 + 进程内串行化) + `update-manager.ts` (唯一检查/计划/执行) + `update-health.ts` (更新后分层健康检查 + doctor) + `src/cli/update-commands.ts`; 消除 **4 处硬编码版本号** (`cli-entry` / `bin/bolloon.cjs` v0.1.1 / `version_check.py` 0.3.7 / `postinstall.js` 0.1.12)。**渠道冻结**: npm 唯一稳定渠道, GitHub 只作源码与发布记录 (`install.sh` 不再先查 Releases, 装完自检版本)。**默认行为变更 (6 条逐条写明)**: 检测到新版**只通知不自动装** (autoInstall/autoRestart 默认 false), `autoUpdate` 只映射 checkUpdates; **网络失败不再显示"已是最新"** (新增 offline/registry_unavailable/local_version_unknown 等 7 个结论 + 优先级); `update` 默认只检查, `update now` 才装。**安全更新**: 更新锁 (陈锁可回收) · 更新计划 10 项风险检查 (安装类阻塞 + 负载类改默认策略为"等 Run 结束") · 临时下载校验 + 切换后验证 + 失败回滚 + `needsRestart`; 执行中落"进行中"阶段 → 被 SIGKILL 后 doctor 能报"上次更新异常中断"。**命令面按 leo 要求全裸词** (`update plan|status|history|now|wait`, `doctor`, `--version verbose|json`)。**发布纪律**: `scripts/verify-release.mjs` 7 项硬门 (含 dist-tags.latest 未公开 = 硬门失败) + `verify-update-system.ts` 真跑 25/0。**修掉 3 个真 bug**: ① 多行 pretty JSON 被按"行首 {"过滤 → 更新后验证**永远判失败**(每次都回滚) → 统一 `parseJsonFromStdout`; ② 未 await 的阶段留痕与收尾写并发 → **丢 lastFailure** (flaky 单测抓到) → 加进程内写串行化; ③ 风险检查里 Goal/Run 的 id 字段名写错 (`id`/`version` → `goalId`/`runId`) 输出 undefined。**验证**: 单测 50/50 · 真跑 `verify-update-system.ts` **25/0** (A 真断网 / B 真无权限 / C 真 npm 成功 + 配置字节未变 / D 真安装失败保留旧版本 / E 真 SIGKILL + 陈旧锁恢复 / F 四个问题可答) · `tsc` 0 错 · `build:main` 通过 · `bolloon --version/update/doctor` 真跑 · wiki 门禁见下 | [update-protocol.md](./update-protocol.md) / [version-info.ts](../../src/utils/version-info.ts) / [update-manager.ts](../../src/utils/update-manager.ts) / [verify-update-system.ts](../../scripts/verify-update-system.ts) / [verify-release.mjs](../../scripts/verify-release.mjs) |
@@ -2406,3 +2407,70 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
 - **0.4.28 npm 状态复核**: 之前 log 记的"publish 退出码 0 但 registry 未公开 (暂存待放行)" —— 本次实测**已公开**: `dist-tags.latest = 0.4.28`, `time[0.4.28] = 2026-09-19T06:10:13Z`, `versions` 尾三 `[0.4.26, 0.4.27, 0.4.28]`。该待办关闭。
 - **未做 / 刻意不做 (如实)**: 多渠道 · 自动灰度 · 插件热更新 · 后台强制升级 (计划里就说不做) · `update now wait` **没有后台守护** (只记录"等当前 Run 结束后再更新", 不会在 Run 结束时替用户动运行时) · beta/dev 没有独立 dist-tag (不假装有独立通道) · `release-binary` 只识别不支持更新 · `update now` 在 CLI 场景不自动重启进程 · "构建时间"是入口文件 mtime 不是真构建戳 (字段里标了 `buildTimeSource`)。
 - **新增 wiki 页**: [update-protocol.md](./update-protocol.md) —— 唯一事实 / 枚举 / 命令面 / 7 结论与优先级 / 计划与风险 / 流水线(含偏差) / 锁 / 健康检查 / doctor / 开关与 6 条行为变更 / 发布纪律 / **Phase 0-8 完成度台账** / 未做清单 / 验收证据 / 明确不碰的边界。
+
+## [2026-09-19] release | 0.4.29 发布 + 发布门 (prepublishOnly) 修复
+
+**做了什么**
+
+1. **真发布 0.4.29**: `npm publish --access public` → `+ @bolloon/bolloon-agent@0.4.29`, 退出码 **0**,
+   tarball `bolloon-bolloon-agent-0.4.29.tgz` **18.1MB / 1404 文件**,
+   shasum `27b6a0500c6cd58e66568d09bda363e897caa5bf`。
+
+2. **发布门一直是红的 (本次才暴露)**: `prepublishOnly = npm run build:all && npm run smoke:esm`,
+   而 `build:all` 里含 `build:electron = tsc -p tsconfig.electron.json` —— 该配置是 **CommonJS**,
+   而 `version-info.ts` / `agents/pi-sdk.ts` / `agents/pi-sdk-tools.ts` / `llm/system-prompt/registry.ts`
+   都用了 `import.meta` → **TS1343**。`build:main` 走 ESM, 日常 `tsx` 也是 ESM, 所以平时完全看不出来,
+   **只有发布那颗门会撞上** (证据: `git worktree` 检出上一提交 HEAD~1 跑同一命令 = 28 个错误)。
+
+3. **修法 (不是绕过)**:
+   - `version-info.ts`: 新增 `currentPackageRoot()` —— 四段探测 (进程入口 → CJS `__dirname`(用
+     `new Function` 包一层, 避免 ESM 下"未定义") → 调用栈里的本文件绝对路径 → cwd), 全部去掉 `import.meta`;
+     入口回退也不再假装"本模块文件"
+   - `utils/module-context.ts` (新): `cjsModuleDir()` / `firstExisting()` / `packageDirCandidates()`,
+     给共享模块一个 ESM+CJS 双上下文的定位方式
+   - `registry.ts`: layers 目录改**三候选探测** (CJS同级 → `dist/llm/system-prompt` → `src/llm/system-prompt`)
+     —— 顺手修一个潜在 ENOENT: electron 产物同级目录里根本没有 .md, 旧写法必然读空
+   - `pi-sdk.ts` / `pi-sdk-tools.ts`: `createRequire` 与 manifests 路径改走包根
+   - `tsconfig.electron.json`: include 带上仓库**早就存在**的 .d.ts 垫片 (`src/types.d.ts`、
+     `src/orbitdb/orbitdb-core.d.ts`) → 修掉 TS7016
+   - **没做**: `npm publish --ignore-scripts` 这类"跳过门"的做法 (那会把红的门永久留在仓库里)
+
+4. **本轮真跑逼出来的其它事实 (如实)**
+   - **真网络 `ECONNRESET`**: 隔离 HOME 里干净安装 949 个依赖时真断了一次 → `install.sh` / `update-manager`
+     / `upgrade.sh` 的 npm 调用统一加 `--fetch-retries=5 --fetch-retry-mintimeout=10000 --fetch-retry-maxtimeout=120000`;
+     失败时如实报"旧版本未被删除, 可继续使用"(旧版本一个字节没动)
+   - **真装出来的包被判成 `npm-local`**: `<prefix>/lib/node_modules/@bolloon/bolloon-agent` 这个 npm
+     全局布局在 `npm root -g` 拿不到/不一致时会掉到 `inAnyNodeModules` → 现在按**布局**兜底识别成 `npm-global`
+     (有单测)
+   - **`doctor` 在全新 HOME 里假阴性**: `~/.bolloon` 还不存在时 `access(W_OK)` 失败 → 报"不可写"且退出码 1。
+     改为: 目录不存在看**父目录**可写性, 报 `degraded` + "还不存在 (首次运行会创建)", 退出码 0
+   - **旧版本装新协议**: 用 registry 上 0.4.28 做真装测试时, `bolloon runtime` 子命令在旧包里不存在 →
+     install.sh 的运行时补齐步骤会失败. 因此新增 `BOLLOON_TARBALL=<本地 tgz>` 安装通道 (正式用户装的是
+     带该子命令的新版本; 同时这也成了"tarball 可安装"这颗发布硬门的真跑方式)
+
+**验证 (全部真跑)**
+
+| 项 | 结果 |
+|---|---|
+| main `tsc --noEmit` | 0 错 |
+| `tsc -p tsconfig.electron.json --noEmit` | **4 → 0 错** (HEAD~1 同命令: 28 错, 含 worktree 缺 constraint-runtime dist 的噪音) |
+| 全量 `vitest run` | **179/179 文件 · 2106/2106 测试 · EXIT=0** |
+| `npm run build:all && npm run smoke:esm` | **EXIT=0** (这正是发布门的前半段) |
+| `scripts/verify-runtime-bootstrap.ts` | **20/0**, 含**真装一遍** (本地 pack tarball → 真 npm → postinstall → runtime 补齐 → `--version json`/`doctor` 硬验证) |
+| `scripts/verify-update-system.ts` | **25/0** (真断网 / 真无权限 / 真 npm 成功且用户配置字节未变 / 真安装失败保留旧版本 / 真 SIGKILL 后陈旧锁接管) |
+| `npm publish` | **EXIT=0**, `+ @bolloon/bolloon-agent@0.4.29` |
+| wiki 四门禁 (`wiki_check`/`raw_manifest_check`/`supersede_check`/`wiki_lint --strict=v2`) | OK (30 个 md, schema v2) |
+
+**这本机 `bolloon update` 的真实输出 (新装 0.4.29 的机器上)**: 本地 0.4.29 vs registry 0.4.28 →
+结论 `unsupported_installation` + "本地 0.4.29 已是 registry 上最新" + "npm 全局目录是软链, 指向开发源码
+—— 不是发行安装" —— **没有**谎报"已是最新", 也**没有**去动这个开发目录。
+
+**未完成 / 需要注意 (如实)**
+
+- `dist-tags.latest` 在本轮结束时**仍是 0.4.28** (publish 返回 0 但 `Your package is being processed and may
+  take a few minutes to become available`) → 按纪律**不重复 publish**, 轮询到公开后再跑
+  `node scripts/verify-release.mjs 0.4.29` 并打 tag `v0.4.29`。
+- **消融实验本轮没跑成**: 环境初始化门禁未就绪 (`connectivity_pending`, 连通性结果 >24h 过期 + 234 个技能不合格),
+  夹具已改为**明确退出码 3 + 打印修复命令**, 不再写"4 项工具循环失败"的误导报告; 上一轮那份误导输出已回退到
+  14:04 那次真跑结果。需要 leo 跑 `bolloon setup --test` + 处理不合格技能后再跑。
+- Android/iOS 侧版本号**未同步** (本轮没有出 APK/IPA; 商店包 versionCode 28 / iPhone 包各自独立).
