@@ -4,6 +4,7 @@
 > `phase` ∈ {init / feature / fix / refactor / docs / chore / test}.
 
 | 日期 | phase | 一句话 | 关联 |
+| 2026-09-19 | chore | **发布 @bolloon/bolloon-agent@0.4.30 (手机端联系方式与授权能力) — 硬门全过 (真装线上 tarball), tag v0.4.30 已推** | [contacts-protocol.md](./contacts-protocol.md) / [verify-release.mjs](../../scripts/verify-release.mjs) |
 | 2026-09-19 | feat | **手机端完成联系方式与授权能力 (真 WebCrypto 签名 → 真 HTTP → 桌面验签 → 直接发送; 含离线排队/撤销即时失效; 真跑 101/0)** | [contacts-protocol.md](./contacts-protocol.md) / [mobile-contacts.ts](../../src/web/mobile-contacts.ts) / [verify-contacts-chain.ts](../../scripts/verify-contacts-chain.ts) |
 | 2026-09-19 | feat | **联系方式持久能力授权 (consent → grant): 确认一次, Agent 长期自动使用 (真跑 83/0, 含真 Ed25519 签名同步 + 撤销期间转人工 + 存储损坏 fail-closed)** | [contacts-protocol.md](./contacts-protocol.md) / [grants.ts](../../src/agents/contacts/grants.ts) / [verify-contacts-chain.ts](../../scripts/verify-contacts-chain.ts) |
 | 2026-09-19 | feat | **联系方式与社交身份核心链 (绑定 → 受约束调用 → 进长期任务 → 等待回复 → Supervisor 恢复 → 证据回放): 真跑 51/0 (真 SMTP 服务器 + 真 HTTP 网关 + 真 express 路由 + 真 Goal/Run/Skills)** | [contacts-protocol.md](./contacts-protocol.md) / [chain.ts](../../src/agents/contacts/chain.ts) / [verify-contacts-chain.ts](../../scripts/verify-contacts-chain.ts) |
