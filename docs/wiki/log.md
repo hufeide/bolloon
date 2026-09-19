@@ -2474,6 +2474,13 @@ status: running=true   libp2p=started   peers=3   blocks=0   lastErr=-
   这正是 Phase 8 要抓的"**已发布 ≠ 用户可安装**": 按纪律**不重复 publish**、**不打 tag `v0.4.29`**
   (tag 会假装发布完成), 等它公开后再跑 `node scripts/verify-release.mjs 0.4.29` + `git tag v0.4.29` + push tag。
   (对照: 0.4.28 当时也是同一形状 —— publish 成功但 registry 未公开, 后来才出现, 属暂存式 token 的固有延迟。)
+  **按之前的发布教训做了诊断 (skill `npm-publish-and-deps` + log 2026-09-13/09-19 那条)**:
+  `npm whoami` = `leoyoge` (token 身份有效) 但 `npm profile get` → **403 Forbidden** —— 正是"绕过 2FA 的旧式粒度
+  token 被 npm 收紧、发布只落暂存"的签名; `npx -y npm@12 stage list` (npm 11 无 `stage` 子命令, npm 12 在 Node 24.13.0
+  上只报 EBADENGINE 警告照常跑) 本次返回 **"No staged packages found"** —— 与 0.4.27 那次"约 5-7 分钟后自己放行"
+  不同, 18MB/1404 文件的包更慢。**待放行期间不轮换 token**(换 token 后 stage list/approve 都看不到旧 token 的暂存,
+  且在飞的那颗会被孤立), **不重复 publish**(同版本必得 E409)。放行入口: `npx -y npm@12 stage view|approve <stage-id>`
+  或 npmjs.com 2FA 批准。
 - **消融实验本轮没跑成**: 环境初始化门禁未就绪 (`connectivity_pending`, 连通性结果 >24h 过期 + 234 个技能不合格),
   夹具已改为**明确退出码 3 + 打印修复命令**, 不再写"4 项工具循环失败"的误导报告; 上一轮那份误导输出已回退到
   14:04 那次真跑结果。需要 leo 跑 `bolloon setup --test` + 处理不合格技能后再跑。
