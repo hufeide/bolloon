@@ -23,7 +23,8 @@ capabilities:
   - agent.delegate
   - trade.query
   - payment.approve
-plannedCapabilities:
+  - mcp.serve
+  # 2026-09-21 (P3 收尾): 以下 8 项**已实现** (契约层 + 现成传输 + 落盘), 不再是 planned
   - task.send
   - task.inbox
   - task.accept
@@ -32,7 +33,7 @@ plannedCapabilities:
   - wallet.policy
   - wallet.sign
   - trade.reconcile
-  - mcp.serve
+plannedCapabilities: []
 inputSchema:
   - "network.join: { link }               # orbitdb:// | ipns:// | https://.../registry"
   - "gateway.join-global: { url?, name?, capabilities?, force? }"
@@ -75,7 +76,7 @@ hardRules:
 | `version` | `1.0.0` (协议版本单独走 `bolloon-task/1`) |
 | `protocol` | `bolloon-task/1` (精确相等才接受, 见 §④) |
 | `execution.entrypoint` | `bolloon` |
-| `execution.modes` | `cli` ✅ 今天可用 · `mcp` **(planned: P4)** —— 今天**没有** `bolloon mcp serve` |
+| `execution.modes` | `cli` ✅ 今天可用 · `mcp` ✅ 今天可用 (`bolloon mcp serve`, stdio; P4) |
 | `requires` | `bolloon-cli` |
 
 **怎么确认本机装了它** (可直接执行):
@@ -89,7 +90,8 @@ bolloon doctor             # 安装入口 + 版本事实 + 更新状态自洽性
 
 **今天真实存在的 CLI 子命令** (`src/cli-entry.ts:136-201`, 逐条核对, 不在表里的都是 `(planned)`):
 `--version` · `--help` · `--gui/-g` · `--web/-w` · `--cli/-c` · `setup|init` · `update` · `doctor` · `runtime` ·
-`model` · `trace` · `p2p` · `task` · `engine list|run` · `x402 fetch|balance` · `read|summarize|improve`。
+`model` · `trace` · `p2p` · `task` · `engine list|run` · `x402 fetch|balance` · `read|summarize|improve` ·
+`network|agent|task|wallet|payment|trade` 六个命令组 (P3 统一信封) · `mcp serve|tools` (P4)。
 
 ---
 
@@ -358,13 +360,18 @@ payment failed    ≠ safe to retry      → 付款失败也不等于可重付
 { "mcpServers": { "bolloon": { "command": "bolloon", "args": ["mcp", "serve"] } } }
 ```
 
-> ⚠️ **`bolloon mcp serve` 今天不存在 (planned: P4)**。硬约束是「MCP 不复制业务逻辑」—— tools 只调 CLI service 层,
-> 否则支付/任务状态/身份会分叉成两套 (`agent-access-layer.md` §1)。
+> ✅ **`bolloon mcp serve` 已实现 (P4, 2026-09-21)** —— stdio JSON-RPC。硬约束是「MCP 不复制业务逻辑」——
+> tools 只调 CLI service 层 (`src/cli/mcp/bridge.ts` 是唯一通道), 否则支付/任务状态/身份会分叉成两套 (`agent-access-layer.md` §1)。
+> 调用返回 **P3 信封原样** `{ ok, code, message, data, evidence, next_action }`; `isError` 严格等于 `!ok`
+> —— **失败绝不会变成 MCP 的成功**。`bolloon mcp tools` 可以列出当前清单。
 >
-> **(planned) tools (15)**: `bolloon_network_join` · `network_status` · `agent_register` · `agent_discover` · `task_send` · `task_list` · `task_accept` · `task_reject` · `task_status` · `task_cancel` · `task_result` · `payment_status` · `trade_list` · `trade_show` · `trade_reconcile`
-> **（planned) resources (8)**: `bolloon://network/status` · `network/capabilities` · `agent/manifest` · `tasks/inbox` · `tasks/recent` · `trades/recent` · `wallet/policy` · `skill/current`
+> **tools (17)**: `bolloon_network_join` · `bolloon_network_status` · `bolloon_agent_register` · `bolloon_agent_discover` · `bolloon_agent_manifest` · `bolloon_task_run` · `bolloon_task_list` · `bolloon_task_status` · `bolloon_task_result` · `bolloon_task_retry` · `bolloon_wallet_status` · `bolloon_payment_pending` · `bolloon_payment_approve` · `bolloon_payment_reject` · `bolloon_trade_list` · `bolloon_trade_show` · `bolloon_trade_reconcile`
+> **resources (7)**: `bolloon://network/status` · `bolloon://network/capabilities` · `bolloon://agent/manifest` · `bolloon://tasks/recent` · `bolloon://trades/recent` · `bolloon://wallet/policy` · `bolloon://skill/current`
+> **刻意不暴露**: `task complete|cancel` 与 `network leave` (P3 如实报 `C_NOT_IMPLEMENTED`, 暴露会逼 MCP 层假装成功) · `task send|inbox|accept|reject` (写操作: 签名 + 落本机台账 + 对外发帧, 不在 P4 冻结的 17 个里, 纳入前需单独裁决) · `wallet set-policy` (远端改策略 = 绕过 payment policy; 必须由本机用户执行) · `network init|peers` (本机节点生命周期/诊断)。
+> 每个 tool 只收**具名参数** (白名单, 未知参数一律 `INVALID_ARGUMENT`), 所以客户端**没法**注入 `--private-key` / `--mode` 之类选项。
+> `bolloon_trade_reconcile` 只接受**单笔** (只读恢复计划); 无 id 的全局对账会写交易记录, 仍是本机命令 (`bolloon trade reconcile`)。
 
-**MCP 可用 (planned)**: 发任务 · 接任务 · 查报价 · 请求支付 · **使用已授权的钱包签名** · 查交易结果。
+**MCP 可用 (已实现)**: 声明与发现能力 · 发任务 (M1 入口) · 查任务/交易/交付证据 · 看钱包策略 · **放行待审批付款 (只改审批状态, 不发付款)** · 对账。
 **MCP 永远不可以**: 把私钥返回远端 · 把完整回执写进公共网络 · 绕过 payment policy · 修改交易历史 · **伪造 `verified`** · 无授权时切到自主支付。
 
 **今天想接 MCP 怎么办**: 用 CLI (支持 shell 的 Agent) 或直接打本地 HTTP API (§③)。**不要求你导入 bolloon 内部 TS 包。**
@@ -410,7 +417,8 @@ payment failed    ≠ safe to retry      → 付款失败也不等于可重付
 `bolloon network init|join|status|leave|peers` · `bolloon agent register|manifest|discover|inspect` ·
 `bolloon task send|list|status|cancel|retry|result|inbox|accept|reject|run|complete` ·
 `bolloon wallet status|policy|set-policy` · `bolloon payment pending|approve|reject` ·
-`bolloon trade list|show|events|reconcile` · `bolloon mcp serve` · MCP 15 tools + 8 resources ·
+`bolloon trade list|show|events|reconcile` ·
 全局选项 `--quiet` / `--timeout` / `--request-id` · 统一 JSON 信封 (`code`/`message`/`evidence`/`next_action`) ·
 P2P 任务帧 (收任务 / 报价 / 结果回传的真实传输)。
+**MCP (P4 已实现)**: `bolloon mcp serve|tools` · 17 tools + 7 resources —— 清单见 §⑧。
 **今天真能跑的**就是 §③ 那一屏命令 + §② 表里 ✅ 的接口。

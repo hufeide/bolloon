@@ -28,9 +28,9 @@ tags: [access-protocol, p1-frozen, envelope, error-codes, state-mapping, local-d
 | 任务契约 (`bolloon-task/1`) | **已落** | `src/agents/task-contract.ts` + `src/test/task-contract.test.ts` 22/22 |
 | 交易两层状态 + verified 门 | **已落** | `src/agents/x402/settlement-state.ts` (44/44 验收) · 单测 18/18 |
 | 支付恢复 / 对账 | **已落** | `src/agents/x402/payment-recovery.ts` (57/57, 真 SIGKILL) |
-| CLI 子命令 (P3) | **部分**: 只有 M1 的 `bolloon task` 等少数命令 | `src/cli-entry.ts:136-201` |
-| 统一 JSON 信封 (§2) | **未落**: 今天没有一条命令按本页格式输出 | 见 §2.1 真实输出对照 |
-| 错误码 (§3) | **未落**: `src/` 里不存在任何本页错误码常量 | `grep` 零命中 |
+| CLI 子命令 (P3) | **已落 (2026-09-21 收尾)**: 6 命令组 + `task.send/inbox/accept/reject/result` 真收发 | `src/cli/commands/*` · `src/agents/task-transport.ts` · `src/agents/task-inbox.ts` |
+| 统一 JSON 信封 (§2) | **已落**: 所有命令组按本页格式输出 (`src/cli/protocol-envelope.ts`) | `bolloon task send --json` 等真实输出 |
+| 错误码 (§3) | **已落**: §3 冻结码为常量 + P3 新增码 (含 `TRANSPORT_UNAVAILABLE`/`TRANSPORT_FAILED`, 按 §1.3 不 bump) | `protocol-envelope.ts` `FROZEN_CODES`/`CLI_CODES` |
 | MCP 适配层 (P4) | **未落**: 无 `bolloon mcp` 子命令 | `grep "case 'mcp'" src/cli-entry.ts` 零命中 |
 
 **标记法 (全页统一)**:
@@ -88,7 +88,7 @@ if (req?.protocol !== TASK_PROTOCOL) issues.push(`协议版本不对: ${String(r
 2. **报价侧同样**: `validateQuoteAgainstRequest` 也查 `quote.protocol !== TASK_PROTOCOL` (`task-contract.ts:251`), 防"请求一个新版本、回执一个老版本"。
 3. **未知状态/未知枚举同样拒**: `checkTaskMove` 对未知状态给 `未知任务状态: X → Y` (`task-contract.ts:74`); `isLifecycleStatus` / `isSettlementFact` 对未知取值返回 false (`settlement-state.ts:44-46`, `168-170`)。
 4. **对外码**: 版本不对 → `PROTOCOL_VERSION_UNSUPPORTED` (§3)。
-5. **今天还没有版本协商** (无 `Accept-Protocol` / capability 握手)。未做, 如实标 `(planned)`; v1 的唯一协商方式就是"客户端读本页 + 发 `bolloon-task/1`"。
+5. **今天还没有版本协商** (无 `Accept-Protocol` / capability 握手)。仍未做; v1 的唯一协商方式就是"客户端读本页 + 发 `bolloon-task/1`" (帧协议不匹配 → 拒, `parseTaskFrame`)。
 
 ---
 
@@ -221,11 +221,11 @@ if (req?.protocol !== TASK_PROTOCOL) issues.push(`协议版本不对: ${String(r
 | `x402_payment_retry:<transactionId>` | 对账已确认可安全付款, 由**持钱包的一方**走同一 requestId 的幂等路径 | **是**, 字面量在 `payment-recovery.ts:299` |
 | `x402_continue:<transactionId>` | 继续未完结交易 (交付/验真) | **是**, `payment-recovery.ts:300` |
 | `reconcile` | 付款状态不确定 → **先对账**, 绝不重付 | 语义已冻 (`payment-recovery.md` §1), 串待 P3 接出 |
-| `approve_payment` | 等人工/本地策略放行 | (planned: P3) |
+| `approve_payment` | 等人工/本地策略放行 | **是** (`wallet.sign`/`accept` 的 fail-closed 拒绝路径会给出它) |
 | `needs_human` | 需要人处理 (争议/越权/预算) | 字面量已在仓库用作 `wakeReason` (`payment-recovery.ts:285`) |
-| `retry_same_request` | 同 requestId 重发 (幂等, 不会产生第二笔) | (planned: P3) |
-| `rejoin_network` / `redefine_capability` / `raise_budget` / `upgrade_client` | 前置条件类 | (planned: P3) |
-| `wait` | 远端仍在执行, 稍后再查 | (planned: P3) |
+| `retry_same_request` | 同 requestId 重发 (幂等, 不会产生第二笔) | **是** (`task send` 传输失败/缺签名路径) |
+| `rejoin_network` / `redefine_capability` / `raise_budget` / `upgrade_client` | 前置条件类 | **是** (`task send` 无目标 · `accept` 未知能力/预算不足 · 版本不符) |
+| `wait` | 远端仍在执行, 稍后再查 | **是** (`task accept` 未交付正文时) |
 
 ### 2.4 今天真实能拿到的 JSON (照实对照, 别把信封当成已有)
 
@@ -358,7 +358,7 @@ if (req?.protocol !== TASK_PROTOCOL) issues.push(`协议版本不对: ${String(r
 | **/tx** | `GET /api/x402/transactions` · `GET /api/x402/transactions/:id` (`web/server.ts:2990-3026`) | 交易记录原文: `status` + `settlementFact` + `chainSettled` + `events[]` + `responsibility` |
 | **诊断模式** | `bolloon doctor` (`cli-entry.ts:777-779`) · `bolloon p2p --json` (`:450-458`) · `GET /api/health` (`web/server.ts:8194`) · `GET /api/watchdog` (`:8218`) · `GET /api/supervisor` (`:3322`) | 本机自洽性 / 网络可拨入地址 / 恢复 tick 报告 (`scanned/reconciled/awaitingPayment/mustNotRepay/closed`) |
 
-**`/tx` 与 `/trace` 作为 CLI 子命令** (`bolloon trade show <id>` / `bolloon task status <id>`) 是 `(planned: P3)` —— 今天的同名路径是上面那两个 HTTP 接口。
+**`/tx` 与 `/trace` 作为 CLI 子命令** (`bolloon trade show <id>` / `bolloon task status <id>`) **已落地** (2026-09-21 P3): `trade show/events/reconcile` · `task status/result/inbox/...` (见 `src/cli/commands/{trade,tasks}.ts`)。
 
 ---
 

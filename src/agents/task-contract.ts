@@ -364,7 +364,7 @@ export function authorizeWalletSignature(req: WalletSignRequest): WalletSignDeci
 
 export interface SignatureAuditEntry {
   at: number;
-  kind: 'task_payment' | 'task_result' | 'task_request';
+  kind: 'task_payment' | 'task_result' | 'task_request' | 'wallet_payload';
   mode: PaymentMode;
   requestId: string;
   taskId?: string;

@@ -38,8 +38,11 @@ export const CLI_CODES = [
   // 命令组成功码
   'OK', 'NETWORK_JOINED', 'NETWORK_NODE_READY', 'AGENT_REGISTERED',
   'POLICY_UPDATED', 'PAYMENT_APPROVED', 'PAYMENT_REJECTED', 'RECOVERY_PLANNED',
+  'WALLET_SIGNED', 'TASK_DELIVERED',
   // 任务态里 §3 没有单列的终态 (字面量取自冻结的 14 态状态机)
   'TASK_REJECTED', 'TASK_FAILED', 'TASK_CANCELLED',
+  // 传输层 (§1.3「新增错误码不 bump 版本」): 帧没送到 / 没有可用传输
+  'TRANSPORT_UNAVAILABLE', 'TRANSPORT_FAILED',
   // 通用失败码
   'C_NOT_IMPLEMENTED', 'INVALID_ARGUMENT', 'NOT_FOUND', 'TIMEOUT', 'INTERNAL_ERROR',
 ] as const;
@@ -82,6 +85,9 @@ const OPTIONS_WITH_VALUE = new Set([
   '--capability', '--name', '--price', '--per', '--description', '--wallet', '--endpoint',
   '--link', '--url', '--instruction', '--provider', '--amount', '--currency', '--network',
   '--per-tx', '--allow-recipient', '--allow-service', '--rate-limit', '--reason',
+  // 2026-09-21 (P3 收尾): bolloon-task/1 真收发 + wallet sign 用到的选项
+  '--payload', '--message', '--mode', '--task-id', '--deadline', '--salt', '--reply-to',
+  '--peer', '--via', '--eta', '--deliver',
 ]);
 
 export function parseFlags(args: string[]): CliFlags {
