@@ -8167,6 +8167,30 @@ app.post('/active-channel', async (req, res) => {
   }
 
   // 健康检查端点
+  // 2026-09-18: 网络脉冲公开只读投影 (给 bolloon-UI 网关页; 无认证, 短缓存, 只有聚合)
+  //   永远不返回原始事件 / registry / DID / peerId / IP / 钱包 / 任务正文。
+  app.get('/api/public/network/progress', async (req, res) => {
+    try {
+      const np: any = await import('../agents/network-pulse.js');
+      const snap = await np.getNetworkPulse({});
+      const body = JSON.stringify({ ...snap, status: np.snapshotStatus(snap) });
+      const { createHash } = await import('crypto');
+      const etag = '"' + createHash('sha256').update(body).digest('hex').slice(0, 32) + '"';
+      res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=15');
+      res.setHeader('ETag', etag);
+      if (req.headers['if-none-match'] === etag) { res.status(304).end(); return; }
+      res.type('application/json').send(body);
+    } catch (e: any) {
+      // 观察层不可用 → 如实 unavailable (不是 500 空体, 也不是"网络为空")
+      try {
+        const np: any = await import('../agents/network-pulse.js');
+        res.type('application/json').send(JSON.stringify(await np.getNetworkPulse({ unavailable: true })));
+      } catch {
+        res.status(503).json({ status: 'unavailable', error: 'network pulse unavailable' });
+      }
+    }
+  });
+
   app.get('/api/health', async (req, res) => {
     try {
       if (!healthMonitor) {

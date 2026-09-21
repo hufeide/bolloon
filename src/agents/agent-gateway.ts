@@ -164,6 +164,10 @@ export async function gatewayCallAgent(opts: GatewayCallOptions): Promise<Gatewa
 
     // 7. Reputation: 记录成功
     await recordServiceOutcome(provider.agentId, provider.service?.name || 'service', 'success', registry).catch(() => {});
+    // 2026-09-18: 委派完成 → 网络脉冲 (只记"发生过一次成功委派", 不记任务内容/对端地址; 失败静默)
+    try {
+      void import('./network-pulse.js').then((np) => np.recordNetworkEvent({ type: 'delegation_completed', did: String((opts as any).toPublicKey || provider.agentId || 'unknown-node') })).catch(() => { /* ignore */ });
+    } catch { /* ignore */ }
     return { success: true, provider: provider.agentId, decision: 'allow', output: r.output };
   } catch (e: any) {
     return { success: false, error: `执行失败: ${String(e?.message || e).slice(0, 200)}`, provider: provider.agentId };

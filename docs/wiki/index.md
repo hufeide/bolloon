@@ -22,6 +22,7 @@
 | [android-agent-runtime.md](./android-agent-runtime.md) | v2 | Android Agent Runtime 架构 (Phase 1-4: Accessibility/Shizuku/本地LLM/Agent OS) |
 | [agent-economic-protocol.md](./agent-economic-protocol.md) | v2 | Agent Economic Protocol 设计 (7 协议 + bolloon 映射 + Registry/x402/Policy MVP) |
 | [durable-run-protocol.md](./durable-run-protocol.md) | v2 | Durable Run 协议 (Goal→Run→Checkpoint→Recovery 状态机 + 字段协议 + 现状盘点 + 六阶段完成度台账) |
+| [network-pulse.md](./network-pulse.md) | v1 | **网络脉冲**: 匿名可验证的公开观察投影 (事件白名单 · 去重 · 隐私阈值 · live/stale/unavailable · `GET /api/public/network/progress` · 双节点真跑 36/0) |
 | [m1-m4-closure.md](./m1-m4-closure.md) | v1 | **M1–M4 收口验收口径**(冻结): 四个唯一事实来源 + 四条不可违反规则 + 5 个用户态口径 + 跨里程碑验收矩阵 + 失败→出口映射 |
 | [product-core-focus.md](./product-core-focus.md) | v1 | **产品核心收缩**: 一句话核心承诺 + 五步闭环 + 三问过滤器 + 冻结清单(不改代码) + M1-M4 路线图 + M1 真实差距 |
 | [facilitator-paths.md](./facilitator-paths.md) | v1 | facilitator 协议路径本地真跑 (verify/settle 四结果 + txHash 有无 + 报价自洽 + 凭据绑定; 真链部分明确未验) |

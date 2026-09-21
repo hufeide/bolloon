@@ -125,6 +125,19 @@ export function setLocalManifest(m: Partial<AgentManifest>) {
   if (!('functions' in m)) localManifest.functions = [];
   if (!('exportments' in m)) localManifest.exportments = [];
   if (!('sciences' in m)) localManifest.sciences = [];
+  // 2026-09-18: 网络脉冲 (只记公开统计; 不落 DID/正文; 统计失败绝不影响主路径)
+  try {
+    const did = String(localManifest.ownerPublicKey || '');
+    const agents = localManifest.agents || [];
+    void import('./network-pulse.js').then(async (np) => {
+      await np.recordNetworkEvent({ type: 'manifest_published', did, agentId: agents[0]?.id, signed: true });
+      for (const a of agents) {
+        for (const cap of a.capabilities || []) {
+          await np.recordNetworkEvent({ type: 'capability_announced', capability: cap, did, agentId: a.id, signed: true });
+        }
+      }
+    }).catch(() => { /* 统计失败忽略 */ });
+  } catch { /* 同上 */ }
   return localManifest;
 }
 
@@ -184,6 +197,20 @@ const remoteManifests: Map<string, AgentManifest> = new Map();  // key = ownerPu
 
 export function cacheRemoteManifest(m: AgentManifest) {
   if (m.ownerPublicKey) remoteManifests.set(m.ownerPublicKey, m);
+  // 2026-09-18: 收到远端 manifest = 观察到另一个节点 (脉冲只记聚合, 记 did 摘要不记原值)
+  try {
+    const did = String(m.ownerPublicKey || '');
+    if (did) {
+      void import('./network-pulse.js').then(async (np) => {
+        await np.recordNetworkEvent({ type: 'peer_connected', did });
+        for (const a of m.agents || []) {
+          for (const cap of a.capabilities || []) {
+            await np.recordNetworkEvent({ type: 'capability_announced', capability: cap, did, agentId: a.id });
+          }
+        }
+      }).catch(() => { /* ignore */ });
+    }
+  } catch { /* ignore */ }
   return m;
 }
 

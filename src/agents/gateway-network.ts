@@ -244,6 +244,11 @@ export async function joinNetwork(link: string, deps?: { registry?: AgentRegistr
       sharedContextCid: bootstrap.sharedContextCid,
     },
   ]);
+  // 2026-09-18: 入网成功 → 网络脉冲 (匿名统计, 失败静默)
+  try {
+    const did = String((globalThis as any).__bolloonLocalDid || bootstrap.name || link || 'unknown-node');
+    void import('./network-pulse.js').then((np) => np.recordNetworkEvent({ type: 'node_joined', did, signed: true })).catch(() => { /* ignore */ });
+  } catch { /* ignore */ }
   return { ok: true, joined, total: remoteServices.length, linkKind: parsed.kind, networkName: bootstrap.name || parsed.networkName, networkId: bootstrap.networkId, sharedContextCid: bootstrap.sharedContextCid };
 }
 

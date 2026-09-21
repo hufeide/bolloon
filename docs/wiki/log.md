@@ -2633,3 +2633,14 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 
 **未做 (如实)**: 真机 App 未改 (APK/IPA 未重出; 脚本与单测扮演手机真做密码学与 HTTP) · UI 未在真机/模拟器点过
 (只做语法/构建/逻辑校验) · 生物识别 (FaceID/指纹) 与系统级确认未接 (当前 sheet 内二次确认)。
+
+## [2026-09-21] feat | 网络脉冲 Network Pulse: 匿名可验证的公开观察投影 + 公开只读接口
+
+- **动因**: leo "下载目录下的 eigenflux 有很多功能希望 bolloon-UI 也能显示 / 需要补充 UI 动态显示全球智能体进度"; 明确**以 bolloon 为主系统**, 只借鉴 EigenFlux 的"网络活跃度/成员进度/匿名活动投影"产品思想, **不合并项目、不把 EigenFlux 当后端依赖**(不借其 Go/Postgres/API/身份体系)。
+- **新增** `src/agents/network-pulse.ts`: 事件白名单 5 类 · 匿名化(`sha256('bolloon-pulse|'+DID)` 前 16 位, 原始 DID/能力名不落盘) · 去重(同桶 node_joined 只记一次; capability 计数 = 不同 Agent 数) · 隐私阈值(少于 3 个 Agent 的类别并进 `other`) · 上限(5000 事件 / 24h 窗 / 1h 桶 / 12 类 / 8 条活动) · 快照 `live/stale/unavailable`(过期不伪装实时; 不可用时明确写"这不是网络为空") · **scope 可信边界**(单来源 `observed`, ≥2 签名来源 `verified`) · malformed 安全(坏事件丢弃) · 快照签名(`signSnapshot`/`verifySnapshotSignature` + canonicalize)。
+- **生命周期挂点 (全部 fire-and-forget, 统计失败绝不影响主路径)**: `setLocalManifest`(manifest_published + capability_announced signed) · `cacheRemoteManifest`(peer_connected + 对方 capability) · `joinNetwork`(node_joined signed) · `gatewayCallAgent` 成功(delegation_completed)。
+- **公开只读接口** `GET /api/public/network/progress`: 无认证 · `Cache-Control: public, max-age=15, stale-while-revalidate=15` · `ETag` + `If-None-Match` → 304 · 空网络安全返回 · 观察层不可用 → `unavailable` · **永不暴露** DID/peerId/IP/钱包/任务正文/Registry 原始数据。本地 `/api/agent/*`、`/api/gateway/*` 原样保留(只服务本地 Agent 与节点控制, 不给网站用)。
+- **真跑逼出的 2 个真问题 (已修)**: ① **malformed 事件会崩快照**(`null` 事件读 `occurredAt` → TypeError, 属 leo 点名的 "malformed manifest" 用例) → 加 `isValidEvent` 过滤, 坏数据一律丢弃; ② 断言与**隐私阈值语义**冲突(小网络里每类只有 1 个 Agent, 全进 `other` 才是正确行为) → 验收改成先断言小网络全进 `other`, 再补足到阈值断言 `research` 出现且计数 = **不同 Agent 数**(4), 并加"重复声明不虚增"断言。
+- **验证**: 单测 `src/test/network-pulse.test.ts` **17/17** · 双节点集成 `scripts/verify-network-pulse.ts` **36 passed / 0 failed / EXIT=0**(A 发布 manifest → B 缓存 → 观察层 2 节点 2 Agent; 原始 DID 与能力名都不落盘; 三态; malformed; 真 HTTP 无凭据 200 + Cache-Control + ETag + **304** + 无私字段; 前端消费契约)· `tsc --noEmit` 0 错。
+- **前端 (bolloon-UI)**: 交子智能体按同一份计划改造 `gateway.html` + `app.js` + `style.css` + `scripts/verify-site.mjs`(脉冲区 · 四态渲染 · 双语 · textContent-only · 轮询与退避 · reduced-motion · 移动端 · 无 console 错误), 完成情况见紧随其后的提交与线上验收记录。
+- **本批未做 (如实)**: 真正的**全球**公共观察入口(需长期在线观察者/Explorer); v1 = 节点本地观察 + `?pulse=` 可指定端点 + 同源静态签名快照(过期就显示 `stale`)。链上强绑定/世界地图/公开 DID 列表/任务内容流/WebSocket 均不做。
