@@ -2679,3 +2679,14 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 - **两个真 bug (子智能体修, 已写进 skill `bolloon-website`)**: ① markup 写 `24h` 而 JS 写 `h24` → 静默丢 24h 数值 (钩子名必须 markup/app.js/verify 三处同步) ② 验收脚本 `awaitPromise:true` 直接 await `refresh()` → 请求卡在 Fetch 拦截队列 → `Invalid InterceptionId` (必须包成 `(() => { inst.refresh(); return 1; })()`)。
 - **部署教训 (我自己踩的, 已写进 skill)**: `Deployment complete` 后**立刻**跑真域名验收 → **97/7 假失败**(含 `roots:0` 这种"页面没有该区块"的假象), 隔 20s 复跑即 **104/0**; 另 `curl | grep` 判页面新旧会因 Cloudflare `content-encoding: br` 未解压而得 0 命中 —— 要加 `--compressed` 或直接用真 Chrome 读 DOM。
 - **UI 仓提交**: `977928c`(9 个文件) 已 push main。
+
+## [2026-09-21] feat(pulse) | 公开观察入口接通 + 静态站动态加载闭环 (真快照签名 + 定期刷新 + cron)
+
+- **动因 (leo 原话)**: "公开观察入口尚未接入，需要实现动态加载" —— 线上脉冲此前只能显示 `unavailable` (静态站没有后端/数据源)。
+- **CREATE** `scripts/export-network-pulse.ts`: 把本节点的**真实观察投影**导出成可部署的公开观察入口 (`network-pulse.json`), 供 bolloon.cn 走同源回退档。含 `--home/--out/--ttl/--no-sign`; 导出前用 `assertNoPrivateFields` 兜底拒绝私有字段 (检出即 exit 2)。
+- **真 bug (真跑抓到)**: `src/agents/network-pulse.ts` 的 `signSnapshot` 把**字符串**直接喂给 `@diap/sdk` 的 `KeyManager.sign` (它要 **Uint8Array**/ed25519), 且 `String(Uint8Array)` 会存成 `"1,2,3,…"` 垃圾签名, 而 catch **静默吞错** → 线上快照 `signed=false` 却没人知道。修: `snapBytes()` 编字节 + base64 存 + `decodeSnapSig()` 解回 `Uint8Array`; 新增 `lastSnapshotSignError()` 让失败**可诊断**(导出器现在会打印未签名的真实原因)。修后**真跑 `signed=true`**(真 keypair, `~/.bolloon/identity.json`)。
+- **静态入口的新鲜度语义 (设计缺口, 已修)**: 静态快照的 `fresh_until` 原来比发布周期短 → 页面**永远显示 stale**。现支持 `--ttl`(默认 7200s), 语义写明 `freshness_semantics = periodic-publication: fresh_until = published_at + 发布周期 (不是实时)`; 页面同时显示快照时间与相对年龄, 不伪装实时。
+- **CREATE** (bolloon-UI) `scripts/refresh-pulse.sh`: 从本机节点导出 → **私有字段自检**(含 did/peerId/wallet/privateKey 即拒绝部署) → **观察内容未变则跳过部署**(省 CF Pages Free 500 次/月配额, 比较时剔除时间/签名字段) → 部署。`network-pulse.json`(+`.prev`)加进 `.gitignore`(每次刷新重新生成, 不进 git 免噪音)。
+- **cron**: `bolloon-pulse-refresh` (job `c85aa4b645c5`, `every 2h`, `no_agent`, 脚本 `~/.hermes/scripts/bolloon-pulse-refresh.sh` → 转调 UI 仓脚本, deliver=local 仅存档) —— 每 2 小时刷新一次, 约 360 次部署/月 < 500 限额。
+- **真域名核验 (真 Chrome 读 DOM, 不是夹具)**: 线上 `network-pulse.json` = `status=live scope=verified signed=True totals={nodes:2,agents:3,active_agents:0,seen_last_24h:3}`; 网关页实渲染 `state=live · nodes=2 · agents=3 · active=0 · 24h=3 · scope=网络观察快照 (多签名来源)`。`verify-site.mjs https://bolloon.cn` **104/0**。
+- **未做**: 单测未覆盖 `signSnapshot` 的真 keypair 往返 (值得补) · P3 CLI 适配 · P4 MCP · P5 双节点 12 步 · P6 经济聚合。

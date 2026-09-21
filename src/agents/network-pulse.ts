@@ -352,16 +352,32 @@ export function canonicalize(value: unknown): string {
 export interface SignedSnapshot { snapshot: NetworkPulseSnapshot }
 
 /** 用本机 DID 身份给快照签名 (公开入口可校验; 只暴露签名与指纹, 不暴露 DID) */
+/** 上一次快照签名失败的原因 (给调用方诊断用; 绝不出现在公开输出里) */
+let lastSignErr: string | null = null;
+export function lastSnapshotSignError(): string | null { return lastSignErr; }
+
+/** 快照签名输入是 Uint8Array (ed25519), 存 base64 —— 不能直接把字符串喂给 KeyManager.sign */
+function snapBytes(snap: NetworkPulseSnapshot): Uint8Array {
+  const payload = { ...snap, signature: undefined, signer_fingerprint: undefined };
+  return new TextEncoder().encode(canonicalize(payload));
+}
+function decodeSnapSig(sig: string): Uint8Array {
+  if (/^[0-9a-f]{128}$/i.test(sig)) return new Uint8Array(Buffer.from(sig, 'hex'));
+  return new Uint8Array(Buffer.from(sig, 'base64'));
+}
+
 export async function signSnapshot(snap: NetworkPulseSnapshot, h?: string): Promise<NetworkPulseSnapshot> {
+  lastSignErr = null;
   try {
     const { KeyManager } = await import('@diap/sdk');
     const file = path.join(home(h), '.bolloon', 'identity.json');
     const kp: any = await (KeyManager as any).fromFile(file);
-    if (!kp?.privateKey) return snap;
-    const payload = { ...snap, signature: undefined, signer_fingerprint: undefined };
-    const sig = await (KeyManager as any).sign(kp, canonicalize(payload));
-    return { ...snap, signature: String(sig), signer_fingerprint: nodeDigest(String(kp.did || '')) };
-  } catch {
+    if (!kp?.privateKey) { lastSignErr = `没有可用身份 (${file}) → 未签名`; return snap; }
+    const sig: any = await (KeyManager as any).sign(kp, snapBytes(snap));
+    const sigStr = typeof sig === 'string' ? sig : Buffer.from(sig as Uint8Array).toString('base64');
+    return { ...snap, signature: sigStr, signer_fingerprint: nodeDigest(String(kp.did || '')) };
+  } catch (e: any) {
+    lastSignErr = String(e?.message || e);
     return snap;   // 没身份/签名失败 → 就返回未签名快照 (绝不假装签过)
   }
 }
@@ -371,8 +387,7 @@ export async function verifySnapshotSignature(snap: NetworkPulseSnapshot, public
   try {
     if (!snap.signature) return false;
     const { KeyManager } = await import('@diap/sdk');
-    const payload = { ...snap, signature: undefined, signer_fingerprint: undefined };
-    return await (KeyManager as any).verify(publicKey, canonicalize(payload), snap.signature);
+    return await (KeyManager as any).verify(publicKey, snapBytes(snap), decodeSnapSig(snap.signature));
   } catch {
     return false;
   }
