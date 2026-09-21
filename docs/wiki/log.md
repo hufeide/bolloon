@@ -2670,3 +2670,12 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 - **CREATE** `docs/wiki/agent-access-layer.md`(9,897 字节): CLI=跨 Agent 标准入口 · MCP=CLI 的**薄适配层(不复制业务逻辑)** · Skill=外部 Agent 使用说明; 含 CLI 命令表(网络/注册发现/任务收发/支付/交易)· 统一 JSON 信封 `{ok,code,message,data,evidence,next_action}`(失败也结构化)· MCP 15 tools + 8 resources + 六条禁止(不返私钥/不写完整回执/不绕 policy/不改历史/**不伪造 verified**/无授权不切自主支付)· 自主支付十步链 · 私钥七不加一条(只存本机/不走 P2P/不进 Skill/不进 MCP 返回/不写日志/不写 Pulse/不写任务正文 + 每次签名记 agent_id+task_id+transaction_id+策略结果)· `skills/bolloon-network/SKILL.md` 九节 · 兼容矩阵 · 公开/私有分层 · 六阶段表。
 - **记下一个待 leo 定夺的冲突**: 该计划写 **3 个支付模式**(manual/policy/autonomous), 而 leo 同日支付规则修正 + 我方 Phase 1 落地是 **4 个**(+ `agent-authorized`)。wiki 里按"保留 4 个, `agent-authorized` 视为**显式授权的 autonomous 变体**(无用户显式开启标记一律拒)"记录, 并标为待决 —— **不擅自抹平**。
 - **落地状态如实标注**: P1 契约层已落(`task-contract.ts`, 22/22)· P1 的**错误码表 / JSON 信封 / 版本策略未冻结** · P2 Skill · P3 CLI 适配 · P4 MCP · P5 双节点 12 步 · P6 经济聚合 均未做。
+
+## [2026-09-21] feat(site) | 脉冲顶到序厅正下方 (加入网络之前) + 首页序栏紧凑版 + 多实例化 — 验收 104 项 (跨仓)
+
+- **leo 指令原话**: "UI 里面的设计不够符合人类使用习惯, 把网络脉冲的位置替换加入网络的显示位置。复制页面也加一份在首页的序栏。"
+- **落地 (bolloon-UI, 子智能体实现 + 我复核)**: ① 网关页区块顺序 = 序厅 → **脉冲** → skills → **加入网络** → manifest → 端点 → 开发者 (脉冲占住"加入网络"原来的显眼位; 断言锁死顺序, 防以后被搬回去) ② 首页序栏 `.intro-inner` 加**紧凑版**脉冲 (同数据源/同四态/同「不是全网精确总量」caveat, 实测字节高度 205px < 网关 320px、数值字号 25.6px < 45.36px = **确实更轻更密**) ③ `app.js` 脉冲模块改**多实例** (遍历所有 `[data-pulse]`, 区内节点全用 `data-pulse-*` 钩子, 不再用 id; 取数 ① `data-pulse-src` ② `?pulse=` ③ 同源 `network-pulse.json` ④ unavailable; `__bolloonPulses`/`__bolloonPulseAttach(root)` 可运行时挂新实例) ④ 样式由 `#pulse` 泛化为 `[data-pulse]` + `.pulse-compact` 紧凑变体 ⑤ 全站 `?v=16 → 17`。
+- **验收**: `scripts/verify-site.mjs` 由 67 → **104 项** (新增 [7] 首页四态+EN+紧凑度、[8] 多实例隔离——运行时注入第二实例双向**独立失败**、[9] 全站 7 页**无重复 id** 且脉冲区无 id)。**我本机复跑 104/0 · 真域名 `https://bolloon.cn` 104/0**。
+- **两个真 bug (子智能体修, 已写进 skill `bolloon-website`)**: ① markup 写 `24h` 而 JS 写 `h24` → 静默丢 24h 数值 (钩子名必须 markup/app.js/verify 三处同步) ② 验收脚本 `awaitPromise:true` 直接 await `refresh()` → 请求卡在 Fetch 拦截队列 → `Invalid InterceptionId` (必须包成 `(() => { inst.refresh(); return 1; })()`)。
+- **部署教训 (我自己踩的, 已写进 skill)**: `Deployment complete` 后**立刻**跑真域名验收 → **97/7 假失败**(含 `roots:0` 这种"页面没有该区块"的假象), 隔 20s 复跑即 **104/0**; 另 `curl | grep` 判页面新旧会因 Cloudflare `content-encoding: br` 未解压而得 0 命中 —— 要加 `--compressed` 或直接用真 Chrome 读 DOM。
+- **UI 仓提交**: `977928c`(9 个文件) 已 push main。
