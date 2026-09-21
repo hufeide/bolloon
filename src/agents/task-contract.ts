@@ -384,6 +384,17 @@ export async function recordSignatureAudit(entry: Omit<SignatureAuditEntry, 'at'
   try {
     fs.mkdirSync(path.dirname(auditFile(h)), { recursive: true });
     fs.appendFileSync(auditFile(h), JSON.stringify(row) + '\n', 'utf8');
+    // ★ 公开观察层: 钱包签名是一次真实活动 → 计一次签名 (fire-and-forget, 只计数不记内容)
+    try {
+      const np: any = await import('./network-pulse.js');
+      void np.recordNetworkEvent({
+        type: 'wallet_signed',
+        did: entry.signerFingerprint,
+        agentId: entry.taskId || entry.requestId,
+        taskId: entry.taskId || entry.requestId,
+        signed: true,
+      }, h);
+    } catch { /* noop */ }
   } catch { /* 审计写失败不该炸主流程, 但调用方应看到 */ }
 }
 

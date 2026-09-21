@@ -126,6 +126,14 @@ export class LocalEconomicPolicy implements EconomicPolicy {
     return this._dailySpent;
   }
 
+  /**
+   * 把当前配置 + 今日花费落盘 (2026-09-21: P3 `bolloon wallet set-policy` 要能持久化策略改动)。
+   * 与 `recordSpend` / `resetIfNewDay` 用**同一份**文件格式与同一个 `persist()` —— 不另开一套写法。
+   */
+  async save(): Promise<void> {
+    await this.persist();
+  }
+
   async resetIfNewDay(): Promise<void> {
     const today = new Date().toISOString().slice(0, 10);
     if (this._dayKey !== today) {

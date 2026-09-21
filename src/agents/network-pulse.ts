@@ -51,6 +51,7 @@ export const NETWORK_EVENT_TYPES = [
   'delegation_completed',
   // 经济事件 (P6 扩展; 原五类保持兼容, 老节点发来的事件仍被接受)
   'task_posted', 'task_accepted', 'task_completed', 'trade_settled', 'trade_verified',
+  'wallet_signed',
 ] as const;
 export type NetworkEventType = (typeof NETWORK_EVENT_TYPES)[number];
 
@@ -89,6 +90,8 @@ export interface NetworkPulseSnapshot {
     tasks: number;
     tasks_completed: number;
     tasks_verified: number;
+    /** 钱包签名次数 (本机/网络里真实发生的签名, 只计数不给内容) */
+    signatures: number;
   };
   capabilities: { key: string; count: number }[];
   recent_activity: { kind: NetworkEventType; at: number; text: { zh: string; en: string } }[];
@@ -291,6 +294,33 @@ export function readAgentSites(h?: string): AgentSite[] {
   }
 }
 
+/**
+ * 把**真实交易活动**投影成脉冲事件 (由交易写路径调用, fire-and-forget)。
+ * 只按事实发: 交付 → task_completed · 真验真 → trade_verified · **链上口径**结算 → trade_settled。
+ * local-dev 上限是 payment_submitted, 永远进不了 trade_settled 那一支 —— 不冒充链上。
+ */
+export async function emitTradePulse(before: any, after: any, h?: string): Promise<void> {
+  try {
+    if (!after) return;
+    const taskId = String(after.requestId || after.transactionId || '');
+    if (!taskId) return;
+    const did = String(after.buyerDid || after.providerDid || after.payTo || after.paymentMode || 'unknown-node');
+    const agentId = String(after.agentId || after.runId || after.goalId || '') || undefined;
+    const base = { did, agentId, taskId, signed: true } as any;
+    if (after.status === 'delivered' && before?.status !== 'delivered') {
+      await recordNetworkEvent({ type: 'task_completed', ...base }, h);
+    }
+    if (after.status === 'verified' && before?.status !== 'verified') {
+      await recordNetworkEvent({ type: 'trade_verified', ...base }, h);
+    }
+    if (after.settlementFact === 'fully_settled' && before?.settlementFact !== 'fully_settled') {
+      await recordNetworkEvent({ type: 'trade_settled', ...base }, h);
+    }
+  } catch {
+    /* 统计失败绝不影响交易主路径 */
+  }
+}
+
 export function computeSnapshot(events: NetworkPulseEvent[], opts: { now: number; unavailable?: boolean; signedNodes?: number }): NetworkPulseSnapshot {
   const now = opts.now;
   const fresh_until = now + PULSE_LIMITS.snapshotTtlMs;
@@ -301,7 +331,7 @@ export function computeSnapshot(events: NetworkPulseEvent[], opts: { now: number
       fresh_until,
       scope: 'observed',
       scope_label: { zh: '当前节点观察到', en: 'Observed by this node' },
-      totals: { nodes: 0, agents: 0, active_agents: 0, seen_last_24h: 0, tasks: 0, tasks_completed: 0, tasks_verified: 0 },
+      totals: { nodes: 0, agents: 0, active_agents: 0, seen_last_24h: 0, tasks: 0, tasks_completed: 0, tasks_verified: 0, signatures: 0 },
       capabilities: [],
       recent_activity: [],
       notes: ['观察层暂不可用 — 这不是"网络为空"'],
@@ -347,6 +377,10 @@ export function computeSnapshot(events: NetworkPulseEvent[], opts: { now: number
     if (e.type === 'trade_verified') tasksVerified.add(t);
   }
 
+  // 钱包签名计数: 按 (来源, 时刻) 去重 —— 同一次签名重复上报不虚增
+  const signatureKeys = new Set<string>();
+  for (const e of window) if (e.type === 'wallet_signed') signatureKeys.add(`${e.sourceProof}|${e.occurredAt}`);
+
   const recent = [...window]
     .sort((a, b) => b.occurredAt - a.occurredAt)
     .slice(0, PULSE_LIMITS.maxActivity)
@@ -375,6 +409,7 @@ export function computeSnapshot(events: NetworkPulseEvent[], opts: { now: number
       tasks: tasks.size,              // 观察到发起的任务数 (聚合, 无内容)
       tasks_completed: tasksCompleted.size,
       tasks_verified: tasksVerified.size,
+      signatures: signatureKeys.size,  // 真实签名次数 (只计数)
     },
     capabilities,
     recent_activity: recent,

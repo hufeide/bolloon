@@ -205,7 +205,13 @@ export async function updateTransaction(
     ...rest,
     events: ev2 ? [...(rec.events || []), event(ev2.kind, ev2.detail)] : (rec.events || []),
   };
-  return await saveTransaction(next, home);
+  const saved = await saveTransaction(next, home);
+  // ★ 公开观察层: 真实交易活动 → 脉冲事件 (fire-and-forget; 统计失败绝不影响交易主路径)
+  try {
+    const np: any = await import('../network-pulse.js');
+    void np.emitTradePulse(rec, saved, home);
+  } catch { /* noop */ }
+  return saved;
 }
 
 export async function setTransactionStatus(transactionId: string, status: TransactionStatus, detail?: string, home: string = os.homedir()): Promise<TransactionRecord | null> {

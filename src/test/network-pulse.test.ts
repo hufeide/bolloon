@@ -145,7 +145,7 @@ describe('状态: live / stale / unavailable / 空网络', () => {
     const h = fs.mkdtempSync(path.join(os.tmpdir(), 'pulse-empty-'));
     const snap = await getNetworkPulse({ home: h, now, force: true });
     expect(snap.status).toBe('live');
-    expect(snap.totals).toEqual({ nodes: 0, agents: 0, active_agents: 0, seen_last_24h: 0, tasks: 0, tasks_completed: 0, tasks_verified: 0 });
+    expect(snap.totals).toEqual({ nodes: 0, agents: 0, active_agents: 0, seen_last_24h: 0, tasks: 0, tasks_completed: 0, tasks_verified: 0, signatures: 0 });
     expect(snap.capabilities).toEqual([]);
     expect(snap.recent_activity).toEqual([]);
     fs.rmSync(h, { recursive: true, force: true });
@@ -200,6 +200,36 @@ describe('scope 可信边界与签名', () => {
 // `scripts/verify-network-pulse.ts` 的 [5] 段真跑验证 —— 单测里不再起真服务 (起服务会拖到 90s 且抖动)。
 
 describe('经济计数 (任务数/完成数/已验真) 与智能体私有站 (IPNS)', () => {
+  it('真实交易活动 → 脉冲事件: 交付→task_completed · 真验真→trade_verified · 仅链上口径→trade_settled', async () => {
+    const home = mkTmp();
+    const base = { transactionId: 'tx-1', requestId: 'req-1', buyerDid: 'did:key:zB', paymentMode: 'local-dev', settlementFact: 'payment_submitted' };
+    // local-dev: 交付 + 验真事件会记, 但**绝不出 trade_settled** (没链上结算)
+    await NP.emitTradePulse({ ...base, status: 'paid' }, { ...base, status: 'delivered' }, home);
+    await NP.emitTradePulse({ ...base, status: 'delivered' }, { ...base, status: 'verified' }, home);
+    let snap: any = await NP.getNetworkPulse({ home, force: true });
+    expect(snap.totals.tasks_completed).toBe(1);
+    expect(snap.totals.tasks_verified).toBe(1);
+    expect(snap.totals.tasks).toBe(0);            // 没有 task_posted 事件就不虚报任务数
+
+    // 链上口径结算才出 trade_settled
+    await NP.emitTradePulse({ ...base, settlementFact: 'payment_submitted' }, { ...base, settlementFact: 'fully_settled', chainSettled: true }, home);
+    snap = await NP.getNetworkPulse({ home, force: true });
+    expect(snap.totals.tasks_completed).toBe(1);
+
+    // 同一状态重复调用不重复计数 (幂等: before 已经是该状态)
+    await NP.emitTradePulse({ ...base, status: 'delivered' }, { ...base, status: 'delivered' }, home);
+    snap = await NP.getNetworkPulse({ home, force: true });
+    expect(snap.totals.tasks_completed).toBe(1);
+  });
+
+  it('钱包签名计数: 按 (来源, 时刻) 去重', async () => {
+    const home = mkTmp();
+    await NP.recordNetworkEvent({ type: 'wallet_signed', did: 'did:key:zB', taskId: 't1' }, home);
+    await NP.recordNetworkEvent({ type: 'wallet_signed', did: 'did:key:zB', taskId: 't1' }, home);
+    const snap: any = await NP.getNetworkPulse({ home, force: true });
+    expect(snap.totals.signatures).toBeGreaterThan(0);
+  });
+
   // 本文件既有风格: 直接 mkdtempSync 建临时 home (没有全局助手)
   const mkTmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pulse-econ-'));
   it('任务计数按**不同任务**去重, 同任务重复事件不虚增', async () => {

@@ -23,8 +23,15 @@ import { discoverEngines, delegateToEngine } from './external-engines/index.js';
 import { x402CheckBalance, x402Fetch } from './agents/x402/x402Pay.js';
 import { runVersionCommand, runUpdateCommand, runDoctorCommand, runRuntimeCommand, UPDATE_HELP } from './cli/update-commands.js';
 import { collectVersionInfo } from './utils/version-info.js';
+// 2026-09-21 (P3): 统一 JSON 信封 + 命令组 (network/agent/task/wallet/payment/trade)
+import { runServiceGroup, GROUPS_HELP } from './cli/commands/index.js';
+import { legacyJson, type Code, type NextAction } from './cli/protocol-envelope.js';
 import { createRequire } from 'module';
 const _require = createRequire(import.meta.url);
+
+/** P3 `bolloon task <子命令>` 的已知子命令 —— 其它一律当 M1 任务正文 (既有体验不动) */
+const TASK_SUBCOMMANDS = new Set(['send', 'list', 'status', 'cancel', 'retry', 'result', 'inbox', 'accept', 'reject', 'run', 'complete']);
+
 
 const isWindows = process.platform === 'win32';
 
@@ -76,6 +83,8 @@ ${BOLD}命令:${RESET}
   bolloon x402 fetch <url>          x402 自动支付 HTTP 请求
   bolloon x402 balance <address>    查询 x402 钱包余额
 
+${GROUPS_HELP}
+
 ${BOLD}示例:${RESET}
   bolloon                    # 启动图形界面
   bolloon --web              # 启动 Web UI
@@ -85,6 +94,8 @@ ${BOLD}示例:${RESET}
   bolloon update plan        # 看更新计划与风险检查
   bolloon update now         # 真正执行更新
   bolloon doctor             # 我这台机器的 Bolloon 是否自洽
+  bolloon network join --json         # 入网 (失败也结构化: ok:false + code + next_action)
+  bolloon task --request-id <id> "…"  # 用给定幂等键跑 M1 任务 (同一 requestId 不会付两次)
 ${UPDATE_HELP}
 
 ${BOLD}环境变量:${RESET}
@@ -185,6 +196,17 @@ function parseArgs(): { mode: string; args: string[] } {
     // 2026-09-18: M1 唯一入口 —— 一个任务 → 一个 Skill → 一个报告卡
     case 'task':
       return { mode: 'task', args: args.slice(1) };
+    // 2026-09-21: P3 命令组 (统一信封 + 全局选项; 薄包装现有服务)
+    case 'network':
+      return { mode: 'network', args: args.slice(1) };
+    case 'agent':
+      return { mode: 'agent', args: args.slice(1) };
+    case 'wallet':
+      return { mode: 'wallet', args: args.slice(1) };
+    case 'payment':
+      return { mode: 'payment', args: args.slice(1) };
+    case 'trade':
+      return { mode: 'trade', args: args.slice(1) };
     // 2026-09-13: 初始化向导 (用户身份 + 模型供应商 + API key)
     case 'setup':
     case 'init':
@@ -269,7 +291,16 @@ async function handleX402Command(x402Args: string[]): Promise<void> {
       rpcUrl: readOption(rest, '--rpc-url'),
     });
     if (hasFlag(rest, '--json')) {
-      console.log(JSON.stringify(result, null, 2));
+      // 2026-09-21 (P3): 保留既有 {success,data,status,error,paymentInfo,...}, 追加 code/message/next_action
+      console.log(JSON.stringify(legacyJson(result as unknown as Record<string, unknown>, {
+        code: result.success ? 'OK' : 'INTERNAL_ERROR',
+        message: result.success ? `x402 请求完成 (status=${result.status})` : `x402 请求失败: ${result.error || ''}`,
+        evidence: [],
+        next_action: result.success ? null : 'retry_same_request',
+      }), null, 2));
+      if (!result.success) process.exit(1);
+    } else if (hasFlag(rest, '--quiet')) {
+      console.log(JSON.stringify(result));
       if (!result.success) process.exit(1);
     } else if (result.success) {
       console.log(`${GREEN}✅ x402 请求完成${RESET} status=${result.status}`);
@@ -295,7 +326,15 @@ async function handleX402Command(x402Args: string[]): Promise<void> {
       rpcUrl: readOption(rest, '--rpc-url'),
     });
     if (hasFlag(rest, '--json')) {
-      console.log(JSON.stringify(result, null, 2));
+      console.log(JSON.stringify(legacyJson(result as unknown as Record<string, unknown>, {
+        code: result.success ? 'OK' : 'INTERNAL_ERROR',
+        message: result.success ? `余额查询完成 (${result.network})` : `余额查询失败: ${result.error || ''}`,
+        evidence: [address],
+        next_action: result.success ? null : 'retry_same_request',
+      }), null, 2));
+      if (!result.success) process.exit(1);
+    } else if (hasFlag(rest, '--quiet')) {
+      console.log(JSON.stringify(result));
       if (!result.success) process.exit(1);
     } else if (result.success) {
       console.log(`${GREEN}💰 ${address}${RESET}`);
@@ -332,6 +371,7 @@ async function handleX402Command(x402Args: string[]): Promise<void> {
 async function handleTaskCommand(taskArgs: string[]): Promise<void> {
   const { runTask, resumeTask } = await import('./agents/task/task-runner.js');
   const wantJson = taskArgs.includes('--json');
+  const wantQuiet = taskArgs.includes('--quiet');
   const flag = (name: string): string | undefined => {
     const i = taskArgs.indexOf(name);
     return i >= 0 ? taskArgs[i + 1] : undefined;
@@ -341,6 +381,8 @@ async function handleTaskCommand(taskArgs: string[]): Promise<void> {
   const perPurchase = flag('--per-purchase');
   const daily = flag('--daily');
   const inputRaw = flag('--input');
+  // 2026-09-21 (P3): 幂等键透传 —— 同一 requestId 重发不会产生第二笔付款 (契约层派生逻辑不变)
+  const requestId = flag('--request-id');
 
   let input: unknown;
   if (inputRaw !== undefined) {
@@ -350,13 +392,22 @@ async function handleTaskCommand(taskArgs: string[]): Promise<void> {
 
   const STAGE_LABEL: Record<string, string> = { prepare: '准备中', acquire: '正在获取能力', execute: '正在执行', report: '报告' };
   const onStage = (stage: string, note: string) => {
-    if (wantJson) return;
+    if (wantJson || wantQuiet) return;
     console.error(`  ${CYAN}${STAGE_LABEL[stage] || stage}${RESET} ${note}`);
   };
 
   if (resumeId) {
     const r = await resumeTask({ goalId: resumeId, input, allowLocalDev: true });
-    if (wantJson) console.log(JSON.stringify({ resumed: r.resumed, action: r.action, reason: r.reason, mustNotRepay: r.mustNotRepay, card: r.card }, null, 2));
+    const verdict = legacyTaskVerdict(r);
+    const payload = {
+      resumed: r.resumed, action: r.action, reason: r.reason, mustNotRepay: r.mustNotRepay, card: r.card,
+      goalId: r.goalId, runId: r.runId ?? null, transactionId: r.transactionId ?? null,
+    };
+    if (wantQuiet) console.log(JSON.stringify(payload));
+    else if (wantJson) console.log(JSON.stringify(legacyJson(payload, {
+      code: verdict.code, message: verdict.message, next_action: verdict.next,
+      evidence: [r.goalId, r.runId, r.transactionId].filter(Boolean) as string[],
+    }), null, 2));
     else { console.log(''); console.log(r.text); console.log(''); }
     process.exit(r.ok ? 0 : 1);
   }
@@ -364,7 +415,7 @@ async function handleTaskCommand(taskArgs: string[]): Promise<void> {
   const words = taskArgs.filter((a, i) => {
     if (a.startsWith('--')) return false;
     const prev = taskArgs[i - 1];
-    return !['--budget', '--per-purchase', '--daily', '--input'].includes(prev || '');
+    return !['--budget', '--per-purchase', '--daily', '--input', '--request-id', '--timeout'].includes(prev || '');
   });
   const task = words.join(' ').trim();
   if (!task) {
@@ -379,20 +430,27 @@ ${CYAN}bolloon task --resume <goalId>${RESET}
   --per-purchase <USDC>  单次购买上限 (M1 硬上限 0.02)
   --daily <USDC>         当日预算 (M1 硬上限 0.10)
   --input '<json>'       显式给技能输入 (跳过自动推导)
-  --json                 机器可读输出
+  --request-id <id>      指定幂等键 (同一 requestId 重发不会产生第二笔付款)
+  --json                 机器可读输出 (+ code/next_action/evidence; 失败也结构化)
 `);
     return;
   }
 
-  const r = await runTask({ task, budget, perPurchase, daily, input, allowLocalDev: true, onStage });
-  if (wantJson) {
-    console.log(JSON.stringify({
+  const r = await runTask({ task, budget, perPurchase, daily, input, requestId, allowLocalDev: true, onStage });
+  const verdict = legacyTaskVerdict(r);
+  if (wantQuiet) {
+    console.log(JSON.stringify({ ok: r.ok, goalId: r.goalId, runId: r.runId, transactionId: r.transactionId, card: r.card, payment: r.payment }));
+  } else if (wantJson) {
+    console.log(JSON.stringify(legacyJson({
       ok: r.ok, status: r.card.status, conclusion: r.card.conclusion, card: r.card,
       goalId: r.goalId, runId: r.runId, transactionId: r.transactionId,
       advisor: r.advisor, payment: r.payment, outputIssues: r.outputIssues,
       budget: { taskBudget: r.budget.taskBudget, perPurchase: r.budget.perPurchase, daily: r.budget.daily, clamped: r.budget.clamped },
       stages: r.stages,
-    }, null, 2));
+    }, {
+      code: verdict.code, message: verdict.message, next_action: verdict.next,
+      evidence: [r.goalId, r.runId, r.transactionId].filter(Boolean) as string[],
+    }), null, 2));
   } else {
     console.log('');
     console.log(r.text);
@@ -402,17 +460,40 @@ ${CYAN}bolloon task --resume <goalId>${RESET}
   process.exit(r.ok ? 0 : 1);
 }
 
+/**
+ * 老 M1 命令 (`bolloon task`) 的 §3 码映射 (P1 §3 + §5.1 红线):
+ * local-dev 最高到 `delivered` → 一律 `TASK_COMPLETED` + `verify_result`, **绝不** TASK_VERIFIED。
+ */
+function legacyTaskVerdict(r: { ok: boolean; payment?: any; card?: any }): { code: Code; message: string; next: NextAction } {
+  const chain = r.payment?.chainSettled === true || r.card?.payment?.chainSettled === true;
+  if (r.ok) {
+    return chain
+      ? { code: 'TASK_VERIFIED', message: 'Task verified', next: null }
+      : { code: 'TASK_COMPLETED', message: 'Task delivered (local-dev: 链上未结算, 不算成功)', next: 'verify_result' };
+  }
+  return r.card?.hardGate === 'bought_not_executed'
+    ? { code: 'DELIVERY_FAILED', message: '已付款但没有交付 → 绝不重付, 交人处理', next: 'needs_human' }
+    : { code: 'RESULT_UNVERIFIED', message: '任务没走完/未过验真门', next: 'needs_human' };
+}
+
 async function handleTraceCommand(traceArgs: string[]): Promise<void> {
   const { listRuns, readRun } = await import('./agents/run-store.js');
   const { runToTraceText, runToTraceJson, summarizeTrace } = await import('./agents/trace-export.js');
   const wantJson = traceArgs.includes('--json');
+  const wantQuiet = traceArgs.includes('--quiet');
   const lastIdx = traceArgs.indexOf('--last');
   const last = lastIdx >= 0 ? Number(traceArgs[lastIdx + 1]) : undefined;
   const runId = traceArgs.find((a) => !a.startsWith('--') && a !== String(last));
 
   if (!runId) {
     const runs = await listRuns({ limit: 20 });
-    if (wantJson) { console.log(JSON.stringify(runs.map((r: any) => runToTraceJson(r)), null, 2)); return; }
+    const payloads = runs.map((r: any) => runToTraceJson(r));
+    if (wantQuiet) { console.log(JSON.stringify(payloads)); return; }
+    if (wantJson) {
+      // 2026-09-21 (P3): 列表形式也走统一信封 (此前是裸数组; `data` 里仍是同样的 payload 数组)
+      console.log(JSON.stringify({ ok: true, code: 'OK', message: `最近 ${runs.length} 次运行`, data: payloads, evidence: payloads.map((p: any) => p.runId).filter(Boolean), next_action: null }, null, 2));
+      return;
+    }
     console.log(`\n${BOLD}最近 ${runs.length} 次运行的执行轨迹${RESET}\n`);
     if (!runs.length) {
       console.log('  还没有运行记录 (落盘在 ~/.bolloon/runs/)');
@@ -432,12 +513,15 @@ async function handleTraceCommand(traceArgs: string[]): Promise<void> {
   const run = await readRun(runId);
   if (!run) {
     console.error(`${MAGENTA}没有这个运行: ${runId}${RESET}`);
+    if (wantJson) console.log(JSON.stringify({ ok: false, code: 'NOT_FOUND', message: `没有这个运行: ${runId}`, data: { runId }, evidence: [], next_action: 'retry_same_request' }, null, 2));
     process.exitCode = 1;
     return;
   }
-  console.log(wantJson ? JSON.stringify(runToTraceJson(run), null, 2) : runToTraceText(run, { limit: last }));
-  if (!wantJson) {
-    const j = runToTraceJson(run);
+  const j = runToTraceJson(run);
+  if (wantQuiet) console.log(JSON.stringify(j));
+  else if (wantJson) console.log(JSON.stringify(legacyJson(j as unknown as Record<string, unknown>, { code: 'OK', message: `运行 ${runId} 轨迹`, evidence: [runId], next_action: null }), null, 2));
+  else console.log(runToTraceText(run, { limit: last }));
+  if (!wantJson && !wantQuiet) {
     console.error(`\n${CYAN}(${j.counts.total} 步 · ✓${j.counts.ok} / ✗${j.counts.fail} · ${j.counts.totalMs}ms · 状态 ${j.status})${RESET}`);
   }
 }
@@ -450,8 +534,18 @@ async function handleTraceCommand(traceArgs: string[]): Promise<void> {
 async function handleP2pCommand(p2pArgs: string[]): Promise<void> {
   const { getLocalP2pInfo, formatP2pInfoText, formatP2pInfoJson } = await import('./agents/p2p-info.js');
   const info = await getLocalP2pInfo();
-  if (p2pArgs.includes('--json')) console.log(formatP2pInfoJson(info));
-  else console.log(formatP2pInfoText(info));
+  if (p2pArgs.includes('--quiet')) {
+    console.log(JSON.stringify(JSON.parse(formatP2pInfoJson(info))));
+  } else if (p2pArgs.includes('--json')) {
+    // 2026-09-21 (P3): 保留 bolloon-p2p-info/1 的全部既有字段, 追加 §2 的 code/message/evidence/next_action
+    const payload = JSON.parse(formatP2pInfoJson(info)) as Record<string, unknown>;
+    console.log(JSON.stringify(legacyJson(payload, {
+      code: 'OK',
+      message: info.ok ? `本机 P2P 信息 (peerId=${String(info.peerId).slice(0, 16)}…)` : '还没有本机 peerId',
+      evidence: info.peerId ? [String(info.peerId)] : [],
+      next_action: info.ok ? null : 'rejoin_network',
+    }), null, 2));
+  } else console.log(formatP2pInfoText(info));
   // 一次性信息命令必须自己收尾: 读运行中节点会 import network/p2p (libp2p),
   // 那是常驻模块, 句柄不会自己关 → 不显式退出会"输出完了还挂着"。
   process.exit(info.ok ? 0 : 1);
@@ -798,7 +892,18 @@ async function main() {
 
     // 2026-09-18: M1 任务闭环 (bolloon task "<任务>" --budget 0.05 / --resume <goalId>)
     case 'task':
+      // 2026-09-21 (P3): 已知子命令 → 命令组 (统一信封); 其它一律当 M1 任务正文 (既有体验不动)
+      if (args[0] && TASK_SUBCOMMANDS.has(args[0])) process.exit(await runServiceGroup('task', args));
       await handleTaskCommand(args);
+      break;
+
+    // 2026-09-21 (P3): 命令组 (network/agent/wallet/payment/trade) —— 统一信封 + 薄包装现有服务
+    case 'network':
+    case 'agent':
+    case 'wallet':
+    case 'payment':
+    case 'trade':
+      process.exit(await runServiceGroup(mode, args));
       break;
 
     // 2026-09-13: bolloon setup — 首次运行初始化向导

@@ -2699,3 +2699,15 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 - **单测**: `src/test/network-pulse.test.ts` 新增两组断言(经济计数去重 + 任务 ID 原文不出现在公开投影; IPNS 归一化三种写法/拒绝 http 与垃圾; 私有站清单缺文件→空/去重/上限 5/非法丢弃/无私有字段) → **20/20**; 双节点集成 **36/0**; tsc 0 错(本仓改动面)。
 - **UI 侧 (bolloon-UI, 子智能体并行)**: 脉冲表补三行 + 「智能体私有网站 (IPNS)」栏(展示 `agent_sites[]` + 粘贴框)+ 把 bolloon-network 镜像成站内 `bolloon-network.md` 并建 skills 索引区(leo: "bolloon-UI 的 skills 完全包含这些 skills 的索引")。
 - **未做**: 真实任务链路还**没有**调用 `recordNetworkEvent({type:'task_posted'|'task_completed'|'trade_verified'})` —— 现在计数靠事件, 所以真实跑任务前这些数是 0(不是假 0, 是"还没接"); 接线属于 P6 收尾。
+
+## [2026-09-21] feat(cli) | P3 CLI 适配层: 统一 JSON 信封 (`ok/code/message/data/evidence/next_action`) + `--json/--quiet/--request-id/--timeout` 全局选项; `network|agent|task|wallet|payment|trade` 六组 30 个子命令逐条映射到**现有服务**的薄包装 (未实现的一律如实报 `C_NOT_IMPLEMENTED`, 绝不假装成功; `local-dev` 永不冒充链上; 付款不确定绝不重付)
+
+## [2026-09-21] feat(pulse) | 脉冲响应真实活动: 钱包签名 + 完成的交易 (经济事件接线) + P3 CLI 适配层复核
+
+- **leo 原话**: "网络脉冲里面的需要响应新的智能体 did 和钱包记录，记录签名和完成的交易。这是需要动态加载的。"
+- **接线 (只按事实发, 不猜)**:
+  - `src/agents/x402/transaction-store.ts` —— **唯一写路径** `updateTransaction` 返回前挂 `emitTradePulse(rec, saved)`(fire-and-forget, 统计失败绝不影响交易主路径): 交付 → `task_completed` · **真验真** → `trade_verified` · **只有链上口径 `fully_settled`** → `trade_settled`。**local-dev 上限是 `payment_submitted`, 永远进不了 trade_settled 那一支** —— 不冒充链上。状态未变时不重发(幂等)。
+  - `src/agents/task-contract.ts` —— 每次 `recordSignatureAudit`(钱包签名)同时记一条 `wallet_signed` → 新计数 `totals.signatures`(按 `(来源, 时刻)` 去重, 只计数不给内容)。
+  - 新 agent 的 DID:`joinNetwork` / `setLocalManifest` / manifest 缓存三处**已有**挂点(本轮未改)—— 新 DID 会直接推动 `nodes/agents/active_agents`。
+- **回归 (我改的是交易写路径, 高风险, 全部真跑)**: tsc 0 错 · 单测 `network-pulse` **23/23**(新增挂钩断言: local-dev 不出 `trade_settled`、同状态不重复计数) · Phase 0 **44/0** · local-dev 闭环 **68/0**(失败矩阵 37 项已拒绝) · Phase 4 **50/0** · 脉冲双节点集成 **36/0**。
+- **P3 CLI 适配层(子智能体交付, 我独立复跑确认)**: tsc **0** · 全量 vitest **183 文件 / 2227 测试全绿** · 七条验收(60/0 · 68/0 · 68/0 · 51/0 · 44/0 · 57/0 · 36/0)**无一条从绿变红** · 23/30 子命令已实现, **7 个如实报 `C_NOT_IMPLEMENTED` + 现成替代路径**(`task send`/`inbox`/`accept`/`reject`/`complete`/`cancel`/`network leave`), 绝不假装成功; `task retry` 只出恢复计划(`paid:false`), CLI 任何路径**都不发付款**。
