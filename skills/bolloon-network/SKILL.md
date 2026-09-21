@@ -1,6 +1,6 @@
 ---
 name: bolloon-network
-version: 1.0.0
+version: 1.0.1
 description: Bolloon 智能体网络的唯一对外入口 —— 加入网络 / 声明与发现能力 / 收发任务 / 受控支付 / 查交易与验真。含支付四模式红线、状态含义与故障处理。外部 Agent 只需读这一份。
 status: active
 tier: capability
