@@ -2644,3 +2644,12 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 - **验证**: 单测 `src/test/network-pulse.test.ts` **17/17** · 双节点集成 `scripts/verify-network-pulse.ts` **36 passed / 0 failed / EXIT=0**(A 发布 manifest → B 缓存 → 观察层 2 节点 2 Agent; 原始 DID 与能力名都不落盘; 三态; malformed; 真 HTTP 无凭据 200 + Cache-Control + ETag + **304** + 无私字段; 前端消费契约)· `tsc --noEmit` 0 错。
 - **前端 (bolloon-UI)**: 交子智能体按同一份计划改造 `gateway.html` + `app.js` + `style.css` + `scripts/verify-site.mjs`(脉冲区 · 四态渲染 · 双语 · textContent-only · 轮询与退避 · reduced-motion · 移动端 · 无 console 错误), 完成情况见紧随其后的提交与线上验收记录。
 - **本批未做 (如实)**: 真正的**全球**公共观察入口(需长期在线观察者/Explorer); v1 = 节点本地观察 + `?pulse=` 可指定端点 + 同源静态签名快照(过期就显示 `stale`)。链上强绑定/世界地图/公开 DID 列表/任务内容流/WebSocket 均不做。
+
+## [2026-09-21] feat(site) | bolloon-UI 网关页上线「全球网络脉冲」动态区 (真域名验收 67/0)
+
+- **动因**: leo "需要补充 UI 动态显示全球智能体进度"; 后端 Network Pulse + 公开只读接口完成后, 前端交子智能体实现, 我复核并部署。
+- **改动 (bolloon-UI)**: `gateway.html` 重排为 ① 序厅 ② **新增 #pulse「全球网络脉冲」** ③ 加入方式 ④ 新增 #manifest 段 ⑤ 端点表(加 `/api/public/network/progress` 行) ⑥ 新增 #developer 开发者说明; 脉冲区含 4 个大数值 · capability 分布 · 匿名活动流 · 快照时间 · 4 态标签 · scope 行 · "不是全网精确总量" caveat · `?pulse=` 用法示例 · `role=status aria-live=polite`。`app.js` 加**隔离模块**(无 #pulse 直接 return, 其它页零开销): 取数 ① `?pulse=` ② 同源 `network-pulse.json` ③ `unavailable`; 首屏 loading · `fresh_until` 过期或 `status=stale` → stale · 30s 轮询 · 5s AbortController 超时 · 失败退避 30→60→120s; 全部经 `textContent` 建节点; `applyLang` 派发 `bolloon:lang` 让动态文字跟随中英切换, 相对时间只重写 `<time>` 文本。`style.css` 追加脉冲样式(炭黑+lime · 发丝线 · 圆角≤2px · 无阴影) + `≤640px` 纵向堆叠 + reduce-motion 关动画。
+- **验收**: `scripts/verify-site.mjs` 由 25 项扩到 **67 项**(新增 CDP Fetch 拦截注入夹具 + console/异常捕获): 四态各自可渲染(含 `status=stale` 与 `fresh_until` 过期两条 stale 路径) · 中英切换后标题/状态/scope/活动/相对时间变英文 · 夹具里的 `<b>` 不被解析(文本节点数=1) · `app.js` **无 innerHTML/outerHTML/insertAdjacentHTML/document.write 真实调用**(仅注释提及) · 失败与 404 后页面其它区域照常 · `pollMs=30000/timeoutMs=5000/backoff=[30000,60000,120000]` · reduce-motion 下动画 `none` · 390px 纵向 · console 错误 0。
+- **本机复核 + 部署**: 我自己复跑本地 → **67 passed / 0 failed / EXIT=0**; 干跑确认 `dl/` 非空(18.30 MiB APK 在内)且 `build-site/` 无敏感文件; CF Pages 部署(**12 个文件更新**); **真域名 `node scripts/verify-site.mjs https://bolloon.cn` → 67 passed / 0 failed**。
+- **跨仓提示**: 线上徽章此时读到 npm latest = **0.4.30**(本会话我发的是 0.4.28; 0.4.29/0.4.30 由其它流程发布) —— 徽章跟随 registry 自动变化, 无需为版本号重新部署。
+- **下一步 (leo 新计划)**: 将 Pulse 扩展为完整 Agent 经济闭环 —— `bolloon-task/1` 任务协议 + 收发闭环 + 任务↔交易绑定 + 本地经济 Web UI + 公共经济脉冲; 其中**支付规则按 leo 修正**: 删除"智能体不得接触私钥", 改为"**允许受控的本地 Agent Runtime 自主签名**"(私钥不出本机; 公共网页/P2P/脉冲/公开记录永不可得; 每次签名进交易事件链; local-dev 仍不得冒充链上)。
