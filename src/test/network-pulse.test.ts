@@ -14,6 +14,7 @@ import {
   recordNetworkEvent, computeSnapshot, getNetworkPulse, snapshotStatus,
   canonicalize, assertNoPrivateFields, renderActivityText,
 } from '../agents/network-pulse.js';
+import * as NP from '../agents/network-pulse.js';   // 新增断言用命名空间引用
 
 let HOME = '';
 const now = Date.UTC(2026, 8, 18, 12, 0, 0);
@@ -144,7 +145,7 @@ describe('状态: live / stale / unavailable / 空网络', () => {
     const h = fs.mkdtempSync(path.join(os.tmpdir(), 'pulse-empty-'));
     const snap = await getNetworkPulse({ home: h, now, force: true });
     expect(snap.status).toBe('live');
-    expect(snap.totals).toEqual({ nodes: 0, agents: 0, active_agents: 0, seen_last_24h: 0 });
+    expect(snap.totals).toEqual({ nodes: 0, agents: 0, active_agents: 0, seen_last_24h: 0, tasks: 0, tasks_completed: 0, tasks_verified: 0 });
     expect(snap.capabilities).toEqual([]);
     expect(snap.recent_activity).toEqual([]);
     fs.rmSync(h, { recursive: true, force: true });
@@ -197,3 +198,62 @@ describe('scope 可信边界与签名', () => {
 
 // 公开接口的 HTTP 端到端 (无认证 / ETag / 304 / 无私字段) 在
 // `scripts/verify-network-pulse.ts` 的 [5] 段真跑验证 —— 单测里不再起真服务 (起服务会拖到 90s 且抖动)。
+
+describe('经济计数 (任务数/完成数/已验真) 与智能体私有站 (IPNS)', () => {
+  // 本文件既有风格: 直接 mkdtempSync 建临时 home (没有全局助手)
+  const mkTmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pulse-econ-'));
+  it('任务计数按**不同任务**去重, 同任务重复事件不虚增', async () => {
+    const home = mkTmp();
+    await NP.recordNetworkEvent({ type: 'task_posted', taskId: 'task-A', did: 'did:key:zA', agentId: 'a1' }, home);
+    await NP.recordNetworkEvent({ type: 'task_posted', taskId: 'task-A', did: 'did:key:zA', agentId: 'a1' }, home);
+    await NP.recordNetworkEvent({ type: 'task_accepted', taskId: 'task-A', did: 'did:key:zB', agentId: 'b1' }, home);
+    await NP.recordNetworkEvent({ type: 'task_posted', taskId: 'task-B', did: 'did:key:zA', agentId: 'a1' }, home);
+    let snap: any = await NP.getNetworkPulse({ home, force: true });
+    expect(snap.totals.tasks).toBe(2);              // A 重复两次 + B = 2 个不同任务
+    expect(snap.totals.tasks_completed).toBe(0);
+
+    await NP.recordNetworkEvent({ type: 'task_completed', taskId: 'task-A', did: 'did:key:zB', agentId: 'b1' }, home);
+    await NP.recordNetworkEvent({ type: 'trade_verified', taskId: 'task-A', did: 'did:key:zB', agentId: 'b1' }, home);
+    snap = await NP.getNetworkPulse({ home, force: true });
+    expect(snap.totals.tasks_completed).toBe(1);
+    expect(snap.totals.tasks_verified).toBe(1);
+
+    // 私字段兜底: 任务 ID 原文不许出现在公开投影里
+    const json = JSON.stringify(snap);
+    expect(json).not.toMatch(/task-A|task-B/);
+  });
+
+  it('IPNS 归一化: 三种写法都吃, 其它一律拒绝', () => {
+    const k = 'k51qzi5uqu5dgn4g2d1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0';
+    expect(NP.normalizeIpns(k)).toBe(k);
+    expect(NP.normalizeIpns(`ipns://${k}`)).toBe(k);
+    expect(NP.normalizeIpns(`/ipns/${k}`)).toBe(k);
+    expect(NP.normalizeIpns(`ipns://${k}/index.html`)).toBe(k);
+    expect(NP.normalizeIpns('https://example.com/secret')).toBeNull();
+    expect(NP.normalizeIpns('')).toBeNull();
+    expect(NP.normalizeIpns('not-an-ipns-key')).toBeNull();
+    expect(NP.normalizeIpns(undefined as any)).toBeNull();
+  });
+
+  it('私有站清单: 缺文件→空; 去重; 上限 5; 非法条目被丢弃; 不泄露 DID', async () => {
+    const home = mkTmp();
+    expect(NP.readAgentSites(home)).toEqual([]);
+    const dir = path.join(home, '.bolloon');
+    fs.mkdirSync(dir, { recursive: true });
+    const k = (i: number) => `k51qzi5uqu5dgn4g2d1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t${i}`;
+    fs.writeFileSync(path.join(dir, 'agent-sites.json'), JSON.stringify([
+      { label: 'leo-node', ipns: `ipns://${k(1)}`, added_at: 1760000000000 },
+      { label: 'dup', ipns: k(1) },
+      { label: 'bad', ipns: 'https://evil.example.com' },
+      { label: 'no-ipns' },
+      { label: 'b2', ipns: k(2) }, { label: 'b3', ipns: k(3) },
+      { label: 'b4', ipns: k(4) }, { label: 'b5', ipns: k(5) }, { label: 'b6', ipns: k(6) },
+    ]), 'utf8');
+    const sites = NP.readAgentSites(home);
+    expect(sites).toHaveLength(5);                       // 上限
+    expect(sites[0]).toMatchObject({ label: 'leo-node', ipns: k(1) });
+    expect(new Set(sites.map((x) => x.ipns)).size).toBe(5);  // 去重生效
+    expect(JSON.stringify(sites)).not.toMatch(/did:|peerId|privateKey/);
+    expect(NP.assertNoPrivateFields({ agent_sites: sites })).toEqual([]);
+  });
+});

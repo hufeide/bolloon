@@ -8173,7 +8173,8 @@ app.post('/active-channel', async (req, res) => {
     try {
       const np: any = await import('../agents/network-pulse.js');
       const snap = await np.getNetworkPulse({});
-      const body = JSON.stringify({ ...snap, status: np.snapshotStatus(snap) });
+      // agent_sites = 本节点**显式发布**的公开指针 (IPNS); 没发布就是空数组, 不猜
+      const body = JSON.stringify({ ...snap, status: np.snapshotStatus(snap), agent_sites: np.readAgentSites() });
       const { createHash } = await import('crypto');
       const etag = '"' + createHash('sha256').update(body).digest('hex').slice(0, 32) + '"';
       res.setHeader('Cache-Control', 'public, max-age=15, stale-while-revalidate=15');

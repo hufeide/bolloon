@@ -49,6 +49,8 @@ export const NETWORK_EVENT_TYPES = [
   'capability_announced',
   'peer_connected',
   'delegation_completed',
+  // 经济事件 (P6 扩展; 原五类保持兼容, 老节点发来的事件仍被接受)
+  'task_posted', 'task_accepted', 'task_completed', 'trade_settled', 'trade_verified',
 ] as const;
 export type NetworkEventType = (typeof NETWORK_EVENT_TYPES)[number];
 
@@ -63,6 +65,8 @@ export interface NetworkPulseEvent {
   sourceProof: string;
   /** 可选: Agent 摘要 (sha256(did:agentId) 前 16 位) */
   agentProof?: string;
+  /** 任务摘要 (sha256 前 16 位; 只用于按任务去重, 绝不存 taskId 原文) */
+  taskProof?: string;
   /** 这条事件是否来自一个签名来源 (决定 scope 能否升到 verified) */
   signed?: boolean;
   /** 签名覆盖 (可选): hmac(secret, payload) 前 32 位, 用于本地完整性校验 */
@@ -76,7 +80,16 @@ export interface NetworkPulseSnapshot {
   /** observed = 当前节点观察到的; verified = 多签名来源汇总观察快照 (都不是"全网精确总量") */
   scope: 'observed' | 'verified';
   scope_label: { zh: string; en: string };
-  totals: { nodes: number; agents: number; active_agents: number; seen_last_24h: number };
+  totals: {
+    nodes: number;
+    agents: number;
+    active_agents: number;
+    seen_last_24h: number;
+    /** 观察到发起的任务数 (聚合计数, 无任务内容) */
+    tasks: number;
+    tasks_completed: number;
+    tasks_verified: number;
+  };
   capabilities: { key: string; count: number }[];
   recent_activity: { kind: NetworkEventType; at: number; text: { zh: string; en: string } }[];
   /** 快照签名 (可选, 供公开观察入口校验) */
@@ -156,6 +169,8 @@ export interface RecordEventInput {
   did?: string;
   /** Agent 标识 (只用于算摘要) */
   agentId?: string;
+  /** 任务标识 (只用于算摘要) —— 任务正文/任务 ID 绝不落盘 */
+  taskId?: string;
   at?: number;
   signed?: boolean;
 }
@@ -178,6 +193,7 @@ export async function recordNetworkEvent(input: RecordEventInput, h?: string): P
     const sourceProof = nodeDigest(String(input.did || 'unknown-node'));
     const bucket = bucketOf(at);
     const agentProof = input.agentId ? nodeDigest(`${String(input.did || 'unknown-node')}:${String(input.agentId)}`) : undefined;
+    const taskProof = input.taskId ? nodeDigest(`task:${String(input.taskId)}`) : undefined;
 
     const list = readEvents(h);
     if (type === 'node_joined' && list.some((e) => e.type === 'node_joined' && e.sourceProof === sourceProof && e.bucket === bucket)) {
@@ -190,6 +206,7 @@ export async function recordNetworkEvent(input: RecordEventInput, h?: string): P
       sourceProof,
       ...(input.capability ? { capabilityGroup: capabilityGroup(input.capability) } : {}),
       ...(agentProof ? { agentProof } : {}),
+      ...(taskProof ? { taskProof } : {}),
       ...(input.signed ? { signed: true } : {}),
     };
     ev.integrity = integrityOf(ev);
@@ -227,6 +244,53 @@ export interface SnapshotOptions {
 }
 
 /** 纯函数: 从事件列表算出快照 (便于单测; 不做 IO) */
+/** 本节点显式发布的智能体私有站 (IPNS) —— 公开指针, 由站长自己决定放什么 */
+export interface AgentSite {
+  label: string;
+  ipns: string;
+  added_at: number;
+}
+
+export const MAX_AGENT_SITES = 5;
+
+/** 归一化 IPNS 标识: 只接受裸 k51…/12D3… · ipns://… · /ipns/… —— 其它一律拒绝 (不猜、不放行) */
+export function normalizeIpns(raw: string): string | null {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  let v = s;
+  if (/^ipns:\/\//i.test(v)) v = v.replace(/^ipns:\/\//i, '');
+  else if (/^\/ipns\//i.test(v)) v = v.replace(/^\/ipns\//i, '');
+  else if (/https?:\/\//i.test(v)) return null;          // 不接受 http(s) 直链
+  v = v.split(/[/?#]/)[0].trim();
+  if (/^(k51|12D3)[a-zA-Z0-9]{20,}$/.test(v) || /^[a-zA-Z0-9]{46,}$/.test(v)) return v;
+  return null;
+}
+
+/** 读本节点显式发布的私有站清单 (~/.bolloon/agent-sites.json); 不存在/坏数据 → 空数组 */
+export function readAgentSites(h?: string): AgentSite[] {
+  try {
+    const file = path.join(home(h), '.bolloon', 'agent-sites.json');
+    const raw = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    if (!Array.isArray(raw)) return [];
+    const out: AgentSite[] = [];
+    const seen = new Set<string>();
+    for (const item of raw) {
+      const ipns = normalizeIpns(item?.ipns);
+      if (!ipns || seen.has(ipns)) continue;
+      seen.add(ipns);
+      out.push({
+        label: String(item?.label || 'agent').slice(0, 40),
+        ipns,
+        added_at: Number(item?.added_at) || 0,
+      });
+      if (out.length >= MAX_AGENT_SITES) break;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 export function computeSnapshot(events: NetworkPulseEvent[], opts: { now: number; unavailable?: boolean; signedNodes?: number }): NetworkPulseSnapshot {
   const now = opts.now;
   const fresh_until = now + PULSE_LIMITS.snapshotTtlMs;
@@ -237,7 +301,7 @@ export function computeSnapshot(events: NetworkPulseEvent[], opts: { now: number
       fresh_until,
       scope: 'observed',
       scope_label: { zh: '当前节点观察到', en: 'Observed by this node' },
-      totals: { nodes: 0, agents: 0, active_agents: 0, seen_last_24h: 0 },
+      totals: { nodes: 0, agents: 0, active_agents: 0, seen_last_24h: 0, tasks: 0, tasks_completed: 0, tasks_verified: 0 },
       capabilities: [],
       recent_activity: [],
       notes: ['观察层暂不可用 — 这不是"网络为空"'],
@@ -271,6 +335,18 @@ export function computeSnapshot(events: NetworkPulseEvent[], opts: { now: number
     capabilities.sort((a, b) => b.count - a.count || (a.key < b.key ? -1 : 1));
   }
 
+  // 经济计数: 按**不同任务**去重 (同一任务重复事件不虚增), 且只给聚合数不给内容
+  const tasks = new Set<string>();
+  const tasksCompleted = new Set<string>();
+  const tasksVerified = new Set<string>();
+  for (const e of window) {
+    const t = (e as any).taskProof as string | undefined;
+    if (!t) continue;
+    if (e.type === 'task_posted' || e.type === 'task_accepted') tasks.add(t);
+    if (e.type === 'task_completed' || e.type === 'trade_settled') tasksCompleted.add(t);
+    if (e.type === 'trade_verified') tasksVerified.add(t);
+  }
+
   const recent = [...window]
     .sort((a, b) => b.occurredAt - a.occurredAt)
     .slice(0, PULSE_LIMITS.maxActivity)
@@ -296,6 +372,9 @@ export function computeSnapshot(events: NetworkPulseEvent[], opts: { now: number
       agents: agents.size,
       active_agents: active.size,
       seen_last_24h: agents.size,     // 24h 窗口内的不同 Agent
+      tasks: tasks.size,              // 观察到发起的任务数 (聚合, 无内容)
+      tasks_completed: tasksCompleted.size,
+      tasks_verified: tasksVerified.size,
     },
     capabilities,
     recent_activity: recent,

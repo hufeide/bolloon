@@ -32,6 +32,7 @@ async function main() {
 
   const snap: any = await NP.getNetworkPulse(home ? { home } : {});
   snap.status = NP.snapshotStatus(snap);
+  snap.agent_sites = NP.readAgentSites(home);   // 本节点显式发布的 IPNS 私有站 (可为空数组)
 
   // 静态观察入口的「新鲜窗口」必须等于它的**发布周期**, 否则文件永远显示 stale。
   // 这是"定期发布"语义 (stale-while-revalidate), 不是假装实时 —— 页面同时显示快照时间与相对年龄。

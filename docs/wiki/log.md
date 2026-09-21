@@ -2690,3 +2690,12 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 - **cron**: `bolloon-pulse-refresh` (job `c85aa4b645c5`, `every 2h`, `no_agent`, 脚本 `~/.hermes/scripts/bolloon-pulse-refresh.sh` → 转调 UI 仓脚本, deliver=local 仅存档) —— 每 2 小时刷新一次, 约 360 次部署/月 < 500 限额。
 - **真域名核验 (真 Chrome 读 DOM, 不是夹具)**: 线上 `network-pulse.json` = `status=live scope=verified signed=True totals={nodes:2,agents:3,active_agents:0,seen_last_24h:3}`; 网关页实渲染 `state=live · nodes=2 · agents=3 · active=0 · 24h=3 · scope=网络观察快照 (多签名来源)`。`verify-site.mjs https://bolloon.cn` **104/0**。
 - **未做**: 单测未覆盖 `signSnapshot` 的真 keypair 往返 (值得补) · P3 CLI 适配 · P4 MCP · P5 双节点 12 步 · P6 经济聚合。
+
+## [2026-09-21] feat(pulse) | 公开投影补经济计数 (任务/完成/已验真) + 智能体私有站 (IPNS) 入口
+
+- **leo 要求**: "网络观察快照 (多签名来源),这个表格里面补充一下的显示的是任务数量,完成任务数量,智能体私有网站链接,允许粘贴进去 ipns 私有网站。"
+- **后端 (本仓)**: `src/agents/network-pulse.ts` —— ① 事件白名单**新增经济事件** `task_posted/task_accepted/task_completed/trade_settled/trade_verified`(原五类**保持兼容**, 老节点事件仍被接受); ② 快照 `totals` 扩为 `{nodes,agents,active_agents,seen_last_24h,tasks,tasks_completed,tasks_verified}`(unavailable 分支形状一致, 前端不用分支); ③ 任务计数按**不同任务摘要去重**(新增 `taskProof = sha256(task:<taskId>)`, **绝不落盘 taskId 原文**)—— 同一任务重复事件不虚增; ④ 新增 `AgentSite{label,ipns,added_at}` + `normalizeIpns`(只吃裸 `k51…`/`12D3…`、`ipns://…`、`/ipns/…`, **http(s) 直链一律拒**) + `readAgentSites`(读 `~/.bolloon/agent-sites.json`, 去重、上限 5、坏条目丢弃、缺文件→空数组)。
+- **接线**: 公开只读路由 `GET /api/public/network/progress` 与导出器都挂 `agent_sites`(本节点**显式发布**的公开指针 —— 放什么由站长自己决定)。
+- **单测**: `src/test/network-pulse.test.ts` 新增两组断言(经济计数去重 + 任务 ID 原文不出现在公开投影; IPNS 归一化三种写法/拒绝 http 与垃圾; 私有站清单缺文件→空/去重/上限 5/非法丢弃/无私有字段) → **20/20**; 双节点集成 **36/0**; tsc 0 错(本仓改动面)。
+- **UI 侧 (bolloon-UI, 子智能体并行)**: 脉冲表补三行 + 「智能体私有网站 (IPNS)」栏(展示 `agent_sites[]` + 粘贴框)+ 把 bolloon-network 镜像成站内 `bolloon-network.md` 并建 skills 索引区(leo: "bolloon-UI 的 skills 完全包含这些 skills 的索引")。
+- **未做**: 真实任务链路还**没有**调用 `recordNetworkEvent({type:'task_posted'|'task_completed'|'trade_verified'})` —— 现在计数靠事件, 所以真实跑任务前这些数是 0(不是假 0, 是"还没接"); 接线属于 P6 收尾。
