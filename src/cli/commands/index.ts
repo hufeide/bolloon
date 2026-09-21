@@ -6,6 +6,7 @@
  */
 
 import { parseFlags, runCommand } from '../protocol-envelope.js';
+import type { CliFlags, CommandResult } from '../protocol-envelope.js';
 import { networkCommand } from './network.js';
 import { agentCommand } from './agent.js';
 import { taskCommand } from './tasks.js';
@@ -20,6 +21,16 @@ export type ServiceGroup = (typeof SERVICE_GROUPS)[number];
 export function isServiceGroup(mode: string): mode is ServiceGroup {
   return (SERVICE_GROUPS as readonly string[]).includes(mode);
 }
+
+/** 模式 → 命令函数 (唯一映射表: CLI 与 MCP 适配层都**只**从这里取, 不许各自 if-else) */
+export const GROUP_COMMANDS: Record<ServiceGroup, (f: CliFlags) => Promise<CommandResult>> = {
+  network: networkCommand,
+  agent: agentCommand,
+  task: taskCommand,
+  wallet: walletCommand,
+  payment: paymentCommand,
+  trade: tradeCommand,
+};
 
 export const GROUPS_HELP = `
 命令组 (P3, 统一信封 { ok, code, message, data, evidence, next_action }):

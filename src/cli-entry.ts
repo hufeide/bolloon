@@ -25,6 +25,8 @@ import { runVersionCommand, runUpdateCommand, runDoctorCommand, runRuntimeComman
 import { collectVersionInfo } from './utils/version-info.js';
 // 2026-09-21 (P3): 统一 JSON 信封 + 命令组 (network/agent/task/wallet/payment/trade)
 import { runServiceGroup, GROUPS_HELP } from './cli/commands/index.js';
+// 2026-09-21 (P4): MCP 适配层 (`bolloon mcp serve` = stdio, 只调 P3 服务层)
+import { runMcpCommand } from './cli/commands/mcp.js';
 import { legacyJson, type Code, type NextAction } from './cli/protocol-envelope.js';
 import { createRequire } from 'module';
 const _require = createRequire(import.meta.url);
@@ -82,6 +84,8 @@ ${BOLD}命令:${RESET}
   bolloon engine run <prompt>       委派任务给智能体
   bolloon x402 fetch <url>          x402 自动支付 HTTP 请求
   bolloon x402 balance <address>    查询 x402 钱包余额
+  bolloon mcp serve                 MCP server (stdio) —— 给 MCP 客户端接本机 Agent 能力
+  bolloon mcp tools                 列出 MCP 暴露的 tools/resources (只读清单)
 
 ${GROUPS_HELP}
 
@@ -207,6 +211,9 @@ function parseArgs(): { mode: string; args: string[] } {
       return { mode: 'payment', args: args.slice(1) };
     case 'trade':
       return { mode: 'trade', args: args.slice(1) };
+    // 2026-09-21: P4 MCP 适配层 (`bolloon mcp serve` = stdio MCP server; 只调 P3 服务层)
+    case 'mcp':
+      return { mode: 'mcp', args: args.slice(1) };
     // 2026-09-13: 初始化向导 (用户身份 + 模型供应商 + API key)
     case 'setup':
     case 'init':
@@ -904,6 +911,11 @@ async function main() {
     case 'payment':
     case 'trade':
       process.exit(await runServiceGroup(mode, args));
+      break;
+
+    // 2026-09-21 (P4): MCP 适配层 (`bolloon mcp serve` = stdio MCP server; tools/resources 只调 P3 服务层)
+    case 'mcp':
+      process.exit(await runMcpCommand(args));
       break;
 
     // 2026-09-13: bolloon setup — 首次运行初始化向导

@@ -249,23 +249,31 @@ export function errorEnvelope(err: unknown): Envelope {
 }
 
 /**
+ * 跑一条命令: 统一套 `--timeout` (§ 超时也是结构化失败) 与异常兜底, 但**不打印**。
+ * 2026-09-21 (P4): 从 `runCommand` 抽出 —— MCP 适配层要的是信封本身 (它不能往 stdout 打字,
+ * stdout 是 JSON-RPC 流), 而超时/异常兜底必须与 CLI 是同一条实现 (绝不允许两套语义)。
+ */
+export async function commandResult(flags: CliFlags, fn: (f: CliFlags) => Promise<CommandResult>): Promise<CommandResult> {
+  try {
+    if (flags.timeoutMs) return await raceTimeout(fn(flags), flags.timeoutMs);
+    return await fn(flags);
+  } catch (err) {
+    if (err instanceof CommandTimeout) {
+      return {
+        envelope: failEnvelope('TIMEOUT', `命令超时 (--timeout ${flags.timeoutMs}ms): 已经处理的部分结果没有落盘保证`, { timeoutMs: flags.timeoutMs ?? null }, [], 'retry_same_request'),
+        human: '',
+      };
+    }
+    return { envelope: errorEnvelope(err), human: '' };
+  }
+}
+
+/**
  * 跑一条命令: 统一套 `--timeout` (§ 超时也是结构化失败) 与异常兜底, 然后按 `--json`/`--quiet`/默认输出。
  * 返回进程退出码 (0 = ok, 1 = 失败; 但**判据永远是 `ok`/`code`, 不是退出码**)。
  */
 export async function runCommand(flags: CliFlags, fn: (f: CliFlags) => Promise<CommandResult>): Promise<number> {
-  let result: CommandResult;
-  try {
-    if (flags.timeoutMs) {
-      result = await raceTimeout(fn(flags), flags.timeoutMs);
-    } else {
-      result = await fn(flags);
-    }
-  } catch (err) {
-    if (err instanceof CommandTimeout) {
-      return emit(failEnvelope('TIMEOUT', `命令超时 (--timeout ${flags.timeoutMs}ms): 已经处理的部分结果没有落盘保证`, { timeoutMs: flags.timeoutMs ?? null }, [], 'retry_same_request'), flags);
-    }
-    return emit(errorEnvelope(err), flags);
-  }
+  const result = await commandResult(flags, fn);
   return emit(result.envelope, flags, result.human);
 }
 
