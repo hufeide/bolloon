@@ -2653,3 +2653,13 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 - **本机复核 + 部署**: 我自己复跑本地 → **67 passed / 0 failed / EXIT=0**; 干跑确认 `dl/` 非空(18.30 MiB APK 在内)且 `build-site/` 无敏感文件; CF Pages 部署(**12 个文件更新**); **真域名 `node scripts/verify-site.mjs https://bolloon.cn` → 67 passed / 0 failed**。
 - **跨仓提示**: 线上徽章此时读到 npm latest = **0.4.30**(本会话我发的是 0.4.28; 0.4.29/0.4.30 由其它流程发布) —— 徽章跟随 registry 自动变化, 无需为版本号重新部署。
 - **下一步 (leo 新计划)**: 将 Pulse 扩展为完整 Agent 经济闭环 —— `bolloon-task/1` 任务协议 + 收发闭环 + 任务↔交易绑定 + 本地经济 Web UI + 公共经济脉冲; 其中**支付规则按 leo 修正**: 删除"智能体不得接触私钥", 改为"**允许受控的本地 Agent Runtime 自主签名**"(私钥不出本机; 公共网页/P2P/脉冲/公开记录永不可得; 每次签名进交易事件链; local-dev 仍不得冒充链上)。
+
+## [2026-09-21] feat(task) | Phase 1: bolloon-task/1 任务协议落地 (状态机 + 受控自主签名 + 签名审计, 单测 22/22)
+
+- **动因**: leo 新计划第一步 —— 把任务委派与交易协议统一, 任务有自己的状态机, 支付分层叠加。
+- **CREATE** `src/agents/task-contract.ts`(纯契约层): 14 态任务状态机 + 非法迁移拒绝 · 支付事实与 `settlement-state` **同集合**(断言相等) · `taskRequestId` 确定性幂等 + 收件箱去重 · 请求/报价校验(篡改 taskId/requestId/能力/超预算/网络不符全拒) · `manual|policy|autonomous|agent-authorized` 四模式 · **`authorizeWalletSignature` 唯一放行闸(fail-closed, 9 项检查)** · 信封签名(base64 存)+ `decodeSignature` · `recordSignatureAudit`/`readSignatureAudit` 审计账本 · `toPublicSummary` 匿名公开投影(金额只给区间)。
+- **CREATE** `src/test/task-contract.test.ts` — **22/22 通过**, tsc 0 错。
+- **真 bug (真跑抓到)**: 签名以 base64 字符串存进信封, 但 `@diap/sdk` 的 `KeyManager.verify` 要 **64 字节 Uint8Array**(ed25519) —— 直接拿字符串验会**每个签名都验不过**。修: 加 `decodeSignature`(base64/hex → Uint8Array) + 断言"解出来必须 64 字节"。这是"签名看起来在, 实际永远无效"的典型静默失效。
+- **规则修正落痕 (leo 原话)**: 删除"智能体不得接触私钥", 改为**允许受控的本地 Agent Runtime 自主签名**; 私钥仍只在本机, 公共网页/P2P/Pulse/公开记录永不可得; 每次签名进审计; 越权网络/越额/重复 requestId 一律拒。
+- **CREATE** `docs/wiki/task-protocol.md`(6343 字节) + index 行。
+- **未做**: Phase 2 传输层(收件箱 + P2P 任务帧) · Phase 3 把放行闸接到真实签名路径 + 本地 Web UI 签名记录视图 · Phase 4-6。
