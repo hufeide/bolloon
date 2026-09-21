@@ -2663,3 +2663,10 @@ Goal 进 `awaiting_external` 并写明等谁/等到何时 · 冒名回复不唤�
 - **规则修正落痕 (leo 原话)**: 删除"智能体不得接触私钥", 改为**允许受控的本地 Agent Runtime 自主签名**; 私钥仍只在本机, 公共网页/P2P/Pulse/公开记录永不可得; 每次签名进审计; 越权网络/越额/重复 requestId 一律拒。
 - **CREATE** `docs/wiki/task-protocol.md`(6343 字节) + index 行。
 - **未做**: Phase 2 传输层(收件箱 + P2P 任务帧) · Phase 3 把放行闸接到真实签名路径 + 本地 Web UI 签名记录视图 · Phase 4-6。
+
+## [2026-09-21] docs(wiki) | 编译 leo 的「Agent 接入层」设计计划 (raw 登记 + wiki 页 + 六阶段落地状态)
+
+- **raw 登记**: `manifests/raw_sources.csv` 新增 `leo-access-layer-plan-2026-09-21`(design-doc, 638 行 / 13,057 字节 / sha256 D1DF1D9BE7B83B25…, compiled_into `docs/wiki/agent-access-layer.md`), `raw_manifest_check: OK`。
+- **CREATE** `docs/wiki/agent-access-layer.md`(9,897 字节): CLI=跨 Agent 标准入口 · MCP=CLI 的**薄适配层(不复制业务逻辑)** · Skill=外部 Agent 使用说明; 含 CLI 命令表(网络/注册发现/任务收发/支付/交易)· 统一 JSON 信封 `{ok,code,message,data,evidence,next_action}`(失败也结构化)· MCP 15 tools + 8 resources + 六条禁止(不返私钥/不写完整回执/不绕 policy/不改历史/**不伪造 verified**/无授权不切自主支付)· 自主支付十步链 · 私钥七不加一条(只存本机/不走 P2P/不进 Skill/不进 MCP 返回/不写日志/不写 Pulse/不写任务正文 + 每次签名记 agent_id+task_id+transaction_id+策略结果)· `skills/bolloon-network/SKILL.md` 九节 · 兼容矩阵 · 公开/私有分层 · 六阶段表。
+- **记下一个待 leo 定夺的冲突**: 该计划写 **3 个支付模式**(manual/policy/autonomous), 而 leo 同日支付规则修正 + 我方 Phase 1 落地是 **4 个**(+ `agent-authorized`)。wiki 里按"保留 4 个, `agent-authorized` 视为**显式授权的 autonomous 变体**(无用户显式开启标记一律拒)"记录, 并标为待决 —— **不擅自抹平**。
+- **落地状态如实标注**: P1 契约层已落(`task-contract.ts`, 22/22)· P1 的**错误码表 / JSON 信封 / 版本策略未冻结** · P2 Skill · P3 CLI 适配 · P4 MCP · P5 双节点 12 步 · P6 经济聚合 均未做。
