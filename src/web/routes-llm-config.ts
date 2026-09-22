@@ -117,13 +117,15 @@ export function registerLlmConfigRoutes(app: Express): void {
   // 测试供应商连接
   app.post('/api/llm-test', async (req, res) => {
     try {
-      const { provider } = req.body;
+      const { provider, config } = req.body;
 
       if (!provider) {
         return res.status(400).json({ error: 'provider required' });
       }
 
-      const result = await llmConfigStore.testProvider(provider as ModelProvider);
+      // config: 前端「测试连接」传来的表单值 (baseUrl/apiKey/model)，
+      // 让用户无需先保存即可测试当前填写的地址。
+      const result = await llmConfigStore.testProvider(provider as ModelProvider, config || undefined);
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: err.message });

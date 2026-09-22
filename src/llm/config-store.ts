@@ -8,7 +8,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fsSync from 'fs';
 
-export type ModelProvider = 'openai' | 'anthropic' | 'ollama' | 'openrouter' | 'gemini' | 'minimax' | 'deepseek' | 'kimi' | 'glm' | 'qwen' | 'mimo' | 'grok' | 'local';
+export type ModelProvider = 'openai' | 'anthropic' | 'ollama' | 'openrouter' | 'gemini' | 'minimax' | 'deepseek' | 'kimi' | 'glm' | 'qwen' | 'mimo' | 'grok' | 'local' | 'llamacpp';
 
 export interface ProviderConfig {
   enabled: boolean;
@@ -158,6 +158,16 @@ export const DEFAULT_PROVIDER_CONFIGS: Record<ModelProvider, ProviderConfig> = {
     temperature: 0.7,
     maxTokens: 4096,
     requiresApiKey: true
+  },
+  // llama.cpp: 本地 OpenAI 兼容节点 (llama-server), 默认不需要 API key
+  llamacpp: {
+    enabled: false,
+    apiKey: '',
+    baseUrl: 'http://localhost:8080/v1',
+    model: 'local',
+    temperature: 0.7,
+    maxTokens: 4096,
+    requiresApiKey: false
   }
 };
 
@@ -185,7 +195,8 @@ export const PROVIDER_INFO: Record<ModelProvider, { name: string; description: s
   qwen: { name: 'Qwen (通义千问)', description: '阿里云通义千问系列', requiresApiKey: true, models: ['qwen3-max', 'qwen-max', 'qwen-plus', 'qwen-turbo'] },
   mimo: { name: 'MiMo (小米)', description: '小米 MiMo V2 系列 (openai 兼容)', requiresApiKey: true, models: ['mimo-v2.5-pro', 'mimo-v2-pro', 'mimo-v2-omni', 'mimo-v2-flash', 'mimo-v2.5-pro-ultraspeed'] },
   grok: { name: 'Grok (xAI)', description: 'xAI Grok 系列模型 (openai 兼容)', requiresApiKey: true, models: ['grok-4.5', 'grok-4', 'grok-4-fast'] },
-  local: { name: '本地模型', description: '本地部署的模型服务', requiresApiKey: false }
+  local: { name: '本地模型', description: '本地部署的模型服务', requiresApiKey: false },
+  llamacpp: { name: 'llama.cpp', description: '本地 llama.cpp OpenAI 兼容节点 (llama-server)', requiresApiKey: false, models: ['local'] }
 };
 
 function getDefaultConfig(): LLMConfig {
@@ -224,6 +235,9 @@ function getDefaultConfig(): LLMConfig {
   if (process.env.OLLAMA_BASE_URL) {
     envConfigs.ollama = { ...DEFAULT_PROVIDER_CONFIGS.ollama, enabled: true, baseUrl: process.env.OLLAMA_BASE_URL };
   }
+  if (process.env.LLAMACPP_BASE_URL) {
+    envConfigs.llamacpp = { ...DEFAULT_PROVIDER_CONFIGS.llamacpp, enabled: true, baseUrl: process.env.LLAMACPP_BASE_URL };
+  }
 
   let activeProvider: ModelProvider = 'ollama';
   if (process.env.OPENAI_API_KEY) activeProvider = 'openai';
@@ -237,6 +251,7 @@ function getDefaultConfig(): LLMConfig {
   else if (process.env.QWEN_API_KEY || process.env.DASHSCOPE_API_KEY) activeProvider = 'qwen';
   else if (process.env.MIMO_API_KEY) activeProvider = 'mimo';
   else if (process.env.OLLAMA_BASE_URL) activeProvider = 'ollama';
+  else if (process.env.LLAMACPP_BASE_URL) activeProvider = 'llamacpp';
 
   const providers = { ...DEFAULT_PROVIDER_CONFIGS };
   for (const [provider, config] of Object.entries(envConfigs)) {
@@ -394,15 +409,28 @@ class LLMConfigStore {
     });
   }
 
-  async testProvider(provider: ModelProvider): Promise<{ success: boolean; error?: string; latency?: number }> {
+  async testProvider(
+    provider: ModelProvider,
+    override?: Partial<ProviderConfig>
+  ): Promise<{ success: boolean; error?: string; latency?: number }> {
     await this.initialize();
 
-    const config = this.config?.providers[provider];
+    // 2026-09-22: 支持用表单里刚填的值直接测（不必先保存/启用）。
+    //   override 来自前端测试按钮传来的 baseUrl/apiKey/model —— 测的是用户
+    //   当前填写的地址，而非已落盘配置；此时跳过 enabled 校验。
+    let config = this.config?.providers[provider];
+    if (override && Object.keys(override).length > 0) {
+      const base = config || DEFAULT_PROVIDER_CONFIGS[provider] || {
+        enabled: true, apiKey: '', baseUrl: '', model: '', requiresApiKey: false,
+      };
+      config = { ...base, ...override } as ProviderConfig;
+    }
+
     if (!config) {
       return { success: false, error: 'Provider not configured' };
     }
 
-    if (!config.enabled) {
+    if (!config.enabled && !override) {
       return { success: false, error: 'Provider is not enabled' };
     }
 

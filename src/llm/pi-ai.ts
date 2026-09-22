@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { request, Agent } from 'undici';
 
-export type ModelProvider = 'openai' | 'anthropic' | 'ollama' | 'openrouter' | 'gemini' | 'minimax' | 'deepseek' | 'kimi' | 'glm' | 'qwen' | 'mimo' | 'grok' | 'local';
+export type ModelProvider = 'openai' | 'anthropic' | 'ollama' | 'openrouter' | 'gemini' | 'minimax' | 'deepseek' | 'kimi' | 'glm' | 'qwen' | 'mimo' | 'grok' | 'local' | 'llamacpp';
 
 export interface ModelConfig {
   provider: ModelProvider;
@@ -283,6 +283,7 @@ export class PiAIModel {
       case 'qwen':
       case 'mimo':
       case 'grok':
+      case 'llamacpp':
         return this.callOpenAI(finalMessages, temperature, maxTokens, signal, openaiTools);
       case 'anthropic':
         return this.callAnthropic(finalMessages, temperature, maxTokens, signal);
@@ -317,7 +318,9 @@ export class PiAIModel {
       qwen: process.env.QWEN_API_KEY || process.env.DASHSCOPE_API_KEY || '',
       mimo: process.env.MIMO_API_KEY || '',
       grok: process.env.XAI_API_KEY || '',
-      local: ''
+      local: '',
+      // llama.cpp: 本地 OpenAI 兼容节点, 默认不需要 key
+      llamacpp: process.env.LLAMACPP_API_KEY || ''
     };
     return envVars[this.provider] || '';
   }
@@ -342,7 +345,9 @@ export class PiAIModel {
       // 小米 MiMo: 走 OpenAI 兼容 API, 官方 endpoint
       mimo: process.env.MIMO_BASE_URL || 'https://api.xiaomi.com/v1',
       grok: process.env.XAI_BASE_URL || 'https://api.x.ai/v1',
-      local: 'http://localhost:11434'
+      local: 'http://localhost:11434',
+      // llama.cpp: 默认监听 8080 的 OpenAI 兼容 server (llama-server)
+      llamacpp: process.env.LLAMACPP_BASE_URL || 'http://localhost:8080/v1'
     };
 
     return baseUrls[this.provider];
@@ -367,7 +372,9 @@ export class PiAIModel {
       // 小米 MiMo (openai 兼容) — env override 优先, 默认 mimo-v2.5-pro
       mimo: this.config.model || process.env.MIMO_MODEL || 'mimo-v2.5-pro',
       grok: this.config.model || process.env.XAI_MODEL || 'grok-4.5',
-      local: this.config.model || 'llama4'
+      local: this.config.model || 'llama4',
+      // llama.cpp: model 字段不强制校验, 默认 'local'; 用户应填 --model 加载的 id
+      llamacpp: this.config.model || process.env.LLAMACPP_MODEL || 'local'
     };
     return modelMap[this.provider];
   }
@@ -398,9 +405,9 @@ export class PiAIModel {
 
   private async callOpenAI(messages: ChatMessage[], temperature: number, maxTokens: number, signal?: AbortSignal, tools?: any[]): Promise<ChatResult> {
     const apiKey = this.getApiKey();
-    if (!apiKey) {
-      throw new Error('OPENAI_API_KEY not set');
-    }
+    // 本地 OpenAI 兼容节点 (llama.cpp 等) 通常不校验 key —— 允许 apiKey 为空,
+    // 仅在有 key 时才带 Authorization 头; 真正的鉴权失败由对端 401 反馈.
+    const authHeader = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
 
     const requestBody: any = {
       model: this.mapModel(),
@@ -431,7 +438,7 @@ export class PiAIModel {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
+            ...authHeader,
           },
           body: JSON.stringify(requestBody),
           signal: this.combinedSignal(signal),
@@ -830,7 +837,8 @@ function detectModel(provider: ModelProvider): string {
     // 小米 MiMo 默认走最新旗舰版 (v2.5-Pro); 2026-06 当前公开版
     mimo: 'mimo-v2.5-pro',
     grok: 'grok-4.5',
-    local: 'llama4'
+    local: 'llama4',
+    llamacpp: 'local'
   };
   return defaults[provider];
 }

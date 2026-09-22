@@ -1844,6 +1844,7 @@
     { id: 'groq', label: 'Groq', baseUrl: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
     { id: 'openrouter', label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini' },
     { id: 'ollama', label: '本地 Ollama', baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5:7b' },
+    { id: 'llamacpp', label: 'llama.cpp', baseUrl: 'http://localhost:8080/v1', model: 'local', requiresApiKey: false },
     { id: 'custom', label: '自定义', baseUrl: '', model: '' },
   ];
   const LLM_BY_ID = LLM_PROVIDERS.reduce((m, p) => (m[p.id] = p, m), {});
@@ -1887,10 +1888,15 @@
       $('#api-key').value = saved.apiKey || '';
       const hint = $('#api-hint');
       if (hint) {
-        hint.textContent = id === 'custom'
-          ? '自定义: 填任意 OpenAI 兼容的 baseUrl (/chat/completions)'
-          : (saved.apiKey ? '该供应商已保存过 key（改完记得再点保存）'
-                          : '填官方文档里的 API key; 保存后本机智能体就走它');
+        if (id === 'custom') {
+          hint.textContent = '自定义: 填任意 OpenAI 兼容的 baseUrl (/chat/completions)';
+        } else if (d.requiresApiKey === false) {
+          hint.textContent = '本地/OpenAI 兼容节点, API Key 可留空; Base URL 填 http://<host>:<port>/v1, 模型填加载的模型名';
+        } else if (saved.apiKey) {
+          hint.textContent = '该供应商已保存过 key（改完记得再点保存）';
+        } else {
+          hint.textContent = '填官方文档里的 API key; 保存后本机智能体就走它';
+        }
       }
     };
     const paintChips = () => {
@@ -1910,9 +1916,10 @@
       const p = picked;
       const next = (cfg && cfg.providers) ? cfg : { activeProvider: cfg.activeProvider, providers: {}, updatedAt: Date.now() };
       next.activeProvider = p;
+      const presetRequiresKey = (LLM_BY_ID[p] && LLM_BY_ID[p].requiresApiKey === false) ? false : true;
       next.providers[p] = Object.assign({}, (next.providers[p] || {}), {
         enabled: true, apiKey: $('#api-key').value.trim(), baseUrl: $('#api-baseurl').value.trim(),
-        model: $('#api-model').value.trim(), temperature: 0.7, maxTokens: 4096, requiresApiKey: true,
+        model: $('#api-model').value.trim(), temperature: 0.7, maxTokens: 4096, requiresApiKey: presetRequiresKey,
       });
       try {
         await api.post('/api/llm-config', next);

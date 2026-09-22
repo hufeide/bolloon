@@ -528,10 +528,19 @@
                        '/api/audio-test';
 
       try {
+        // LLM: 测试用「当前表单填写的值」，不必先保存（后端 testProvider 支持 override）
+        const body: any = { provider: currentProvider };
+        if (currentProviderType === 'llm') {
+          body.config = {
+            baseUrl: (document.getElementById('baseUrlInput') as HTMLInputElement)?.value?.trim() || '',
+            apiKey: (document.getElementById('apiKeyInput') as HTMLInputElement)?.value?.trim() || '',
+            model: (document.getElementById('modelInput') as HTMLInputElement)?.value?.trim() || '',
+          };
+        }
         const resp = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ provider: currentProvider })
+          body: JSON.stringify(body)
         });
         const data = await resp.json();
 
