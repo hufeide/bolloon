@@ -1,3 +1,6 @@
+// 启动时自动加载 .env (无论用 tsx 直接跑还是 npm start, 都不依赖外部 -r dotenv/config / --env-file)
+import 'dotenv/config';
+
 import {
   HyperswarmCommunicator,
   createHyperswarmCommunicator,
@@ -905,7 +908,7 @@ async function startCLI(commReady: Promise<HyperswarmCommunicator | null>): Prom
         if (!a || typeof (a as any).promptStream !== 'function') {
           throw new Error('无可用 agent, 跳过调度任务');
         }
-        await (a as any).promptStream?.(`[cron] ${job.name}: ${job.prompt}`, () => {}, undefined, cliActiveChannelId || undefined);
+        await (a as any).promptStream?.(`[cron] ${job.name}: ${job.prompt}`, () => {}, undefined, cliActiveChannelId || undefined, 'cron');
       },
     });
     (globalThis as any).__bolloonMainTask = { enterMainTask, exitMainTask };

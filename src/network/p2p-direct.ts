@@ -85,7 +85,16 @@ export class P2PDirect extends EventEmitter {
 
     this.swarm.on('connection', (conn: any, info: any) => {
       const remotePubKeyHex = b4a.toString(info.publicKey, 'hex');
-      console.log(`[P2PDirect:${this.name}] 新连接: ${remotePubKeyHex.substring(0, 12)}... (inbound=${info.inbound || false}, type=${typeof conn}, hasWrite=${typeof conn?.write})`);
+      const isInbound = !!(info && info.inbound);
+      // 2026-09-22: 入站开关 — BOLLOON_P2P_INBOUND=0 时拒绝所有远端发起的连接.
+      //   目的: 防远端 peer 自动聊天触发本地 LLM; 同时消除 agent.manifest/heartbeat/meta.list 入站噪音.
+      //   本节点主动发起的 outbound 连接不受影响 → 主动发消息 / 收回复照常.
+      if (isInbound && process.env.BOLLOON_P2P_INBOUND === '0') {
+        console.log(`[P2PDirect:${this.name}] 入站已禁用, 拒绝远端连接 ${remotePubKeyHex.substring(0, 12)}...`);
+        try { conn.destroy(); } catch { /* 已销毁 */ }
+        return;
+      }
+      console.log(`[P2PDirect:${this.name}] 新连接: ${remotePubKeyHex.substring(0, 12)}... (inbound=${isInbound}, type=${typeof conn}, hasWrite=${typeof conn?.write})`);
 
       // 双向记录 (inbound + outbound 都能拿到)
       this.conns.set(remotePubKeyHex, conn);

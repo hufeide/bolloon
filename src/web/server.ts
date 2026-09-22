@@ -1568,9 +1568,11 @@ async function getAgentForChannel(
     console.log(`[Agent] 找到现有 session: ${sessionKey}`);
     const currentIdentity = existingSession.getIdentity();
 
-    // 如果当前 identity 没有真实 DID，或者 DID 与频道的 DID 不匹配，需要重建
-    let needsUpdate = !currentIdentity.did.startsWith('did:pi:') ||
-                        (channelDid && !currentIdentity.did.includes(channelId));
+    // 有效 DID (did:key:/did:web:/did:pi: 等) 不应因前缀误判而每轮重建;
+    // 仅当身份缺失/无效, 或与实际频道 DID 不符时才重建 — 否则 head 每轮变化会打爆 KV 前缀缓存
+    const curDid = currentIdentity.did;
+    let needsUpdate = !curDid || curDid === 'undefined' || curDid === 'null' || curDid === '' ||
+                      (channelDid && curDid !== channelDid);
 
     if (!needsUpdate && channelDid && currentIdentity.did !== channelDid) {
       needsUpdate = true;
@@ -2420,6 +2422,9 @@ export async function createWebServer(port: number = 3000, options: CreateWebSer
       try {
         const { AgentHeartbeat } = await import('../social/agent-heartbeat.js');
         const socialOn = process.env.BOLLOON_AGENT_HEARTBEAT_SOCIAL !== '0';
+        // 2026-09-22: 社交决策默认走"轻量模式" — 直接调底层模型, 不加载完整 agent 上下文
+        // (persona/project-state/vector/memory/pivot-loop/trajectory). 设 0 可退回旧版完整 agent 决策.
+        const socialDecideLite = process.env.BOLLOON_SOCIAL_DECIDE_LITE !== '0';
         const myName = await (async () => {
           let n = process.env.BOLLOON_USER_NAME || process.env.USER || 'node';
           try {
@@ -2470,7 +2475,7 @@ export async function createWebServer(port: number = 3000, options: CreateWebSer
               return sendOrQueue(pk, op, payload, v3P2PRef);
             },
           },
-          decide: socialOn ? llmSocialDecide : undefined,
+          decide: socialOn ? (socialDecideLite ? liteSocialDecide : llmSocialDecide) : undefined,
           // 目标: 社交服务于"与网络中的其他智能体建立并维持协作". 配额/效果阈值防止一直社交.
           // owner 可通过 env BOLLOON_AGENT_GOAL 覆盖描述; 也可经 RPC setGoal 运行时注入.
           getGoal: async () => ({
@@ -2628,7 +2633,7 @@ ${goalDesc}
 现在是否要主动联系其中某个智能体? 只输出一个 JSON 对象, 不要任何其他文字:
 {"initiate": true 或 false, "goalAchieved": true 或 false, "targetPeerPublicKey": "对方 pk", "targetChannelId": "对方渠道 id", "message": "你要说的话"}
 若不想发起, 输出 {"initiate": false}。`;
-          const raw = await agent.promptStream(prompt, () => {}, undefined, local.id);
+          const raw = await agent.promptStream(prompt, () => {}, undefined, local.id, 'social');
           const m = raw.match(/\{[\s\S]*\}/);
           if (!m) return { initiate: false };
           const obj = JSON.parse(m[0]);
@@ -2641,6 +2646,80 @@ ${goalDesc}
           };
         } catch (err) {
           console.warn('[heartbeat] 社交决策 LLM 失败 (跳过本次发起):', (err as Error)?.message);
+          return { initiate: false };
+        }
+      }
+
+      /**
+       * liteSocialDecide — 轻量社交决策 (2026-09-22)
+       *
+       * 旧版 llmSocialDecide 复用完整聊天 agent (getAgentForChannel + agent.promptStream),
+       * 每次心跳都会加载 persona 文档、项目状态、事件日志、向量检索、记忆召回, 再跑带质量评分的
+       * pivot loop (最多 30 轮) + 轨迹采集 — 对一个"要不要发条消息"的二选一 JSON 决策严重浪费.
+       *
+       * 本函数直接走底层模型 getMinimax().generateText, 自己拼一份极小的 system prompt,
+       * 完全绕过 agent 上下文管线: 无 persona / 无 project-state / 无 vector / 无 memory /
+       * 无 pivot loop / 无 trajectory. system prompt 从几十 KB 降到 ~200 字, 且无多轮迭代.
+       */
+      async function liteSocialDecide(ctx: { self: any; peers: any[]; goal?: any }): Promise<{
+        initiate: boolean;
+        targetPeerPublicKey?: string;
+        targetChannelId?: string;
+        message?: string;
+        goalAchieved?: boolean;
+        reason?: string;
+      }> {
+        try {
+          const peerLines = ctx.peers
+            .map((p: any) => `- ${p.name || p.publicKey.slice(0, 8)} (pk=${p.publicKey.slice(0, 12)}…): 渠道[${p.channels.map((c: any) => c.name).join(', ') || '无'}]`)
+            .join('\n');
+          const goalDesc = ctx.goal
+            ? `当前目标: ${ctx.goal.description} (已发起 ${ctx.goal.initiationsUsed}/${ctx.goal.maxInitiations}, 有效回复 ${ctx.goal.effectfulReplies}/${ctx.goal.effectThreshold})`
+            : '当前无明确目标';
+
+          const systemPrompt =
+            '你是 P2P 智能体网络中的社交决策器。你的唯一任务: 判断本地智能体是否要主动联系其他在线智能体, 以推进目标。保持极度克制, 不要闲聊, 不要每条心跳都发消息。只输出一个 JSON 对象, 不要任何其他文字。';
+
+          const userPrompt =
+`你是智能体「${ctx.self.name || '本地智能体'}」。你通过 P2P 网络认识以下其他智能体:
+${peerLines}
+
+${goalDesc}
+
+规则:
+1. 社交是为了达成上述目标, 不是闲聊。只在你有真正有价值的信息要分享/询问、且能推进目标时才主动发起。
+2. 不要重复最近已经聊过的话题, 不要每条心跳都发消息, 保持克制。
+3. 如果目标已经通过已有交流达成 (或你认为无需再聊), 输出 {"initiate": false, "goalAchieved": true}。
+4. 如果决定发起, 选一个最合适的目标渠道 (用对方渠道的真实 id)。
+
+现在是否要主动联系其中某个智能体? 只输出一个 JSON 对象, 不要任何其他文字:
+{"initiate": true 或 false, "goalAchieved": true 或 false, "targetPeerPublicKey": "对方 pk", "targetChannelId": "对方渠道 id", "message": "你要说的话"}
+若不想发起, 输出 {"initiate": false}。`;
+
+          const model = getMinimax();
+          // 直接发自定义 messages, 绕过 buildSystemPromptAsync 的基础层拼装 + 完整 agent 管线
+          const r = await (model as any).generateText({
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            temperature: 0.3,
+            maxTokens: 512,
+            source: 'social',
+          });
+          const raw = (r?.reply as string) || '';
+          const m = raw.match(/\{[\s\S]*\}/);
+          if (!m) return { initiate: false };
+          const obj = JSON.parse(m[0]);
+          return {
+            initiate: !!obj.initiate,
+            goalAchieved: !!obj.goalAchieved,
+            targetPeerPublicKey: obj.targetPeerPublicKey,
+            targetChannelId: obj.targetChannelId,
+            message: obj.message,
+          };
+        } catch (err) {
+          console.warn('[heartbeat] 轻量社交决策失败 (跳过本次发起):', (err as Error)?.message);
           return { initiate: false };
         }
       }
@@ -4901,6 +4980,74 @@ fetchState();
         }
         contextHint += '回复时应自然体现这个角色 (不要硬搬原文, 像这个角色说话即可).\n\n';
       }
+
+      // 2026-08-03 (Context OS P5): 资产层目录注入 — LLM 知道有 12+3 层资产,
+      //   需要细节时用 read_context_assets 按层路由读取, 不全仓扫描 (Context OS §4).
+      try {
+        const { readContextAssets, formatLayerListing } = await import('../bootstrap/context-os.js');
+        const listings = await readContextAssets();
+        const total = listings.reduce((s, l) => s + l.fileCount, 0);
+        if (total > 0) {
+          contextHint += `[系统上下文] 资产层 (Context OS 12+3 层, ${total} 篇资产 — 任务需要细节时用 read_context_assets 按层读取, 不要假装知道没读过的内容):\n${formatLayerListing(listings)}`;
+        }
+      } catch (ctxErr) {
+        // 静默失败
+      }
+      const linkedIds = channelForJudgment?.linkedDocumentIds;
+      if (Array.isArray(linkedIds) && linkedIds.length > 0) {
+        try {
+          const { documentStore } = await import('../documents/store.js');
+          contextHint += `[系统上下文] 此 channel 关联了 ${linkedIds.length} 篇文档 (已自动加载内容, 你应基于它们回答):\n`;
+          let loaded = 0;
+          for (const docId of linkedIds.slice(0, 10)) {
+            const doc = await documentStore.readDocument(docId).catch(() => null);
+            if (!doc) continue;
+            const name = doc.metadata?.fileName || docId;
+            const content = (doc.content || '').slice(0, 1500);  // 单篇 1.5KB 上限, 总 prompt 防爆
+            contextHint += `\n--- 文档: ${name} ---\n${content}\n--- 文档结束 ---\n`;
+            loaded++;
+          }
+          if (loaded === 0) {
+            contextHint += `(但加载失败, 文档可能已被删除)\n\n`;
+          } else {
+            contextHint += '\n';
+          }
+        } catch (err) {
+          console.warn('[v3-persona] 加载关联文档失败 (非致命):', (err as Error).message);
+        }
+      }
+
+      // v3 新增: 注入"可用渠道"目录, 让 LLM 知道可以 @-mention 哪些 channel
+      // - 本地 channels (除了自己)
+      // - 远端 channels (remoteChannelCache 缓存的)
+      const localChannels = (await loadChannels()).filter(c => c.id !== channelId);
+      const remoteChannels: any[] = [];
+      for (const [peerPk, list] of remoteChannelCache.entries()) {
+        for (const ch of list) {
+          remoteChannels.push({ ...ch, _ownerPublicKey: peerPk });
+        }
+      }
+      if (localChannels.length > 0 || remoteChannels.length > 0) {
+        contextHint += '[系统上下文] 可用渠道 (你可以用 @渠道名 消息内容 给它们发消息):\n';
+        for (const c of localChannels) {
+          contextHint += `  - [本地] @${c.name} (id=${c.id})\n`;
+        }
+        for (const c of remoteChannels) {
+          contextHint += `  - [远端, owner=${(c._ownerPublicKey || '').substring(0,8)}…] @${c.name} (id=${c.id})\n`;
+        }
+        contextHint += '语法: 当你想给其他渠道发消息, 在回复中写 "@渠道名 我要说的话" 即可. 消息会持久化到目标 channel 的 session, 你之后能看到"自己"在那里说的话.\n';
+        // 2026-06-10 强化: 当用户消息里出现 @渠道名, 默认是请你代为转发, 务必在回复里包含对应的 @ 转发
+        if (remoteChannels.length > 0) {
+          contextHint += '重要: 上面列表里 [远端] 标记的 channel 在另一台机器上, 你可以像 @本地 channel 一样 @ 它们 — 我会通过 P2P 自动把消息送达对方智能体, 对方智能体的回复也会同步回来.\n';
+          contextHint += '当用户在消息里 @ 了某个 (本地或远端) channel, 默认意图是希望你代为转发 — 你应该在回复中写出对应的 "@渠道名 转发内容", 否则用户的请求不会被路由出去.\n\n';
+        } else {
+          contextHint += '\n';
+        }
+      }
+
+      if (contextHint) contextHint += '\n';
+
+      // === 变化段: 每轮变的记忆/计划置于所有固定段之后, 以稳定 KV 缓存前缀 ===
       // 2026-08-02: memory 回读 — 把本 channel 的历史记忆摘要注入 contextHint.
       //   memory-compressor 每次 /message 后把增量摘要 append 到
       //   ~/.bolloon/memory/<agentId>/sessions/<safe-channel>__<safe-session>.summary.md,
@@ -4973,71 +5120,6 @@ fetchState();
       } catch (planErr) {
         // 静默失败
       }
-      // 2026-08-03 (Context OS P5): 资产层目录注入 — LLM 知道有 12+3 层资产,
-      //   需要细节时用 read_context_assets 按层路由读取, 不全仓扫描 (Context OS §4).
-      try {
-        const { readContextAssets, formatLayerListing } = await import('../bootstrap/context-os.js');
-        const listings = await readContextAssets();
-        const total = listings.reduce((s, l) => s + l.fileCount, 0);
-        if (total > 0) {
-          contextHint += `[系统上下文] 资产层 (Context OS 12+3 层, ${total} 篇资产 — 任务需要细节时用 read_context_assets 按层读取, 不要假装知道没读过的内容):\n${formatLayerListing(listings)}`;
-        }
-      } catch (ctxErr) {
-        // 静默失败
-      }
-      const linkedIds = channelForJudgment?.linkedDocumentIds;
-      if (Array.isArray(linkedIds) && linkedIds.length > 0) {
-        try {
-          const { documentStore } = await import('../documents/store.js');
-          contextHint += `[系统上下文] 此 channel 关联了 ${linkedIds.length} 篇文档 (已自动加载内容, 你应基于它们回答):\n`;
-          let loaded = 0;
-          for (const docId of linkedIds.slice(0, 10)) {
-            const doc = await documentStore.readDocument(docId).catch(() => null);
-            if (!doc) continue;
-            const name = doc.metadata?.fileName || docId;
-            const content = (doc.content || '').slice(0, 1500);  // 单篇 1.5KB 上限, 总 prompt 防爆
-            contextHint += `\n--- 文档: ${name} ---\n${content}\n--- 文档结束 ---\n`;
-            loaded++;
-          }
-          if (loaded === 0) {
-            contextHint += `(但加载失败, 文档可能已被删除)\n\n`;
-          } else {
-            contextHint += '\n';
-          }
-        } catch (err) {
-          console.warn('[v3-persona] 加载关联文档失败 (非致命):', (err as Error).message);
-        }
-      }
-
-      // v3 新增: 注入"可用渠道"目录, 让 LLM 知道可以 @-mention 哪些 channel
-      // - 本地 channels (除了自己)
-      // - 远端 channels (remoteChannelCache 缓存的)
-      const localChannels = (await loadChannels()).filter(c => c.id !== channelId);
-      const remoteChannels: any[] = [];
-      for (const [peerPk, list] of remoteChannelCache.entries()) {
-        for (const ch of list) {
-          remoteChannels.push({ ...ch, _ownerPublicKey: peerPk });
-        }
-      }
-      if (localChannels.length > 0 || remoteChannels.length > 0) {
-        contextHint += '[系统上下文] 可用渠道 (你可以用 @渠道名 消息内容 给它们发消息):\n';
-        for (const c of localChannels) {
-          contextHint += `  - [本地] @${c.name} (id=${c.id})\n`;
-        }
-        for (const c of remoteChannels) {
-          contextHint += `  - [远端, owner=${(c._ownerPublicKey || '').substring(0,8)}…] @${c.name} (id=${c.id})\n`;
-        }
-        contextHint += '语法: 当你想给其他渠道发消息, 在回复中写 "@渠道名 我要说的话" 即可. 消息会持久化到目标 channel 的 session, 你之后能看到"自己"在那里说的话.\n';
-        // 2026-06-10 强化: 当用户消息里出现 @渠道名, 默认是请你代为转发, 务必在回复里包含对应的 @ 转发
-        if (remoteChannels.length > 0) {
-          contextHint += '重要: 上面列表里 [远端] 标记的 channel 在另一台机器上, 你可以像 @本地 channel 一样 @ 它们 — 我会通过 P2P 自动把消息送达对方智能体, 对方智能体的回复也会同步回来.\n';
-          contextHint += '当用户在消息里 @ 了某个 (本地或远端) channel, 默认意图是希望你代为转发 — 你应该在回复中写出对应的 "@渠道名 转发内容", 否则用户的请求不会被路由出去.\n\n';
-        } else {
-          contextHint += '\n';
-        }
-      }
-
-      if (contextHint) contextHint += '\n';
 
       // 2026-07-06: 全局 contextHint 硬裁 — MiniMax-M3 context window 8K token ≈ 32K 字符
       //   如果 contextHint 超过 14K 字符 (留 ~18K 给 userText + LLM 输出 + system), 主动截断
@@ -5441,8 +5523,11 @@ fetchState();
     runState.running = true;
     runState.abortController = new AbortController();
 
-    const currentSessionId = (await loadChannels()).find(c => c.id === channelId)?.currentSessionId || 'default';
-    const realChannelDid = reqChannelDid || (await loadChannels()).find(c => c.id === channelId)?.did || '';
+    const channelInfo = (await loadChannels()).find(c => c.id === channelId);
+    const currentSessionId = channelInfo?.currentSessionId || 'default';
+    const realChannelDid = reqChannelDid || channelInfo?.did || '';
+    const realChannelName = channelInfo?.name || '';
+    const realChannelDidDoc = channelInfo?.didDocRef;
 
     const parsedAttachments: Array<{ attachmentId: string; filename?: string; mimeType?: string; size?: number }> =
       Array.isArray(attachments) ? attachments : [];
@@ -5463,7 +5548,7 @@ fetchState();
       broadcast({ type: 'user', content: text }, channelId);
 
       // 2) 取 agent + session
-      agent = await getAgentForChannel(channelId, currentSessionId).catch(() => null);
+      agent = await getAgentForChannel(channelId, realChannelDid, realChannelName, realChannelDidDoc).catch(() => null);
       if (!agent) {
         throw new Error(`No agent for channel=${channelId}`);
       }
@@ -8501,6 +8586,7 @@ app.post('/active-channel', async (req, res) => {
   // 健康检查错误数 ≥ 2 -> 触发自改信号
   // 2026-06-16: 自迭代默认关 (用户模式), 仅 BOLLOON_DEV_MODE=1 或 selfImprove=true 启动项才装 callback
   if (healthMonitor) {
+    console.log(`[24h] LLM health probe: ${process.env.BOLLOON_HEALTH_LLM_CHECK !== '0' ? 'enabled (calls model every 60s)' : 'disabled (lightweight, no model call)'}`);
     if (selfImproveEnabled) {
       healthMonitor.startPeriodicCheck(60000, (status: any) => {
         const errorCount = Object.values(status.checks as Record<string, { status: string }>)

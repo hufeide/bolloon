@@ -1704,6 +1704,109 @@ function handleSelfImproveResult(data) {
 
 
 // ============================================================
+// 2026-09-22: 人机问答通道 (clarify) 前端回答控件
+//   后端 clarify 工具 ask() 会 await 人类回答 (默认 600s 超时). 之前前端从没渲染回答入口 →
+//   pivot 循环卡在 await → 浏览器一直转圈、看不到返回. 这里渲染问题卡片 + 输入框/选项按钮.
+//   回答经 POST /api/questions/answer 送回, 后端 userQuestions.answer() 唤醒 await, agent 继续.
+// ============================================================
+let activeAgentQuestionCard: HTMLElement | null = null;
+interface AgentQuestionUI { id: string; card: HTMLElement; body: HTMLElement; qText: string; input: HTMLInputElement | null; submit: HTMLButtonElement; choicesWrap: HTMLElement | null; }
+let currentAgentQuestion: AgentQuestionUI | null = null;
+
+// 共享的回答提交逻辑 — 卡片内输入框 / 选项按钮 / 普通聊天输入框 三者复用.
+// 返回 true 表示提交成功 (后端已唤醒 await), false 表示失败或被忽略.
+async function answerAgentQuestion(raw: string): Promise<boolean> {
+  if (!currentAgentQuestion) return false;
+  const t = String(raw || '').trim();
+  if (!t) return false;
+  const q = currentAgentQuestion;
+  q.submit.disabled = true;
+  q.submit.textContent = '⏳ 提交中…';
+  try {
+    const r = await fetch('/api/questions/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: q.id, text: t }),
+    });
+    const j = await r.json().catch(() => ({} as any));
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    q.body.textContent = '✅ 已回答：' + t;
+    if (q.input && q.input.parentNode) q.input.remove();
+    if (q.submit.parentNode) q.submit.remove();
+    if (q.choicesWrap && q.choicesWrap.parentNode) q.choicesWrap.remove();
+    currentAgentQuestion = null;
+    activeAgentQuestionCard = null;
+    return true;
+  } catch (err) {
+    q.submit.disabled = false;
+    q.submit.textContent = '发送回答';
+    q.body.textContent = q.qText + '\n[提交失败] ' + (err && (err as any).message ? (err as any).message : err);
+    return false;
+  }
+}
+
+function handleAgentQuestion(data) {
+  const q = data && data.question;
+  if (!q || !q.id) return;
+  const container = getMessagesContainerForCurrent();
+  if (!container) return;
+  if (activeAgentQuestionCard) activeAgentQuestionCard.remove(); // 同时只显示一个待回答问题
+  const card = document.createElement('div');
+  card.className = 'agent-question-card';
+  card.dataset.qid = q.id;
+  card.style.cssText = 'margin:8px 12px;padding:10px 12px;border:1px solid var(--accent);border-left:3px solid var(--accent);border-radius:6px;background:var(--bg-hover);color:var(--text);font-size:13px;line-height:1.5;';
+  const title = document.createElement('div');
+  title.style.cssText = 'font-weight:600;color:var(--accent);margin-bottom:4px;';
+  title.textContent = '❓ 智能体提问（需你回答才能继续）';
+  card.appendChild(title);
+  const body = document.createElement('div');
+  body.style.cssText = 'white-space:pre-wrap;word-break:break-word;margin-bottom:8px;';
+  body.textContent = q.question || '(空问题)';
+  card.appendChild(body);
+  let choicesWrap: HTMLElement | null = null;
+  const choices = Array.isArray(q.choices) ? q.choices : [];
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = '输入你的回答…(也可直接在下方聊天框输入)';
+  input.style.cssText = 'width:100%;box-sizing:border-box;padding:6px 8px;margin-top:4px;background:var(--bg-main);color:var(--text);border:1px solid var(--accent);border-radius:4px;font-size:13px;';
+  const submit = document.createElement('button');
+  submit.textContent = '发送回答';
+  submit.style.cssText = 'margin-top:6px;padding:5px 12px;background:var(--accent);color:var(--bg-main);border:none;border-radius:4px;cursor:pointer;font-size:12px;';
+  submit.onclick = () => answerAgentQuestion(input.value);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); answerAgentQuestion(input.value); } });
+  if (choices.length > 0) {
+    choicesWrap = document.createElement('div');
+    choicesWrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;';
+    choices.forEach((c) => {
+      const b = document.createElement('button');
+      b.textContent = c;
+      b.style.cssText = 'padding:4px 10px;background:var(--bg-main);color:var(--text);border:1px solid var(--accent);border-radius:14px;cursor:pointer;font-size:12px;';
+      b.onclick = () => answerAgentQuestion(c);
+      choicesWrap.appendChild(b);
+    });
+    card.appendChild(choicesWrap);
+  }
+  card.appendChild(input);
+  card.appendChild(submit);
+  container.appendChild(card);
+  activeAgentQuestionCard = card;
+  currentAgentQuestion = { id: q.id, card, body, qText: q.question || '(空问题)', input, submit, choicesWrap };
+  card.scrollIntoView({ block: 'end', behavior: 'smooth' });
+  input.focus();
+}
+
+function handleAgentQuestionAnswered(data) {
+  // 人类已在别处 (CLI / 手机 / 另一标签) 回答 → 清理问题卡片
+  if (!activeAgentQuestionCard) return;
+  const qid = activeAgentQuestionCard.dataset.qid;
+  if (!data || !data.id || data.id === qid) {
+    activeAgentQuestionCard.remove();
+    activeAgentQuestionCard = null;
+  }
+}
+
+
+// ============================================================
 // 2026-06-15: 发送按钮 ↔ 终止按钮 状态机
 //   idle: sendMessage 入口, 飞机图标
 //   abort: 流式期间, ▢ 图标 + 红边框, click 调 abortCurrentRun
@@ -1954,23 +2057,14 @@ function connect(channelId) {
         }
         sendRokidText(data.content || '', { source: 'ai' });
       } else if (data.type === 'reply-preview') {
-        // 2026-07-06: pivot loop 每 iter 推 preview — 用户要求"后端只要在跑就要看到内容, 不是 '任务处理超时'"
-        //   2026-07-15 修 Bug 5: 之前每次 preview 新建气泡, pivot 多 iter → 屏幕上叠 3-5 个 R1/R2/R3 气泡, 看起来像"重复"
-        //   Bug 5.1: addMessage 是 void 返回, 之前 currentPreviewBubble = addMessage(...) 实际是 undefined,
-        //     导致 .preview class 永远没贴上 → querySelectorAll('.message-ai.preview') 找不到 → 重叠依然存在.
-        //   修法: 先清所有 .message-ai.preview (按容器最新那条来加 .preview), 再以 container.lastElementChild 拿到刚加的 div 加 .preview.
+        // 2026-09-22: 真流式下, 增量 token 已在 .message-streaming live 气泡里逐字累加.
+        //   这里把 live 气泡内容刷新成"当前轮完整回复", 避免跨轮累加错乱; 不再另建 .preview 气泡
+        //   (否则会跟流式气泡并存成双气泡). 无流式气泡时退回普通 addMessage.
         const previewContent = data.content || '';
-        // 清掉所有老 preview — 上一次 reply-preview 加的也带 .preview
-        const oldPreviews = container.querySelectorAll('.message-ai.preview');
-        oldPreviews.forEach(el => el.remove());
-        // 加新 preview
-        addMessage(previewContent, 'ai', false, container, []);
-        // 拿到刚加的那一条 — 它是 container 的最后一个 .message-ai
-        const newPreview = container.querySelector('.message-ai:not(.preview):last-of-type')
-          || container.lastElementChild;
-        if (newPreview) {
-          newPreview.classList.add('preview');
-          currentPreviewBubble = newPreview as HTMLElement;
+        if (MR_hasStreamingText()) {
+          MR_replaceStreamingText(previewContent);
+        } else {
+          addMessage(previewContent, 'ai', false, container, []);
         }
       } else if (data.type === 'stream') {
         // 2026-07-06: 简化流式处理 — 完全不显示 token/thinking 中间产物
@@ -2049,6 +2143,11 @@ function connect(channelId) {
       } else if (data.type === 'self_improve_result') {
         // 2026-06-15: 即时 render + 失败 retry 按钮 (修 Bug 2/3)
         handleSelfImproveResult(data);
+      } else if (data.type === 'agent-question') {
+        // 2026-09-22: 渲染人机问答回答控件, 否则 clarify 工具 await 卡死 (浏览器一直转圈)
+        handleAgentQuestion(data);
+      } else if (data.type === 'agent-question-answered') {
+        handleAgentQuestionAnswered(data);
       }
     } catch (parseErr) {
       console.error('[SSE] 解析错误', parseErr);
@@ -2059,6 +2158,13 @@ function connect(channelId) {
 async function sendMessage() {
   const text = input.value.trim();
   if (!text) return;
+  // 2026-09-22: 有待回答问题时, 普通聊天输入框直接当作回答送回 (而非开启新的聊天轮)
+  //   这样 clarify 卡死转圈的问题, 用户不必去卡片里找输入框, 直接在下方聊天框输入即可.
+  if (currentAgentQuestion) {
+    const ok = await answerAgentQuestion(text);
+    if (ok) input.value = ''; // 成功: 清空; 失败: 保留输入, 让用户看清卡片上的错误并重试
+    return;
+  }
   // 2026-07-06: 第一行就切 abort 模式 — 用户期望按钮按完"立刻"变 abort icon
   //   之前延迟是因为后面 addMessage + scrollTop 后才 setSendMode, 感官上有滞后
   setSendMode('abort');

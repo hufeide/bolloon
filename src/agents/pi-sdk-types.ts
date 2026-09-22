@@ -146,7 +146,7 @@ export interface HeartbeatConfig {
 
 export interface AgentSession {
   prompt(input: string, options?: { onStream?: StreamCallback; signal?: AbortSignal; channelId?: string }): Promise<string>;
-  promptStream(input: string, onStream: StreamCallback, signal?: AbortSignal, channelId?: string): Promise<string>;
+  promptStream(input: string, onStream: StreamCallback, signal?: AbortSignal, channelId?: string, source?: string): Promise<string>;
   /** 2026-09-16: 标记运行表面 (Durable Run 记录里的 surface 字段) — 可选, 老实现不关心 */
   setRunSurface?(surface: 'cli' | 'web' | 'mobile' | 'cron' | 'delegate'): void;
   promptWithPivotLoop(input: string, config?: PivotLoopConfig, channelId?: string): Promise<LoopResult>;

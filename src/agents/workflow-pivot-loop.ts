@@ -14,6 +14,7 @@
  */
 
 import type { Tool, ToolResult, StreamCallback, StreamEvent } from './pi-sdk.js';
+import type { ChatMessage } from '../llm/pi-ai.js';
 import { detectRepeatingCalls, toolCallArgsHash } from './loop-review.js';
 
 /**
@@ -71,6 +72,8 @@ export interface PivotLoopConfig {
   maxConsecutiveNoProgress?: number;
   maxTokenBudget?: number;
   complexity?: TaskComplexity;
+  /** 调用来源标记, 透传到 chat 的 source 参数 (health/social/main-agent/cron). 默认 'main-agent' */
+  source?: string;
 }
 
 export interface PivotLoopState {
@@ -98,6 +101,11 @@ export interface LoopResult {
   qualityScore: number;
   exitReason: ExitReason;
   state: PivotLoopState;
+  /**
+   * 2026-09-22 (KV 修复 A): execute 结束后的完整消息历史 (含被 pi-ai.chat 写回 D1 的当前 user).
+   *   上层 (PiAgentSession) 用它直接替换 messageHistory, 保证下一轮从同一前缀重建 → KV 复用.
+   */
+  finalHistory?: ChatMessage[];
 }
 
 export type ExitReason =
@@ -108,6 +116,7 @@ export type ExitReason =
   | 'token_budget_exceeded'
   | 'min_iterations_not_met'
   | 'final_gen_marker'
+  | 'repeating_tool_loop_stopped'
   | 'error';
 
 export type TaskComplexity = 'simple' | 'moderate' | 'complex';
@@ -219,7 +228,8 @@ export class WorkflowPivotLoop {
       qualityThreshold: config.qualityThreshold || 0.7,
       maxConsecutiveNoProgress: config.maxConsecutiveNoProgress || 8,
       maxTokenBudget: config.maxTokenBudget || 50000,
-      complexity: config.complexity || 'moderate'
+      complexity: config.complexity || 'moderate',
+      source: config.source || 'main-agent'
     };
     
     this.config = defaults;
@@ -329,6 +339,16 @@ export class WorkflowPivotLoop {
      *   异步: PiAgent 触发 compactPipeline, 这里 await 等折叠完再继续.
      */
     onApproachingTokenBudget?: () => Promise<void>,
+    /**
+     * 2026-09-22 (KV 修复 A): 上层注入的持久化历史 (结构化消息, 不含当前轮 user).
+     *   history 走 messages 数组 (仅追加), 不进 system prompt. 上层必须传稳定 persona 作 systemPrompt.
+     */
+    historyMessages?: ChatMessage[],
+    /**
+     * 2026-09-22 (KV 修复 A): 当前轮动态附加文本 (intent/bootstrap/judgment/context hints 等),
+     *   冻结进当前 user 消息, 下一轮随 history 原样回带 → 前缀一致.
+     */
+    dynamicTail?: string,
   ): Promise<LoopResult> {
     this.streamCallback = streamCallback;
     this.state = this.createInitialState();
@@ -339,7 +359,16 @@ export class WorkflowPivotLoop {
     // 重置 compact 状态 — 这次 execute 第一次 iter 仍用全量
     this.compactedThisRun = false;
     this.vlog(`[pivot] execute: input chars=${input.length}, systemPrompt chars=${systemPrompt.length}, signal=${!!signal}, continuationHeader chars=${this.continuationSystemHeader?.length ?? 0}`);
-    this.messageHistory = [{ role: 'user', content: input }];
+    // 2026-09-22 (KV 修复 A): 以结构化 history (仅追加) 重建 messageHistory, 不再扁平化进 system.
+    //   dynamicTail 冻结进当前 user, 下一轮随 history 原样回带 → 前缀逐字节一致.
+    this.messageHistory = [
+      ...(historyMessages ?? []).map((m) => ({ role: m.role, content: m.content })),
+      { role: 'user', content: input },
+    ];
+    if (dynamicTail && dynamicTail.trim()) {
+      const cur = this.messageHistory[this.messageHistory.length - 1];
+      if (cur && cur.role === 'user') cur.content = `${dynamicTail}\n\n${cur.content}`;
+    }
     
     // Analyze task complexity and adapt config
     const taskProfile = analyzeTaskComplexity(input);
@@ -386,26 +415,22 @@ export class WorkflowPivotLoop {
         tool: 'loop'
       });
 
-      // Build context for LLM
-      let context = this.buildContext();
-      // 2026-08-11: 注入工具续跑提示 (Hermes continuation prompt 模式) — 结构性问题显式告知,
-      //   用完即清 (只对下一轮 LLM 可见一次)
+      // 2026-09-22 (KV 修复 A): history 走 messages 数组 (仅追加), 不再扁平化塞进 system prompt.
+      //   system 只保留稳定 persona (headerForThisIter); history 已在 execute 入口注入 this.messageHistory.
+      //   D1 (git/runtime/p2p) 由 pi-ai.chat 注入到最后一条 user 并写回 this.messageHistory,
+      //   下一轮从 this.messageHistory 重建 → 前缀逐字节一致 → KV 跨轮复用.
+      // 工具续跑提示注入到最后一条 user (当前轮), 用完即清.
       if (this.continuationHints.length > 0) {
-        context += `\n\n【工具续跑提示】\n${this.continuationHints.map((h) => `- ${h}`).join('\n')}\n请基于以上信息继续推进任务, 不要重复已失败的调用。`;
+        const lastMsg = this.messageHistory[this.messageHistory.length - 1];
+        if (lastMsg && lastMsg.role === 'user') {
+          lastMsg.content += `\n\n【工具续跑提示】\n${this.continuationHints.map((h) => `- ${h}`).join('\n')}\n请基于以上信息继续推进任务, 不要重复已失败的调用。`;
+        }
         this.continuationHints = [];
       }
-      const fullPrompt = `${systemPrompt}\n\n${context}`;
-      // 2026-07-06: iter ≥ 2 改用 continuationHeader — messageHistory 已经载过全 persona/tools,
-      //   重装 11K + 25 layer 是浪费, 同时让 pi-ai.chat 走 < 2000 分支 (不重新装 system prompt).
-      //   compact 触发 → 这次 iter 之后下一 iter 恢复用 full.
-      let headerForThisIter = systemPrompt;
-      let usingContinuation = false;
-      const shouldUseContinuation = this.state.iteration >= 2 && !this.compactedThisRun && this.continuationSystemHeader;
-      if (shouldUseContinuation) {
-        headerForThisIter = this.continuationSystemHeader!;
-        usingContinuation = true;
-      }
-      this.vlog(`[pivot] iter=${this.state.iteration} ctx=${context.length} fullPrompt=${fullPrompt.length} budget=${effectiveConfig.maxTokenBudget} iterHeader=${usingContinuation ? 'short' : 'full'} (${headerForThisIter.length}B)`);
+      // 始终用完整 systemPrompt 作前缀 — 让 llama.cpp 的 prefix-cache (LCP 复用) 跨轮复用已算好的 persona KV.
+      const headerForThisIter = systemPrompt;
+      const ctxChars = this.messageHistory.reduce((a, m) => a + (m.content?.length || 0), 0);
+      this.vlog(`[pivot] iter=${this.state.iteration} msgHistory=${this.messageHistory.length} ctxChars=${ctxChars} budget=${effectiveConfig.maxTokenBudget} header=full(${headerForThisIter.length}B)`);
 
       try {
         // Call LLM
@@ -413,18 +438,23 @@ export class WorkflowPivotLoop {
         // 2026-08-02: 传原生 OpenAI tools — deepseek 返回结构化 tool_calls,
         //   UI 才能显示真实的工具执行 step (之前靠文本 JSON 猜格式, LLM 编造 result)
         const openAITools = this.buildOpenAITools();
-        const llmResponse = await llm.chat(context, headerForThisIter, signal, openAITools);
+        // 2026-09-22: onToken 把 LLM 增量 content 实时 emit 成 type='token' 事件,
+        //   经 server.streamCallback → SSE {type:'stream'} → 前端增量渲染 (真流式).
+        const onToken = (delta: string) => this.emit({ type: 'token', content: delta });
+        // 2026-09-22 (KV 修复 A): 传 this.messageHistory 数组 — pi-ai.chat 把 D1 注入最后一条 user 并写回,
+        //   最终消息原文被持久化到 history → 下一轮前缀逐字节一致.
+        const llmResponse = await llm.chat(this.messageHistory as unknown as ChatMessage[], headerForThisIter, signal, openAITools, onToken, 'main-agent', this.config.source || 'main-agent');
         const reply = (llmResponse.reply || '').trim();
         this.vlog(`[pivot] iter=${this.state.iteration} LLM took=${Date.now() - t0}ms reply=${reply.length} nativeToolCalls=${llmResponse.toolCalls?.length ?? 0} head=${reply.substring(0, 80).replace(/\n/g, ' ')}`);
 
-        this.emit({ type: 'token', content: reply });
-        // 2026-07-06: 把完整 reply 推给前端 — 前端按需更新临时气泡
-        //   之前只 emit token(100B 截断), 前端拿到 100B 看不清. 现在 emit preview 带完整 content.
-        //   折叠 / 清洗交给前端的 message-renderer.addMessage (类型 ai 入口统一 strip).
+        // 2026-09-22: 增量 token 已通过 onToken 流式推给前端, 这里不再 emit 整段 token (避免重复/错乱).
+        //   保留 reply-preview (整段) 供前端在每轮结束时刷新 live 气泡 (避免跨轮累加乱序).
         this.emit({ type: 'reply-preview', content: reply, iteration: this.state.iteration } as any);
 
         // Estimate token usage
-        this.state.totalTokens += this.estimateTokens(headerForThisIter + '\n\n' + context) + this.estimateTokens(reply);
+        // 2026-09-22 (KV 修复 A): context 已改为 this.messageHistory 数组 (不再有 buildContext 字符串),
+        //   这里用 header + 历史消息内容估算 token, 与真实发送一致.
+        this.state.totalTokens += this.estimateTokens(headerForThisIter) + this.estimateTokens(this.messageHistory.map((m) => m.content).join('\n\n')) + this.estimateTokens(reply);
         
         // 2026-07-06: token 接近预算时先尝试自动压缩, 而不是直接 break — 上层 PiAgentSession
         //   通过 onApproachingTokenBudget 回调触发 compactPipeline (5 层短路)
@@ -603,6 +633,24 @@ export class WorkflowPivotLoop {
                 content: `⚠ 检测到重复工具调用 ${rep.name} (连续 3 次相同参数) — 疑似循环工作流, 已计入无进展`,
                 tool: 'loop-guard',
               });
+              // 2026-09-22: 弱模型 (0.8B 等) 无视"换策略"提示, 会无限重复同一调用,
+              //   一直空转到 5 分钟 AbortError 才被上层判"未返回". 达到 minIterations 后直接硬停止,
+              //   返回最近一次工具结果, 让前端拿到答复而非空内容触发无意义重试.
+              if (this.state.iteration >= (effectiveConfig.minIterations ?? 2)) {
+                const lastToolMsg = [...this.messageHistory].reverse().find(
+                  (m: any) => (m as any).toolResult || (m as any).role === 'tool'
+                ) as any;
+                const toolOut = lastToolMsg
+                  ? (lastToolMsg.toolResult?.output ?? lastToolMsg.content)
+                  : '';
+                response = response || `已执行工具 ${rep.name} 等调用（模型反复重复同一调用、未给出最终答复）。最近一次工具返回：\n\n${(toolOut || '').toString().slice(0, 3000)}`;
+                this.emit({
+                  type: 'status',
+                  content: `🛑 检测到重复工具调用, 已自动停止循环并返回已有结果 (iter=${this.state.iteration})`,
+                  tool: 'loop-guard',
+                });
+                return this.createResult(true, response, 'repeating_tool_loop_stopped');
+              }
             }
 
             const result = await tool.execute(toolCall.args ?? {});
@@ -664,6 +712,14 @@ export class WorkflowPivotLoop {
           type: 'error',
           content: `❌ 循环异常: ${error}`
         });
+        // 2026-09-22: 超时/abort 等异常时, 若还没拿到最终答复, 用最近一次助手消息兜底,
+        //   避免返回空内容被前端判为"未返回"而触发无意义重试.
+        if (!response && this.messageHistory.length > 0) {
+          const lastAssistant = this.messageHistory
+            .filter(m => m.role === 'assistant')
+            .pop();
+          response = (lastAssistant?.content as string) || response;
+        }
         return this.createResult(false, response, 'error');
       }
     }
@@ -908,22 +964,6 @@ export class WorkflowPivotLoop {
   /**
    * Build context from message history
    */
-  private buildContext(): string {
-    return this.messageHistory.map(m => {
-      if (m.role === 'user') return `用户: ${m.content}`;
-      if (m.role === 'assistant' && m.toolCall && m.toolResult) {
-        // 2026-08-02 fix: 工具调用后的 assistant 消息带 toolCall/toolResult,
-        //   之前只输出 content (原生 tool_calls 时 content 为空) → LLM 永远看不到结果 → 无限重试同一工具
-        return `工具调用: ${m.toolCall.name}(${JSON.stringify(m.toolCall.args)})\n工具结果: ${JSON.stringify(m.toolResult)}`;
-      }
-      if (m.role === 'assistant') return `助手: ${m.content}`;
-      if (m.role === 'tool' && m.toolResult) {
-        return `工具结果: ${JSON.stringify(m.toolResult)}`;
-      }
-      return '';
-    }).filter(Boolean).join('\n');
-  }
-  
   /**
    * Evaluate response quality
    */
@@ -1005,7 +1045,9 @@ ${identityLine ? identityLine + '\n' : ''}当前 step 别再读 persona 全文, 
       toolCalls: this.state.toolCallsCount,
       qualityScore: avgQuality,
       exitReason,
-      state: { ...this.state }
+      state: { ...this.state },
+      // 2026-09-22 (KV 修复 A): 透出完整 history (含被写回 D1 的当前 user), 上层用它替换 messageHistory.
+      finalHistory: this.messageHistory as unknown as ChatMessage[],
     };
   }
   
@@ -1059,7 +1101,11 @@ ${identityLine ? identityLine + '\n' : ''}当前 step 别再读 persona 全文, 
 export interface LLMInterface {
   // 2026-07-04: 加 signal 让 pivot loop 支持 abort (防止 LLM hang)
   // 2026-08-02: 加 tools 参数 (OpenAI 原生函数定义) + toolCalls 返回 (结构化工具调用)
-  chat(context: string, systemPrompt: string, signal?: AbortSignal, tools?: any[]): Promise<{ reply: string; tokens?: number; toolCalls?: any[] }>;
+  // 2026-09-22: 加 onToken 流式回调 — 传参时 LLM 每吐一段 content delta 触发, 用于前端实时渲染
+  // 2026-09-22: 加 purpose 透传 — 主 agent 推理调用传 'main-agent', 供 callOpenAI 打 [pi-ai] 标记
+  // 2026-09-22 (KV 修复 A): context 允许传 ChatMessage[] — history 走 messages 数组 (仅追加),
+  //   这样 pi-ai.chat 把 D1 注入到最后一条 user 后能写回同一数组, 跨轮前缀逐字节一致 → KV 复用.
+  chat(context: string | ChatMessage[], systemPrompt: string, signal?: AbortSignal, tools?: any[], onToken?: (delta: string) => void, purpose?: string, source?: string): Promise<{ reply: string; tokens?: number; toolCalls?: any[] }>;
 }
 
 /**

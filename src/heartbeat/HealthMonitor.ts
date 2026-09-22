@@ -6,6 +6,9 @@
 import type { HealthStatus, HealthCheckResult, HealthCheckProvider } from './types.js';
 import { getMinimax } from '../constraints/index.js';
 
+// 默认开启 LLM 模型探针；设为 '0' 时降级为「不调用模型」的轻量健康检查
+const LLM_PROBE_ENABLED = process.env.BOLLOON_HEALTH_LLM_CHECK !== '0';
+
 export class HealthMonitor implements HealthCheckProvider {
   private lastHeartbeatTime: number = Date.now();
   private checkIntervalId: ReturnType<typeof setInterval> | null = null;
@@ -116,6 +119,16 @@ export class HealthMonitor implements HealthCheckProvider {
 
       if (!minimax) {
         return { status: 'error', message: 'LLM not initialized', latency_ms: Date.now() - start };
+      }
+
+      // BOLLOON_HEALTH_LLM_CHECK=0: 降级为不调用模型的轻量探针（仅确认客户端已初始化）
+      if (!LLM_PROBE_ENABLED) {
+        return {
+          status: 'ok',
+          message: 'LLM client initialized (model probe disabled)',
+          details: { model_probe: false },
+          latency_ms: Date.now() - start
+        };
       }
 
       // 执行 ping 测试
@@ -260,7 +273,7 @@ export class HealthMonitor implements HealthCheckProvider {
       // 2026-06-15: signal 位置正确传 undefined (chat signature 是 (message, context?, signal?))
       //   之前传 { maxTokens: 1 } 被当 signal, Node 22+ undici 强类型 AbortSignal 校验 throw
       if (minimax.chat) {
-        await minimax.chat('ping', 'test', undefined);
+        await minimax.generateText({ messages: [{ role: 'user', content: 'ping' }], source: 'health' });
       } else if (minimax.ping) {
         await minimax.ping();
       }

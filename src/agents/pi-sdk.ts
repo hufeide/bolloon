@@ -32,6 +32,7 @@ import { WorkflowPivotLoop, createDefaultPivotConfig, type PivotLoopConfig, type
 import { p2pDocumentTools, initDocumentReceiver } from './p2p-document-tools.js';
 import { shellExec } from './shell-tool.js';
 import { startRun, recordStep, finishRun, readRun, budgetVerdict, recordDegradation, recordHarnessEvent, recordRecovery, setRunStatus, prepareResume, markRunRunning, buildResumeInstruction, argsDigestOf, repeatedFailureCount, classifyError as classifyRunError, type RunSurface, type RunStatus, type ResumePlan } from './run-store.js';
+import { beginPromptProfile, addPromptParts } from '../llm/promptProfile.js';
 import { createGoal, readGoal, attachRun, findActiveGoal, completeGoalIfEligible, setUnresolved, addEvidence, evaluateGoalCompletion } from './goal-store.js';
 import { PiAgentHarness, type HarnessRunContext, type ToolDecision } from './pi-harness.js';
 import { getBranchPrefix, getCooldownMs, checkWritePath } from './shell-guard.js';
@@ -135,6 +136,70 @@ import { DEFAULT_MAX_REVIEWS } from './loop-review.js';
  */
 const MAX_SAME_TOOL_FAILURES = 3;
 
+/**
+ * bootstrap 稳定段缓存 (L1 session-start + L2 事件日志 + L3 项目状态).
+ * 这三段只依赖 channelId, 会话内数秒级不变, 但每轮都做 DB 读取 / onSessionStart 重算
+ * (含 persona 文档加载) → 是"每次发送都重新处理 sys prompt"的主要来源. 缓存 30s,
+ * 只有 L4 向量检索 (依赖 userText) 仍每轮跑. 注意: 这是进程级缓存, 多 session 同 channel 共享.
+ */
+const BOOTSTRAP_STABLE_TTL_MS = 30 * 1000;
+const _bootstrapStableCache = new Map<string, { at: number; text: string }>();
+
+async function buildStableBootstrap(channelId?: string, agentId?: string): Promise<string> {
+  const key = channelId || 'no-channel';
+  const now = Date.now();
+  const hit = _bootstrapStableCache.get(key);
+  if (hit && now - hit.at < BOOTSTRAP_STABLE_TTL_MS) {
+    if (process.env.DEBUG_PROMPT_PREFIX) {
+      console.log(`[bootstrap-cache] HIT channel=${key} age=${now - hit.at}ms`);
+    }
+    return hit.text;
+  }
+  if (process.env.DEBUG_PROMPT_PREFIX) {
+    console.log(`[bootstrap-cache] MISS channel=${key} (rebuild L1~L3)`);
+  }
+
+  let text = '';
+  // L1: SessionStart (项目 context + persona 文档, 可能较重)
+  try {
+    const ss = await onSessionStart({ channelId: channelId || undefined, agentId: agentId || undefined });
+    text = ss.systemAddition || '';
+  } catch (err) {
+    console.warn('[PiAgent] onSessionStart failed (non-fatal):', err);
+  }
+
+  if (channelId) {
+    // L2: 最近 5 条项目事件日志
+    try {
+      const { getRecentEvents } = await import('../bootstrap/event-log.js');
+      const events = await getRecentEvents(channelId, 5);
+      if (events.length > 0) {
+        const eventBlock = [
+          '## 最近项目事件 (最近 5 条, 倒序)',
+          ...events.map((e) => `- [${e.ts.slice(0, 16)}] [${e.type}] ${e.summary}`),
+        ].join('\n');
+        text = (text + '\n\n' + eventBlock).slice(-2000);
+      }
+    } catch (err) {
+      console.warn('[PiAgent] getRecentEvents failed (non-fatal):', err);
+    }
+    // L3: 项目当前状态 (目标/约束/待办/已完成)
+    try {
+      const { readState, formatStateForPrompt } = await import('../bootstrap/project-state.js');
+      const state = await readState({ channelId });
+      const stateText = formatStateForPrompt(state);
+      if (stateText) {
+        text = (text + '\n\n' + stateText).slice(-2500);
+      }
+    } catch (err) {
+      console.warn('[PiAgent] readState failed (non-fatal):', err);
+    }
+  }
+
+  _bootstrapStableCache.set(key, { at: now, text });
+  return text;
+}
+
 export class PiAgentSession implements AgentSession {
   private cwd: string;
   private peerId: string;
@@ -200,6 +265,8 @@ export class PiAgentSession implements AgentSession {
   private reactHarness: ReactHarness = new ReactHarness();
   private usePivotLoop: boolean = false;
   private pivotLoopConfig?: PivotLoopConfig;
+  /** 调用来源标记, 由 promptStream(source?) 写入, 透传给 WorkflowPivotLoop 的 chat source 参数 */
+  private currentSource?: string;
   /** P2: 当前会话的 permission mode (每次 promptStream 入口解析) */
   private currentPermissionMode: import('./permission-mode.js').PermissionMode = 'default';
   /** P1.2: Context Collapse 读时投影结果 (feature flag 开启时由 maybeAutoCompact 写入, buildContext 优先用) */
@@ -499,7 +566,11 @@ export class PiAgentSession implements AgentSession {
    *   即可获得"重启 / 跨进程接续"的语义.
    */
   async saveCurrentSession(key: string): Promise<void> {
-    const persisted: PersistedMessage[] = this.messageHistory.map((m) => ({
+    // 2026-09-22: 落盘前过滤瞬时 system 控制消息 + tool 错误结果, 让 session 成为干净的下一轮历史源头
+    //   (配合 buildMessages / pivot historyToInject / buildContext 的 on-use 过滤, 双保险)
+    const persisted: PersistedMessage[] = this.messageHistory
+      .filter(m => this.isPersistentHistory(m))
+      .map((m) => ({
       role: m.role,
       content: m.content,
       toolCall: m.toolCall,
@@ -919,11 +990,12 @@ export class PiAgentSession implements AgentSession {
     }
   }
 
-  async promptStream(input: string, onStream: StreamCallback, signal?: AbortSignal, channelId?: string): Promise<string> {
+  async promptStream(input: string, onStream: StreamCallback, signal?: AbortSignal, channelId?: string, source?: string): Promise<string> {
     console.log(`[PiAgent.promptStream] ENTRY, channelId=${channelId}, input chars=${input.length}`);
     this.minimaxAvailable = this.checkMinimax();
     console.log(`[PiAgent.promptStream] minimaxAvailable=${this.minimaxAvailable}`);
     this.currentChannelId = channelId ?? this.currentChannelId;
+    this.currentSource = source;
 
     // 2026-08-08: 运行轨迹采集 (落盘 + OrbitDB, 失败静默) — 包裹 onStream 收集步骤事件
     const trajRec = await this.createTrajectoryRecorder(input, channelId);
@@ -994,50 +1066,13 @@ export class PiAgentSession implements AgentSession {
       console.warn('[PiAgent] maybeAutoCompact failed (non-fatal):', err);
     }
 
-    // Bootstrap SessionStart: 收集项目 Context, 拼到 systemAddition 头部
-    // (失败静默, 5s 限流防止循环)
-    // 2026-07-04: 透传 agentId 让 onSessionStart 加载 persona 文档
-    let bootstrapAddition = '';
-    try {
-      const ss = await onSessionStart({
-        channelId: this.currentChannelId || undefined,
-        agentId: this.currentAgentId || undefined,
-      });
-      bootstrapAddition = ss.systemAddition || '';
-    } catch (err) {
-      console.warn('[PiAgent] onSessionStart failed (non-fatal):', err);
-    }
+    // Bootstrap: L1~L3 (session-start + 事件日志 + 项目状态) 是会话内稳定的, 走 30s TTL 缓存
+    // (buildStableBootstrap), 不再每轮做 DB 读取 / onSessionStart 重算 — 这是"每次发送都重新处理
+    // sys prompt" 的主要来源. 只有 L4 向量检索依赖 userText, 必须每轮跑.
+    let bootstrapAddition = await buildStableBootstrap(this.currentChannelId, this.currentAgentId);
 
-    // 2026-07-07 P1-B: 注入最近 5 条项目事件日志 (L2) — 让 LLM 知道项目状态/feature 变化
-    // 失败静默, append 到 bootstrapAddition 末尾 (超 800 字截断)
+    // 2026-07-07 P2-C: 向量检索 top-3 (L4) — 按当前 channelId + userText 找历史相关片段
     if (this.currentChannelId) {
-      try {
-        const { getRecentEvents } = await import('../bootstrap/event-log.js');
-        const events = await getRecentEvents(this.currentChannelId, 5);
-        if (events.length > 0) {
-          const eventBlock = [
-            '## 最近项目事件 (最近 5 条, 倒序)',
-            ...events.map(e => `- [${e.ts.slice(0, 16)}] [${e.type}] ${e.summary}`),
-          ].join('\n');
-          bootstrapAddition = (bootstrapAddition + '\n\n' + eventBlock).slice(-2000);
-        }
-      } catch (err) {
-        console.warn('[PiAgent] getRecentEvents failed (non-fatal):', err);
-      }
-
-      // 2026-07-07 P2-C: 注入项目当前状态 (L3) — 目标/约束/待办/已完成
-      try {
-        const { readState, formatStateForPrompt } = await import('../bootstrap/project-state.js');
-        const state = await readState({ channelId: this.currentChannelId });
-        const stateText = formatStateForPrompt(state);
-        if (stateText) {
-          bootstrapAddition = (bootstrapAddition + '\n\n' + stateText).slice(-2500);
-        }
-      } catch (err) {
-        console.warn('[PiAgent] readState failed (non-fatal):', err);
-      }
-
-      // 2026-07-07 P2-C: 向量检索 top-3 (L4) — 按当前 channelId + userText 找历史相关片段
       try {
         const { searchIndex } = await import('../bootstrap/vector-index.js');
         const indexName = `channel-${this.currentChannelId}`;
@@ -1230,7 +1265,7 @@ export class PiAgentSession implements AgentSession {
     }
 
     const llm = getMinimax();
-    const loopConfig = config || this.pivotLoopConfig || createDefaultPivotConfig();
+    const loopConfig = { ...(config || this.pivotLoopConfig || createDefaultPivotConfig()), source: this.currentSource };
     const loop = new WorkflowPivotLoop(loopConfig);
 
     for (const tool of this.tools.values()) {
@@ -1259,10 +1294,12 @@ export class PiAgentSession implements AgentSession {
 `;
     }
 
-    const systemPrompt = `${this.bootstrapAddition}你是 ${this.identity.name}，基于ReAct (Reasoning + Acting)模式工作。${this.cachedPersonaSection}
-当前工作目录: ${this.cwd}
-当前身份: ${this.identity.name} (${this.identity.did})
-${this.currentIntentHint}
+    // 2026-09-22: KV 复用关键 — 【静态】persona+工具+工作模式放头部, 【动态】内容
+    //   (intent hint / bootstrapAddition / judgment / context) 放末尾. 否则 bootstrapAddition 含
+    //   按 userText 向量检索的 top-3 片段, 放在头部会使每轮 system prompt 前缀都不同 → llama.cpp
+    //   prefix-cache 完全匹配不上, 整个 46K 提示词每问都从头重算. 静态头部稳定后 KV 跨问答复用.
+    // 2026-09-22: cwd / did 移到 system prompt 尾部, 头部只留静态内容 → 跨会话共享 KV 前缀
+    const systemPrompt = `你是 ${this.identity.name}，基于ReAct (Reasoning + Acting)模式工作。${this.cachedPersonaSection}
 
 ${this.getToolDefinitions()}
 
@@ -1287,7 +1324,16 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
 - 用 markdown json code block 包裹: \`\`\`json\n{"name":"X","input":{...}}\n\`\`\`
 - 工具调用前可以简短思考 (1-2 句话), 但**不要写长篇 thinking** (会撞 max_tokens)
 - 工具调用后必须等结果, 不要在同一个回复里继续输出
-- <final gen> 只在**真完成所有任务**时输出, 不要在工具调用前/中输出${this.judgmentGateAddition}${this.contextHintAddition}`;
+- <final gen> 只在**真完成所有任务**时输出, 不要在工具调用前/中输出
+
+当前工作目录: ${this.cwd}
+当前身份: ${this.identity.name} (${this.identity.did})`;
+
+    // 2026-09-22: 四个动态字段 (intent hint / bootstrapAddition / judgment / context) 从 persona 尾部
+    //   移到 historyBlock 之后 (见下方 loop.execute 的 dynamicTail 拼接). 原因: 它们每轮随 userText / 向量检索
+    //   变化, 若夹在 persona 静态头与 historyBlock 之间, 前缀在 "did" 处就断 → 整个 44K 每轮全量重算.
+    //   移到 historyBlock 之后, persona+cwd+did 成为逐字节稳定前缀被 KV 复用, historyBlock 也落入可复用前缀区.
+    const dynamicTail = `${this.currentIntentHint}${this.bootstrapAddition}${this.judgmentGateAddition}${this.contextHintAddition}`;
 
     // 2026-06-15: 把 currentOnStream 传给 loop, 让 step-timeline 在 pivot 循环里也能 emit step_start/done
     //   之前 loop.execute() 不接 streamCallback, 导致 step-timeline 只能看到老 runReActLoop 路径
@@ -1303,7 +1349,12 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
     //   pivot loop execute() 内部自己维护 messageHistory, 跟 pi-sdk 的 this.messageHistory 隔离,
     //   不注入的话 LLM 看不到历史对话, 每次都是新对话.
     const historyLines: string[] = [];
-    const historyToInject = this.messageHistory.slice(-20, -1);
+    // 2026-09-22: pivot 注入历史同样过滤瞬时 system 控制消息, 与 buildMessages 一致
+    // 2026-09-22: 改为「追加」而非「滑动窗口」——去掉 -20 上限, 用 slice(0, -1) 取全部历史 (排除当前轮输入).
+    //   这样 round N 的 historyBlock 是 round N+1 的严格前缀 → 落入可复用前缀区, KV 跨轮复用;
+    //   原先 slice(-20,-1) 在对话超 20 条后会丢最旧消息, 导致 historyBlock 头部变化 → 前缀断裂.
+    //   代价: 历史无上限增长, 超长对话会撑大 prompt (由 autoCompact / pivot token 预算兜底).
+    const historyToInject = this.messageHistory.slice(0, -1).filter(m => this.isPersistentHistory(m));
     for (const m of historyToInject) {
       const roleLabel = m.role === 'user' ? '用户' : m.role === 'assistant' ? '你' : m.role === 'tool' ? '工具结果' : m.role;
       const text = (m.content || '').slice(0, 2000);
@@ -1316,9 +1367,52 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
     const onCompact = async () => {
       // no-op (best-effort hook for future pi-sdk/pivot history sync)
     };
-    const result = await loop.execute(input, llm, systemPrompt + historyBlock, this.currentOnStream ?? undefined, this.currentSignal ?? undefined, onCompact);
+    // 临时诊断: 量化提示词各部分大小 (BOLLOON_PROMPT_PROFILE=1 时打印; tok 估算 = 字符数/4)
+    if (process.env.BOLLOON_PROMPT_PROFILE === '1') {
+      const _nt = (n: number) => Math.ceil((n || 0) / 4);
+      const _sl = (s: string | undefined) => (s?.length || 0);
+      const _dynLen = _sl(this.currentIntentHint) + _sl(this.bootstrapAddition) + _sl(this.judgmentGateAddition) + _sl(this.contextHintAddition);
+      // head = systemPrompt 中"非本次动态注入"的部分 (动态注入 intent/bootstrap/judgment/context 都进了 dynamicTail, 不在 systemPrompt 里)
+      const _headLen = Math.max(0, systemPrompt.length - _dynLen);
+      const _msgLen = this.messageHistory.reduce((a, m) => a + _sl(m.content), 0);
+      const _total = (systemPrompt + historyBlock + dynamicTail).length;
+      // 头部 hash: 用于判断 systemPrompt(稳定前缀) 是否跨轮变化
+      const _h = (s: string) => { let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0; return (h >>> 0).toString(16).padStart(8, '0'); };
+      console.log(`[prompt-profile] sys_total≈${_nt(systemPrompt.length)}tok head≈${_nt(_headLen)} persona≈${_nt(_sl(this.cachedPersonaSection))} tools≈${_nt(_sl(this.getToolDefinitions()))} | intent≈${_nt(_sl(this.currentIntentHint))} bootstrap≈${_nt(_sl(this.bootstrapAddition))} judgment≈${_nt(_sl(this.judgmentGateAddition))} context≈${_nt(_sl(this.contextHintAddition))} dynamicTail≈${_nt(dynamicTail.length)} | historyBlock≈${_nt(historyBlock.length)} sys+historyBlock≈${_nt((systemPrompt + historyBlock).length)}tok | msgHistory≈${_nt(_msgLen)}tok | TOTAL≈${_nt(_total)}tok | headHash=${_h(systemPrompt)} tail(new per-turn)=${_nt((historyBlock + dynamicTail).length)}tok | fullHash=${_h(systemPrompt + historyBlock + dynamicTail)} | cwd=${JSON.stringify(this.cwd)} did=${JSON.stringify(this.identity?.did)} name=${JSON.stringify(this.identity?.name)}`);
+      // 落盘完整 systemPrompt 以便跨轮 diff 定位 head 差异
+      try { import('node:fs').then((fs) => fs.writeFileSync(`/tmp/bolloon_sys_${_h(systemPrompt)}.txt`, systemPrompt)).catch(() => {}); } catch { /* ignore */ }
+    }
+    // 2026-09-22: dynamicTail 拼在 historyBlock 之后 (而非 persona 尾部), 使稳定前缀延伸到
+    //   persona+cwd+did, historyBlock 也进入可复用前缀区. 最终顺序:
+    //   stableText(全局) | persona+cwd+did | historyBlock | dynamicTail | projectContext(动态层)
+    // 2026-09-22: 逐部分落盘诊断 (BOLLOON_PROMPT_PROFILE=1) — 把 systemPrompt/historyBlock/dynamicTail 等各部分
+    //   完整文本+字符数+sha 落盘, 与 pi-ai 同轮关联, 供跨轮 diff 定位前缀变化
+    if (process.env.BOLLOON_PROMPT_PROFILE === '1') {
+      const _ppr = beginPromptProfile();
+      (globalThis as any).__ppRound = _ppr;
+      addPromptParts(_ppr, {
+        systemPrompt,
+        historyBlock,
+        dynamicTail,
+        intent: this.currentIntentHint || '',
+        bootstrap: this.bootstrapAddition || '',
+        judgment: this.judgmentGateAddition || '',
+        context: this.contextHintAddition || '',
+        persona: this.cachedPersonaSection || '',
+        tools: String((this as any).getToolDefinitions?.() ?? ''),
+        full: systemPrompt + historyBlock + dynamicTail,
+      }, 'pi-sdk');
+    }
+    // 2026-09-22 (KV 修复 A): 只传稳定 persona 给 pivot (system 不 concat history/dynamic → 逐字节稳定前缀).
+    //   history 以结构化消息数组注入 this.messageHistory (仅追加); dynamicTail 冻结进当前 user.
+    const histForPivot = historyToInject.map((m) => ({ role: m.role, content: m.content }));
+    const result = await loop.execute(input, llm, systemPrompt, this.currentOnStream ?? undefined, this.currentSignal ?? undefined, onCompact, histForPivot, dynamicTail);
 
-    if (result.response) {
+    // 采用 pivot 透回的完整 history (含被写回 D1 的当前 user), 保证下一轮从同一前缀重建 → KV 复用;
+    // 兜底: 无 finalHistory 时退回旧逻辑只压 assistant 回复.
+    if (result.finalHistory && result.finalHistory.length > 0) {
+      this.messageHistory = result.finalHistory as any;
+    } else if (result.response) {
       this.messageHistory.push({ role: 'assistant', content: result.response });
     }
 
@@ -1817,12 +1911,10 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
         loopProgressSection = `\n【本轮循环进度】你已完成以下 ${loopActionLog.length} 个动作, 这是连续执行的同一轮任务:\n${actionLines}\n请基于已有结果继续推进, 不要重复执行上面已成功的动作. 全部完成后用 <final gen> 结束.\n`;
       }
 
-      const systemPrompt = `${this.bootstrapAddition}你是 ${this.identity.name}，基于ReAct (Reasoning + Acting)模式工作。${personaSection}
-当前工作目录: ${this.cwd}
-当前身份: ${this.identity.name} (${this.identity.did})
-${refineContext}
-${this.currentIntentHint}
-${loopProgressSection}
+      // 2026-09-22: 同 promptWithPivotLoop — 静态 persona+工具+工作模式放头部, 动态内容
+      //   (refineContext/intent/loopProgress/bootstrap/judgment/context) 放末尾, 启用 KV 跨轮复用.
+      // 2026-09-22: cwd / did 移到尾部, 头部保持静态以跨会话复用 KV
+      const systemPrompt = `你是 ${this.identity.name}，基于ReAct (Reasoning + Acting)模式工作。${personaSection}
 
 ${toolDefs}
 
@@ -1839,7 +1931,11 @@ ${PiAgentSession.TOOL_SELECTION_GUIDE}
 - 每次只调用一个工具
 - 仔细分析工具返回结果
 - 当任务完成时，必须在回答末尾添加 <final gen> 标记表示结束
-- 如果需要更多信息，继续调用工具${this.judgmentGateAddition}${this.contextHintAddition}`;
+- 如果需要更多信息，继续调用工具
+
+当前工作目录: ${this.cwd}
+当前身份: ${this.identity.name} (${this.identity.did})
+${refineContext}${this.currentIntentHint}${loopProgressSection}${this.bootstrapAddition}${this.judgmentGateAddition}${this.contextHintAddition}`;
 
       // 3 个恢复机制 (Claude Code 论文 9-step pipeline 内部):
       //   1. max output token 升级 (最多 3 次, 每次 maxOutputTokens 翻倍)
@@ -2553,7 +2649,8 @@ lastQualityScore = this.estimateResponseQuality(reply);
     // 失败静默: 任何 stage 抛错 → 走老 slice(-10) 逻辑
     //
     // P1.2: 如果 maybeAutoCompact 算过 Context Collapse 投影, 用 this.projectedHistory (读时投影, 非破坏)
-    const source = this.projectedHistory ?? this.messageHistory;
+    // 2026-09-22: 字符串路径同样过滤瞬时 system 控制消息, 与 buildMessages / pivot 一致
+    const source = this.projectedHistory ?? this.messageHistory.filter(m => this.isPersistentHistory(m));
     const recentMessages = this.compressHistorySync(source).slice(-10);
     return recentMessages.map(m => {
       if (m.role === 'user') return `用户: ${m.content}`;
@@ -2564,6 +2661,24 @@ lastQualityScore = this.estimateResponseQuality(reply);
       }
       return m.content;
     }).join('\n');
+  }
+
+  /**
+   * 2026-09-22: 历史持久化/回灌过滤器 — 只保留「真实对话」, 剔除回合内瞬时控制消息.
+   *
+   * messageHistory 是一锅 4 类角色的混合物:
+   *   - user / assistant / tool  -> 真实对话, 全部保留 (含失败的 tool 结果 —
+   *     它们是真实发生过的消息, 下轮模型需要看到才能调整).
+   *   - system                   -> 全是回合内瞬时控制/训话/反思 (如
+   *      "[注意] 你已连续调用 N 次工具", "[质量检查] 评分", "[Harness Router Hint]",
+   *      formatObservationWithReflection 等). 这些每轮都会由 finalSystem 重新注入到
+   *      序列最前面, 留进历史是双重冗余 + 误导 (下轮看到上轮 "已连续调用" 是错的).
+   *
+   * 返回 false 的项不会进入下一轮历史 / buildMessages / pivot historyToInject.
+   */
+  private isPersistentHistory(m: { role: string; content?: string }): boolean {
+    // 只剔除 system 角色的瞬时控制消息; user / assistant / tool (含失败结果) 一律保留
+    return m.role !== 'system';
   }
 
   /**
@@ -2579,7 +2694,9 @@ lastQualityScore = this.estimateResponseQuality(reply);
       // 2026-08-06: 来源优先用 projectedHistory (Context Collapse 投影, 非破坏) —
       //   与 buildContext 一致; 之前只让字符串路径用投影, messages 数组路径被跳过,
       //   导致 LLM 实际看到的还是未压缩的历史.
-      const source = this.projectedHistory ?? this.messageHistory;
+      // 2026-09-22: fallback 路径 (非 projectedHistory) 过滤掉瞬时 system 控制消息
+      //   (projectedHistory 是 Context Collapse 投影, 保留其自身语义, 不在此过滤).
+      const source = this.projectedHistory ?? this.messageHistory.filter(m => this.isPersistentHistory(m));
       const WINDOW = 15;
       const out: Array<{ role: string; content: string; reasoningContent?: string }> = [];
 
@@ -2714,6 +2831,21 @@ lastQualityScore = this.estimateResponseQuality(reply);
         // Bug 5: pass tool IDs for native OpenAI tool calling
         const response = await llm.chat(contextOrMessages, systemPrompt, signal, tools);
         // 2026-06-30: 透传 toolCalls (OpenAI 协议 native) 给上层, 让 assistant message 能 emit 真 id
+        // 2026-09-22 (#1 修复): 把 chat() 注入的 CURRENT TURN 动态内容 (git/runtime/p2p reserve) 落回
+        //   messageHistory. 否则下一轮 buildMessages() 从 messageHistory 重建的 user 消息不含 D →
+        //   前缀从 U1 起失配, KV 永远不命中. 映射: wire 最后一条 user = 本轮用户输入, 写回
+        //   messageHistory 最后一条 user (普通单轮对话即当前用户输入; tool-loop 末条为 assistant 时跳过).
+        if (response.messages && this.messageHistory.length > 0) {
+          const lastUserWire = [...response.messages].reverse().find((m: any) => m.role === 'user');
+          if (lastUserWire) {
+            for (let i = this.messageHistory.length - 1; i >= 0; i--) {
+              if ((this.messageHistory[i] as any).role === 'user') {
+                (this.messageHistory[i] as any).content = lastUserWire.content;
+                break;
+              }
+            }
+          }
+        }
         return { reply: response.reply || '', toolCalls: response.toolCalls };
       } catch (err: any) {
         // 用户主动 abort: 不重试, 立即抛
@@ -2821,7 +2953,7 @@ lastQualityScore = this.estimateResponseQuality(reply);
     // 给 Context Collapse (虚拟投影) 和 Auto-Compact (摘要) 共用
     const llm = getMinimax();
     const llmChat = async (systemPrompt: string, userPrompt: string): Promise<string> => {
-      const r = await llm.chat(userPrompt, systemPrompt, signal);
+      const r = await llm.chat(userPrompt, systemPrompt, signal, undefined, undefined, 'autoCompact');
       return r.reply;
     };
 

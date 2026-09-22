@@ -529,12 +529,12 @@
 
       try {
         // LLM: 测试用「当前表单填写的值」，不必先保存（后端 testProvider 支持 override）
-        const body: any = { provider: currentProvider };
+        const body = { provider: currentProvider };
         if (currentProviderType === 'llm') {
           body.config = {
-            baseUrl: (document.getElementById('baseUrlInput') as HTMLInputElement)?.value?.trim() || '',
-            apiKey: (document.getElementById('apiKeyInput') as HTMLInputElement)?.value?.trim() || '',
-            model: (document.getElementById('modelInput') as HTMLInputElement)?.value?.trim() || '',
+            baseUrl: (document.getElementById('baseUrlInput')?.value || '').trim(),
+            apiKey: (document.getElementById('apiKeyInput')?.value || '').trim(),
+            model: (document.getElementById('modelInput')?.value || '').trim(),
           };
         }
         const resp = await fetch(endpoint, {
